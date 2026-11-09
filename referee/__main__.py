@@ -48,7 +48,7 @@ def conformance(argv=()) -> int:
 
 
 def full(argv=()) -> int:
-    if not _has_engine():
+    if not _has_engine() and not any(x in ("--engine=opensearch", "--engine=reference") for x in argv):
         print("referee full: needs engine/api.py (INTERFACES section 5); S1 adds it", file=sys.stderr)
         return 2
     from referee.full import main

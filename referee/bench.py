@@ -74,8 +74,9 @@ def _rev():
 
 
 def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=64, latency_queries=500,
-        price_per_hour=None, split="fit", engine="engine", index=None) -> dict:
-    """Runs one benchmark. `queries` is a DataFrame[query_id, query]; `judgments` {query_id: {product_id: label}}."""
+        price_per_hour=None, split="fit", engine="engine", index=None, subsets=None) -> dict:
+    """Runs one benchmark. `queries` is a DataFrame[query_id, query]; `judgments` {query_id: {product_id: label}}.
+    `subsets` ({name: set of query ids}) are scored from the same runs, e.g. the founder's held-out draw."""
     template = template or DEFAULT_TEMPLATE
     wall0 = time.perf_counter()
     if index is None:
@@ -94,6 +95,8 @@ def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=6
             runs[q] = [h["_id"] for h in resp["hits"]["hits"]]
     recall_ks = tuple(sorted({x for x in (k, 100, 1000) if x <= k}))
     quality = score_run(runs, judgments, k_ndcg=10, recall_ks=recall_ks)["mean"]
+    quality_subsets = {name: score_run(runs, {q: j for q, j in judgments.items() if q in ids}, k_ndcg=10,
+                                       recall_ks=recall_ks)["mean"] for name, ids in (subsets or {}).items()}
 
     # Latency: page 1 at batch 1.
     page1 = [{**fill(template, t), "size": 10} for t in texts]
@@ -122,6 +125,7 @@ def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=6
         "host": {"cpus": os.cpu_count(), "machine": platform.machine(), "python": platform.python_version()},
         "n_queries": len(qids), "n_products": int(len(ds.catalogue)), "request_template": template,
         "quality": {k_: v for k_, v in quality.items()},
+        **({"quality_subsets": quality_subsets} if subsets else {}),
         "latency_ms": {"batch": 1, "size": 10, "n": len(lat), "p50": _pct(lat, 50), "p99": _pct(lat, 99),
                        "mean": float(np.mean(lat)) if lat else None},
         "stage_ms_p50": {s: _pct(v, 50) for s, v in stages.items()},

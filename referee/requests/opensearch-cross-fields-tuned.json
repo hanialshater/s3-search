@@ -1,0 +1,3 @@
+{"query": {"multi_match": {"query": "{{query}}", "type": "cross_fields", "tie_breaker": 0.0,
+  "fields": ["product_title^1.0", "product_brand^0.667", "product_color^0.333", "product_bullet_point^0.333",
+             "product_description^0.167"]}}}
