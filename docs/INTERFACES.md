@@ -129,20 +129,41 @@ names.
 **Intake** (`dataplane/intake/`):
 
 ```python
-def read_batch(path: str | Path, mapping: dict) -> Iterator[dict]   # .parquet or .jsonl; one source doc per row
+def read_batch(path: str | Path, mapping: dict) -> Iterator[dict | Rejection]   # .parquet or .jsonl; one source doc
+                                                                   # per row; a malformed JSONL line is a Rejection
 def validate(doc: dict, mapping: dict) -> dict | Rejection         # coerced doc, or why not
-def enrich(docs: list[dict], mapping: dict, encoder: Encoder | None) -> list[dict]   # adds vectors
-def ingest(path, mapping, store: Store, rejected: Path) -> IntakeReport  # read → validate → enrich → store.apply
+def enrich(docs: list[dict], mapping: dict, encoder: Encoder | dict[str, Encoder] | None = None) -> list[dict]
+def ingest(path, mapping, store: Store, rejected: Path, encoder=None) -> IntakeReport  # read → validate → enrich → apply
+def apply_changes(changes: Iterable[dict], mapping, store, encoder=None, rejected=None) -> ChangeReport  # the feed
 @dataclass
 class Rejection: _id: str | None; reason: str; field: str | None; detail: str
 @dataclass
-class IntakeReport: accepted: int; rejected: int; first_offset: int; last_offset: int
+class IntakeReport: accepted: int; rejected: int; first_offset: int; last_offset: int; reasons: dict[str, int]
+@dataclass
+class ChangeReport: accepted: int; first_offset: int; last_offset: int; rejected: list[tuple[dict, Rejection]]
+class Encoder(Protocol): name: str; dim: int; def encode(self, texts: list[str]) -> float32[n, dim]
 ```
 
 Rejection reasons (closed set, additive): `missing_id`, `duplicate_id_in_batch`, `bad_type`, `dims_mismatch`,
 `unknown_field` (the mapping's `dynamic` is `strict`), `too_long` (keyword over `ignore_above` is *kept* but not indexed
-as keyword, as OpenSearch does; this reason is for ids over 512 bytes). Rejected records go to `rejected.jsonl`, one
-`{"record": ..., "rejection": ...}` per line.
+as keyword, as OpenSearch does; this reason is for ids over 512 bytes), `malformed` (a JSONL line or change record that
+is not an object, a patch without `fields`), `bad_op`, `not_hot` and `no_such_key` (the change feed). Rejected records
+go to `rejected.jsonl`, one `{"record": ..., "rejection": ...}` per line.
+
+- **Coercion.** `text`: strings, numbers (as text), lists of strings (joined by a newline). `keyword`: strings or
+  numbers. `float`: finite numbers or numeric strings, within float32 range. `integer`/`long`: integers, integral
+  floats or integer strings, within int32/int64. `boolean`: booleans or `"true"`/`"false"`. `knn_vector`: a list or
+  array of `dimension` finite numbers, not all zero, L2-normalised to float32. Booleans are never numbers. `null` and
+  NaN mean missing: the field is left out.
+- **Unknown fields** are kept in the stored source but not indexed (OpenSearch's `dynamic: false`) unless the mapping
+  is `strict`.
+- **A batch file is one atomic batch** (one `store.apply`, consecutive offsets). Within it, the first valid record of
+  an id wins; later ones are `duplicate_id_in_batch`. The change feed (`apply_changes`, §7's `_docs`) rejects bad
+  records one by one and commits the rest as one batch; ids repeat freely there, in order.
+- **Encoders.** `encoder=None` resolves each vector field's `_meta.engine.embeddings.<field>.model` through
+  `dataplane.intake.encoders.register(name, factory)`; an unregistered name gets the deterministic `HashingEncoder`
+  (signed feature hashing of words and bigrams; `name` `hash-<dim>`), the development default. A store records the
+  encoder of each vector field (`store.meta("encoder.<field>")`) and refuses to mix in another one.
 
 ## 3. Key-value store and change log (intake → indexer and updater) · owner dataplane-engineer
 
@@ -167,23 +188,56 @@ The store is the source of truth. **SQLite (stdlib), one file, one writer.** Mod
 
 ```python
 class Store:
-    def __init__(self, path: str | Path, mapping: dict): ...
-    def apply(self, changes: Iterable[dict]) -> tuple[int, int]        # (first, last) offset committed
+    def __init__(self, path: str | Path, mapping: dict): ...          # refuses a store created with another mapping
+    def apply(self, changes: Iterable[dict]) -> tuple[int, int]        # (first, last) offset committed; (0, 0) if empty
     def head(self) -> int                                              # last committed offset
     def get(self, ids: Sequence[str]) -> list[dict | None]
-    def changes(self, after: int, limit: int = 10_000) -> list[dict]   # records with offset > after, ascending
+    def changes(self, after: int, limit: int = 10_000, docs: bool = True) -> list[dict]  # offset > after, ascending;
+                                                                       # docs=False leaves upserts' doc out
     def snapshot(self, at: int | None = None) -> pandas.DataFrame     # live docs as of offset `at`, ordered by first_offset
+    def meta(self, key) -> str | None; def set_meta(self, key, value); def count(self) -> int; def close(self)
+class StoreError(ValueError); class NotHot(StoreError); class NoSuchKey(StoreError, KeyError); class BadChange(StoreError)
 ```
 
+- **Atomic batches.** A refused change (`NotHot`, `NoSuchKey`, `BadChange`: unknown op, missing or over-long id, a
+  patch value that does not coerce, a vector of the wrong shape) refuses its whole batch: nothing is logged, so offsets
+  stay gapless. The store trusts intake to validate upserts; `dataplane.intake.apply_changes` is the checked entry.
+  Every thread gets its own SQLite connection (WAL); writers serialise on `BEGIN IMMEDIATE`.
+- **The snapshot frame.** Columns: the id field; every mapped top-level field (`text`, `keyword`: str or None;
+  `float`: float64, NaN when missing; `integer`, `long`, `boolean`: int32, int64, bool, or pandas' nullable `Int32`,
+  `Int64`, `boolean` when any value is missing; `knn_vector`: float32 arrays or None); then `_first_offset` and
+  `_last_offset` (int64). Unmapped fields are not columns. `df.attrs["version"]` is the offset it is at. At head it
+  reads the docs table; at an earlier offset it replays the log.
+
 - **The indexer** (`dataplane/indexer/`): `build(store, mapping, out_dir, device_budget=None) -> Path` takes
-  `snapshot(head)`, calls `engine.build.build_segment(snapshot, mapping)`, and writes it with
-  `engine.segment.write_segment`. The segment's `version` is that head offset. Doc ids are row order of the snapshot,
-  i.e. ascending `first_offset`, so a rebuild keeps the relative order of surviving documents (ties stay stable).
-- **The updater** (`dataplane/updater/`): `Replica(store, segment_dir, device)` holds the live `Index` and a reference
-  to swap. `poll()` reads `store.changes(after=index.version)`: `patch` → `Index.patch`, `delete` → `Index.delete`,
-  `upsert` → counted as pending (visible only after the next build and swap). `swap(new_segment_dir)` loads the second
-  `Index` (after the 2x budget check, §0), replays changes after its version, then swaps one reference; searches in
-  flight finish on the old one. Freshness = time from `apply` returning to `poll` making it visible.
+  `snapshot(head)`, calls `engine.build.build_segment(snapshot, mapping)`, sets `seg.manifest["version"]` to that head
+  offset, and writes it with `engine.segment.write_segment` into `out_dir/.tmp-*`, renamed to
+  `out_dir/<segment_id>` when complete (it accepts a writer that treats the path as the segment directory or as its
+  parent). Doc ids are row order of the snapshot, i.e. ascending `first_offset`, so a rebuild keeps the relative order
+  of surviving documents (ties stay stable). `device_budget` refuses a segment whose `device_nbytes` exceeds it
+  (`OverBudget`). v1 has one segment per index, so **every build is a full merge**: deletes are dropped and statistics
+  recomputed. Also `list_segments`, `latest_segment`, `gc(out_dir, keep=3, protect=())`, `MergePolicy(max_deleted_ratio,
+  max_pending, max_age_s).due(replica.stats())`, `reindex(store, out_dir, replica)` (§7 `_reindex`), and the job
+  `python -m dataplane.indexer --store --mapping --out [--ingest FILE]`.
+- **The updater** (`dataplane/updater/`): `Replica(store, segment_dir, device="cpu", budget=None, batch=32)` holds the
+  live `Index` and a reference to swap; `segment_dir` is a segment or a directory of them (the latest is loaded).
+  Loading checks `device_nbytes + work_nbytes <= budget`, then replays the log. `poll()` reads
+  `store.changes(after=index.version)`: `patch` → `Index.patch`, `delete` → `Index.delete`, `upsert` → counted as
+  pending (visible only after the next build and swap). Within a poll the changes are coalesced: the last value of a
+  (field, id) wins, one `Index.patch` call per field, one `Index.delete` call, and an id the index does not hold live
+  (upserted or re-inserted since the segment) is not patched: it waits for the build like its upsert.
+  `swap(new_segment_dir)` checks `current device_nbytes + new device_nbytes + work_nbytes <= budget` (the double
+  buffer, §0; 2x when the two are the same size) and raises `engine.backend.OverBudget` otherwise, loads the second
+  `Index`, replays changes after its version (outside the lock, then the rest under it), then swaps one reference;
+  searches in flight finish on the old one. A swap to an older segment is the rollback. `budget=None` is
+  `Backend.memory_budget()` (the §0 rule, computed by the updater until the backends land). Also `start(interval)` /
+  `stop()` (a background poller), `stats()`, `live_ids()`, `on_visible(fn)`. Freshness = time from `apply` returning
+  to `poll` making it visible.
+- **The freshness hook** (for B1-4): `dataplane.freshness.run(store, replica, n_changes=10_000, batch=100,
+  interval=0.005, queries=None, check_rebuild=True) -> FreshnessReport` writes hot-field patches to random live ids,
+  measures each change's apply-to-visible latency (p50, p99, max) and compares every query's response with a fresh
+  rebuild's (`compare_responses`: totals, ids in order, scores at `rtol=1e-5`, sort values but the last element, the
+  internal doc id).
 
 ## 4. Segment format (indexer → engine) · owner architect
 
@@ -486,3 +540,11 @@ status:
 - 2026-11-09, architect: all named errors moved to `engine.errors` (serving matches them by class name); `NoSuchKey`
   added. `Index` gained `save`, `add_ranker`, `candidate_features`, `segment_id`. Section 6: parse and plan are one
   pass in S1. Section 5: rescore puts a tier first in `sort`.
+- 2026-11-09, dataplane-engineer: sections 2 and 3 amended with the S2 code (additive). Section 2: `read_batch`
+  yields a `Rejection` for a malformed line; four reasons added (`malformed`, `bad_op`, `not_hot`, `no_such_key`);
+  coercion and unknown-field rules written down; `apply_changes` for the change feed; the encoder hook and one encoder
+  per store. Section 3: atomic batches (a refused change refuses its batch, so offsets stay gapless), `changes(docs=)`,
+  the snapshot frame's columns and dtypes (`_first_offset`, `_last_offset`), the indexer's version, temp-and-rename
+  writes, merges, gc and job, the updater's coalescing and its swap budget (current plus new, which is 2x for equal
+  sizes), and the freshness hook. Why: these are what the code does, and the engine, serving and the steward's B1-4
+  harness need them to call it. Sections 0 and 4 to 7 are unchanged; what they still need is in the S2 report.
