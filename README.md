@@ -6,7 +6,7 @@ updates, and every result is judged against a matched OpenSearch baseline on pub
 It is the engine of **Floor 2 · Search engine** in Shakabuku Labs, a company of the System 3 city. The floor's records
 live in the lab's repository, `hanialshater/shakabuku-labs`:
 - the brief: `docs/search-floor/BRIEF.md`;
-- the interfaces: `docs/search-floor/INTERFACES.md`;
+- the interfaces: now `docs/INTERFACES.md` here (the lab's `docs/search-floor/INTERFACES.md` was the skeleton);
 - the milestones S1 to S4, with predictions: `company/milestones.json`;
 - the owner's asks: `company/asks.json`.
 
