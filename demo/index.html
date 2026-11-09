@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S3 Search demo</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>S3 Search</h1>
+  <form id="search-form" role="search">
+    <label class="sr" for="q">Search the catalogue</label>
+    <input id="q" type="search" placeholder="Search products" autocomplete="off" autofocus>
+    <button type="submit">Search</button>
+  </form>
+  <label class="toggle"><input id="explain" type="checkbox"> Explain scores</label>
+</header>
+
+<div class="layout">
+  <aside id="filters" aria-label="Filters">
+    <fieldset id="facet-category"><legend>Category</legend><div class="opts"></div></fieldset>
+    <fieldset id="facet-brand"><legend>Brand</legend><div class="opts"></div></fieldset>
+    <fieldset id="price"><legend>Price</legend>
+      <label>Min <input id="price-min" type="number" min="0" step="any" inputmode="decimal"></label>
+      <label>Max <input id="price-max" type="number" min="0" step="any" inputmode="decimal"></label>
+    </fieldset>
+    <button id="clear" type="button">Clear filters</button>
+  </aside>
+
+  <main>
+    <p id="summary" role="status" aria-live="polite"></p>
+    <p id="error" role="alert" hidden></p>
+    <ol id="results"></ol>
+    <nav id="pager" aria-label="Pages">
+      <button id="prev" type="button" disabled>Previous</button>
+      <span id="page-label"></span>
+      <button id="next" type="button" disabled>Next</button>
+    </nav>
+    <p id="timing" class="mut"></p>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
