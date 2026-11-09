@@ -21,7 +21,7 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S1-1 | Interfaces sections 4 to 6: segment format, request and response, plan | open | |
+| S1-1 | Interfaces sections 4 to 6: segment format, request and response, plan | claimed | architect, 2026-11-09 |
 | S1-2 | `engine/ops/`: analysis and BM25F (multi-field, query-time weights), checked against a reference implementation | open | |
 | S1-3 | Exact dense search with a small CPU model; device-agnostic (CPU and CUDA) | open | |
 | S1-4 | Filters as bitmaps, terms facets over the full match set, top-k with from/size and search_after | open | |
@@ -33,7 +33,7 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S2-1 | Interfaces sections 2 and 3: mappings, intake, the key-value store and its change log | open | |
+| S2-1 | Interfaces sections 2 and 3: mappings, intake, the key-value store and its change log | claimed | architect, 2026-11-09 (drafted for the dataplane-engineer, who owns and may amend it) |
 | S2-2 | Intake: batch parquet and JSONL, validation, rejected records, enrichment with embeddings | open | |
 | S2-3 | The key-value store (embedded, for example RocksDB or SQLite) with an ordered change log | open | |
 | S2-4 | The indexer: segments from the store; merges and deletes | open | |
@@ -51,7 +51,7 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S4-1 | Interfaces section 7: the admin API and the `SearchIndex` resource | open | |
+| S4-1 | Interfaces section 7: the admin API and the `SearchIndex` resource | claimed | architect, 2026-11-09 (drafted for the platform-engineer, who owns and may amend it) |
 | S4-2 | Serving: HTTP and RPC, the batching scheduler, caching, health, stage timings | open | |
 | S4-3 | The admin API: create, reindex, list versions, roll back | open | |
 | S4-4 | The Kubernetes operator: the `SearchIndex` resource, the indexer job, replicas, rolling swaps; on kind | open | |
