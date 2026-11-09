@@ -51,10 +51,10 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S4-1 | Interfaces section 7: the admin API and the `SearchIndex` resource | claimed | architect, 2026-11-09 (drafted for the platform-engineer, who owns and may amend it) |
-| S4-2 | Serving: HTTP and RPC, the batching scheduler, caching, health, stage timings | open | |
-| S4-3 | The admin API: create, reindex, list versions, roll back | open | |
-| S4-4 | The Kubernetes operator: the `SearchIndex` resource, the indexer job, replicas, rolling swaps; on kind | open | |
+| S4-1 | Interfaces section 7: the admin API and the `SearchIndex` resource | claimed | platform-engineer 2026-11-09 (the architect drafted it; the platform-engineer owns and amends it) |
+| S4-2 | Serving: HTTP and RPC, the batching scheduler, caching, health, stage timings | claimed | platform-engineer 2026-11-09 |
+| S4-3 | The admin API: create, reindex, list versions, roll back | claimed | platform-engineer 2026-11-09 |
+| S4-4 | The Kubernetes operator: the `SearchIndex` resource, the indexer job, replicas, rolling swaps; on kind | claimed | platform-engineer 2026-11-09 |
 
 ## S5 · Tools and the demo page (tools-engineer)
 
