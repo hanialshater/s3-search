@@ -13,7 +13,7 @@ NOTE = re.compile(r"\n> Copy of `hanialshater/shakabuku-labs`.*?\n(?=\n|#)", re.
 
 
 def body(text: str) -> str:
-    return NOTE.sub("\n", text).strip()
+    return NOTE.sub("", text).strip()
 
 
 def main() -> int:
