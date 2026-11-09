@@ -33,11 +33,11 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S2-1 | Interfaces sections 2 and 3: mappings, intake, the key-value store and its change log | claimed | dataplane-engineer, 2026-11-09 (drafted by the architect) |
-| S2-2 | Intake: batch parquet and JSONL, validation, rejected records, enrichment with embeddings | claimed | dataplane-engineer, 2026-11-09 |
-| S2-3 | The key-value store (embedded, for example RocksDB or SQLite) with an ordered change log | claimed | dataplane-engineer, 2026-11-09 |
-| S2-4 | The indexer: segments from the store; merges and deletes | claimed | dataplane-engineer, 2026-11-09 |
-| S2-5 | The GPU updater: segment loading, the double-buffered swap, hot columns patched in place | claimed | dataplane-engineer, 2026-11-09 |
+| S2-1 | Interfaces sections 2 and 3: mappings, intake, the key-value store and its change log | in review | dataplane-engineer, 2026-11-09 (drafted by the architect) |
+| S2-2 | Intake: batch parquet and JSONL, validation, rejected records, enrichment with embeddings | in review | dataplane-engineer, 2026-11-09 |
+| S2-3 | The key-value store (embedded, for example RocksDB or SQLite) with an ordered change log | in review | dataplane-engineer, 2026-11-09 |
+| S2-4 | The indexer: segments from the store; merges and deletes | in review | dataplane-engineer, 2026-11-09 |
+| S2-5 | The GPU updater: segment loading, the double-buffered swap, hot columns patched in place | in review | dataplane-engineer, 2026-11-09 |
 
 ## S3 · Query DSL and planner (architect)
 
