@@ -41,6 +41,12 @@ ESCI is public, so the hold-out is a rule:
 - The founder's draw is scored only in Colab, so no member knows which 2,000 queries it holds.
 - A stronger hold-out, for later, is fresh queries labelled by an LLM judge.
 
+## Changes awaiting the steward's approval
+
+- **2026-11-09, onboarding (not the steward): `loader.py` falls back to GitHub's LFS host** when `github.com/raw` is
+  blocked. It changes no metric and no split. It takes effect only if the founder, as evaluation steward, merges
+  s3-search pull request #1.
+
 ## Status (2026-11-09)
 
 - `metrics.py` and `loader.py` exist, and 14 tests are green.

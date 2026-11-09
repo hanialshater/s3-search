@@ -11,6 +11,7 @@ roles (`.claude/agents/`) and the lessons (`company/knowledge/entries.jsonl`). T
 1. Read the floor's milestones and asks in the lab repository. If you were given a role, read its file there.
 2. Claim an item before touching an area that is not yours (the areas and owners are in `README.md`).
 3. Run `python -m referee fast` before you change anything, and record the result.
+4. Run `python scripts/check_roles.py`: the crew's roles must match the lab's, the source.
 
 ## How the crew runs
 

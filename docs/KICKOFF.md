@@ -13,6 +13,7 @@ cd s3-search
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 python -m referee fast                                      # green before anything changes
+python scripts/check_roles.py                               # the subagents match the lab's roles
 claude                                                      # Claude Code, opened in s3-search
 ```
 
