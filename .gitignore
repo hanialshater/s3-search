@@ -5,6 +5,7 @@ results/
 __pycache__/
 .pytest_cache/
 *.tmp
+results.json
 
 # Claude Code subagent worktrees (local only)
 .claude/worktrees/
