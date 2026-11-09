@@ -1,0 +1,19 @@
+# The same kind of index on a GPU node pool. Only device: cuda adds nvidia.com/gpu limits, the nodeSelector and the
+# toleration. Needs a cluster with the NVIDIA device plugin; applying it creates nothing outside that cluster.
+apiVersion: search.s3.dev/v1alpha1
+kind: SearchIndex
+metadata:
+  name: esci-sample-gpu
+spec:
+  mapping:
+    configMapRef: {name: esci-mapping, key: mapping.json}
+  source:
+    pvc: esci-data
+    path: esci-sample/products.parquet
+  device: cuda
+  replicas: 2
+  resources:
+    requests: {cpu: "2", memory: 8Gi}
+    limits: {memory: 16Gi, nvidia.com/gpu: 1}
+  storage: {size: 20Gi, accessModes: [ReadWriteMany]}
+  image: s3-search:cuda

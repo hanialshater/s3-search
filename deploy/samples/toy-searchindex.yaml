@@ -1,0 +1,18 @@
+# A sample SearchIndex on the synthetic toy products baked into the image (CPU). Create the mapping ConfigMap first:
+#   kubectl create configmap toy-mapping --from-file=mapping.json=deploy/samples/toy-mapping.json
+apiVersion: search.s3.dev/v1alpha1
+kind: SearchIndex
+metadata:
+  name: toy
+spec:
+  mapping:
+    configMapRef: {name: toy-mapping, key: mapping.json}
+  source:
+    path: /app/deploy/samples/toy-products.jsonl
+  device: cpu
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  storage: {size: 1Gi}
+  image: s3-search:cpu

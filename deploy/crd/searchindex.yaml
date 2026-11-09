@@ -1,0 +1,141 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: searchindexes.search.s3.dev
+spec:
+  group: search.s3.dev
+  scope: Namespaced
+  names:
+    kind: SearchIndex
+    listKind: SearchIndexList
+    plural: searchindexes
+    singular: searchindex
+    shortNames: [si]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+        scale:
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.readyReplicas
+      additionalPrinterColumns:
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Device, type: string, jsonPath: .spec.device}
+        - {name: Segment, type: string, jsonPath: .status.segmentId}
+        - {name: Version, type: integer, jsonPath: .status.version}
+        - {name: Ready, type: string, jsonPath: .status.readyReplicas, description: ready replicas}
+        - {name: Replicas, type: integer, jsonPath: .spec.replicas}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [mapping, source]
+              properties:
+                mapping:
+                  type: object
+                  description: The OpenSearch mapping body (docs/INTERFACES.md section 2), from a ConfigMap in this namespace.
+                  required: [configMapRef]
+                  properties:
+                    configMapRef:
+                      type: object
+                      required: [name]
+                      properties:
+                        name: {type: string, minLength: 1}
+                        key: {type: string, default: mapping.json}
+                source:
+                  type: object
+                  description: The data the indexer reads. With pvc, path is relative to that claim, mounted read-only at /source.
+                  required: [path]
+                  properties:
+                    path: {type: string, minLength: 1}
+                    pvc: {type: string}
+                device:
+                  type: string
+                  enum: [cpu, torch-cpu, cuda]
+                  default: cpu
+                  description: Only cuda adds nvidia.com/gpu limits, a nodeSelector and a toleration.
+                replicas:
+                  type: integer
+                  minimum: 0
+                  default: 1
+                resources:
+                  type: object
+                  description: Container resources for the replicas (and the indexer, without any GPU). nvidia.com/gpu is allowed only with device cuda.
+                  properties:
+                    requests:
+                      type: object
+                      additionalProperties: {x-kubernetes-int-or-string: true}
+                    limits:
+                      type: object
+                      additionalProperties: {x-kubernetes-int-or-string: true}
+                segmentVersion:
+                  type: string
+                  nullable: true
+                  pattern: '^seg-[0-9]+-[0-9a-f]{8}$'
+                  description: null serves the latest built segment; a segment id pins it (a roll back).
+                reindexToken:
+                  type: string
+                  description: Change it to build again from the same inputs.
+                image:
+                  type: string
+                  description: Defaults to the operator's CPU or CUDA image for the device.
+                imagePullPolicy:
+                  type: string
+                  enum: [Always, IfNotPresent, Never]
+                storage:
+                  type: object
+                  default: {}
+                  properties:
+                    size: {type: string, default: 5Gi}
+                    storageClassName: {type: string}
+                    accessModes:
+                      type: array
+                      items: {type: string}
+                      default: [ReadWriteOnce]
+                    existingClaim: {type: string, description: Use this claim instead of creating one.}
+                serving:
+                  type: object
+                  properties:
+                    maxBatch: {type: integer, minimum: 1}
+                    maxWaitMs: {type: number, minimum: 0}
+                    cacheSize: {type: integer, minimum: 0}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Indexing, Ready, Swapping, Failed]
+                message: {type: string}
+                segmentId: {type: string}
+                version: {type: integer}
+                latestSegmentId: {type: string}
+                replicas: {type: integer}
+                readyReplicas: {type: integer}
+                observedGeneration: {type: integer}
+                indexJob:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                segments:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: {type: string}
+                      status: {type: string}
+                      reason: {type: string}
+                      message: {type: string}
+                      lastTransitionTime: {type: string}
+                      observedGeneration: {type: integer}
