@@ -1,0 +1,35 @@
+:root {
+  --bg: #fff; --fg: #1c1b19; --mut: #6b675e; --line: #dedbd2; --card: #f7f5f0; --acc: #1f5fbf; --acc-fg: #fff;
+  --err-bg: #fdecea; --err: #a1271b;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #171613; --fg: #ece9e1; --mut: #a29d90; --line: #37342d; --card: #201f1b; --acc: #6aa3ff; --acc-fg: #10223f;
+          --err-bg: #3a1f1c; --err: #ff9d90; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+h1 { font-size: 1.2rem; margin: 0; }
+#search-form { display: flex; flex: 1 1 320px; gap: 8px; }
+#q { flex: 1; min-width: 0; padding: 8px 10px; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+button { font: inherit; padding: 7px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+button[type=submit] { background: var(--acc); color: var(--acc-fg); border-color: var(--acc); }
+button:disabled { opacity: .5; cursor: default; }
+.sr { position: absolute; left: -9999px; }
+.layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 24px; padding: 16px; max-width: 1100px; margin: 0 auto; }
+@media (max-width: 720px) { .layout { grid-template-columns: 1fr; } }
+fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 12px; padding: 8px 10px; }
+legend { font-weight: 600; padding: 0 4px; }
+.opts label { display: flex; gap: 6px; align-items: baseline; }
+.opts .count { color: var(--mut); margin-left: auto; font-variant-numeric: tabular-nums; }
+#price label { display: block; margin: 4px 0; }
+#price input { width: 6.5em; padding: 4px 6px; font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
+#results { list-style: none; padding: 0; margin: 0; }
+#results > li { border-bottom: 1px solid var(--line); padding: 10px 0; }
+.title { font-weight: 600; }
+.meta { color: var(--mut); }
+.score { color: var(--mut); font-size: .85em; font-variant-numeric: tabular-nums; }
+details pre { overflow: auto; background: var(--card); padding: 8px; font-size: .82em; }
+#pager { display: flex; gap: 12px; align-items: center; margin: 16px 0 4px; }
+.mut { color: var(--mut); font-size: .85em; }
+#error { background: var(--err-bg); color: var(--err); padding: 8px 12px; border-radius: 6px; }
