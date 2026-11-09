@@ -1,0 +1,7 @@
+data/
+results/
+*.parquet
+!referee/tests/fixtures/*.parquet
+__pycache__/
+.pytest_cache/
+*.tmp
