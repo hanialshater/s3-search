@@ -1,0 +1,66 @@
+# The Kubernetes end-to-end test (S4-4): a kind cluster in the runner, the CPU image built and loaded into it, the
+# operator installed, a SearchIndex on the toy dataset brought to Ready, a new segment rolled under a 50 QPS replay with
+# zero failed queries, then rolled back.
+#
+# This is a test, not a deploy: the cluster exists only inside the runner and is gone when the job ends. Nothing is
+# pushed to a registry or to a cloud, and no step deploys anything. The step that needs the real engine
+# (`python -m serving build` imports engine.api and dataplane) fails until S1-6 and S2-4 have landed.
+name: kind-e2e
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "serving/**"
+      - "engine/**"
+      - "dataplane/**"
+      - "requirements*.txt"
+      - ".github/workflows/kind-e2e.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kind-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kind-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KIND_VERSION: v0.24.0
+      KIND_NODE_IMAGE: kindest/node:v1.31.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests that need no cluster
+        run: |
+          python -m pip install -r requirements.txt pyyaml
+          python -m pytest serving/tests deploy/tests -q
+
+      - name: Build the CPU image
+        run: docker build -f deploy/Dockerfile --build-arg BASE=cpu -t s3-search:cpu .
+
+      - name: Install kind and create the cluster
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+          kind create cluster --name s3-search --image "${KIND_NODE_IMAGE}" --wait 120s
+
+      - name: Load the image into the cluster
+        run: kind load docker-image s3-search:cpu --name s3-search
+
+      - name: Operator, toy SearchIndex, rolling swap under load, roll back
+        run: bash deploy/e2e/run.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get searchindex,deploy,job,pod,svc,pvc -A -o wide || true
+          kubectl get searchindex toy -o yaml || true
+          kubectl -n s3-search-system logs deploy/s3-operator --tail=200 || true
+          kubectl logs -l app.kubernetes.io/component=indexer --tail=100 --all-containers || true
+          kubectl logs -l app.kubernetes.io/component=replica --tail=100 --all-containers || true
+          kubectl describe pods || true
