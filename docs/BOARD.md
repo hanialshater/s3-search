@@ -10,12 +10,12 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| B1-1 | `toy` dataset: a synthetic catalogue of about 200 products with judgments, built in under 1 s, for tests | open | |
-| B1-2 | `esci-sample`: the judged products of 2,000 training and 500 test queries, cached as parquet under `data/` | open | |
-| B1-3 | `python -m referee bench --dataset=…`: quality, latency (p50 and p99), throughput and cost to `results.json` | open | |
-| B1-4 | The freshness check: 10,000 hot-field changes; time to visible at p99; results equal to a rebuild | open | |
-| B1-5 | The DSL conformance suite: 200 requests, replayed against OpenSearch and the engine (feeds S3) | open | |
-| B1-6 | `referee full` and the Colab notebook wired to the engine's API | open | |
+| B1-1 | `toy` dataset: a synthetic catalogue of about 200 products with judgments, built in under 1 s, for tests | in review | evaluation-steward, 2026-11-09 |
+| B1-2 | `esci-sample`: the judged products of 2,000 training and 500 test queries, cached as parquet under `data/` | in review | evaluation-steward, 2026-11-09 |
+| B1-3 | `python -m referee bench --dataset=…`: quality, latency (p50 and p99), throughput and cost to `results.json` | in review | evaluation-steward, 2026-11-09 |
+| B1-4 | The freshness check: 10,000 hot-field changes; time to visible at p99; results equal to a rebuild | in review | evaluation-steward, 2026-11-09 |
+| B1-5 | The DSL conformance suite: 200 requests, replayed against OpenSearch and the engine (feeds S3) | in review | evaluation-steward, 2026-11-09 |
+| B1-6 | `referee full` and the Colab notebook wired to the engine's API | in review | evaluation-steward, 2026-11-09 |
 
 ## S1 · GPU operators (architect)
 
