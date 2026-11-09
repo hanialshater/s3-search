@@ -1,0 +1,24 @@
+{
+ "seed": 20261109,
+ "locale": "us",
+ "small_version": 1,
+ "queries": {
+  "test": 500,
+  "train": 2000
+ },
+ "judgments": {
+  "test": 9701,
+  "train": 40714
+ },
+ "fit_labels": {
+  "C": 1693,
+  "E": 17562,
+  "I": 7206,
+  "S": 14253
+ },
+ "products": 48639,
+ "sha256": {
+  "product_ids": "0b6cecee9bd4b53be8fb60480812339cae128280bd08af17dbd084059a2298d0",
+  "examples": "e1048ccab850a66c298e984bcb9572dc51c9849258966bbd8afcdbf81b1178bc"
+ }
+}
