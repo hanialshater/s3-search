@@ -14,14 +14,18 @@ live in the lab's repository, `hanialshater/shakabuku-labs`:
 
 ## Layout
 
-| Path | What | Owner |
-|---|---|---|
-| `baseline/` | The Colab prototype `esci_gpu_vs_opensearch.ipynb` (A100, 2026-11-05): the numbers S1 must reproduce | founder |
-| `engine/` | The query engine: analysis, BM25F, dense, filters, facets, fusion, features, ranker; `engine/api.py` | architect |
-| `dataplane/` | The key-value store and change log, segments, the double-buffered swap, the GPU updater | dataplane-engineer |
-| `tools/` | Side by side, debug (explain), the test-drive report | tools-engineer |
-| `demo/` | The public demo (deploys only with the founder's approval) | tools-engineer |
-| `referee/` | The loader, the metrics, the checks, the Colab referee: the only judge | evaluation-steward |
+The design is the floor's design 2, run from Claude Code with the roles as subagents. See `docs/KICKOFF.md`; the
+work items are in `docs/BOARD.md`.
+
+| Path | What | Owner | Milestone |
+|---|---|---|---|
+| `baseline/` | The Colab prototype `esci_gpu_vs_opensearch.ipynb` (A100, 2026-11-05): the numbers S1 must reproduce | founder | |
+| `datasets/`, `referee/` | The datasets (`toy`, `esci-sample`, `esci-us`), the loader, the metrics, the checks, the benchmark, the Colab referee | evaluation-steward | B1 |
+| `engine/` | The GPU operators (BM25F, dense, filters, facets, pagination, fusion), ranking, the query DSL and planner, `engine/api.py` | architect | S1, S3, S6 |
+| `dataplane/` | Intake, the key-value store and its change log, the indexer and segments, the GPU updater | dataplane-engineer | S2 |
+| `serving/` | HTTP and RPC, batching, caching, the admin API, observability | platform-engineer | S4 |
+| `deploy/` | The Kubernetes operator (`SearchIndex`), tested on kind | platform-engineer | S4 |
+| `tools/`, `demo/` | Side by side, explain, the test-drive report, the demo page | tools-engineer | S5 |
 
 ## The referee
 

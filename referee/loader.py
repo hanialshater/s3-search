@@ -18,7 +18,8 @@ from pathlib import Path
 
 import pandas as pd
 
-BASE_URL = "https://github.com/amazon-science/esci-data/raw/main/shopping_queries_dataset/"
+BASE_URLS = ("https://github.com/amazon-science/esci-data/raw/main/shopping_queries_dataset/",
+             "https://media.githubusercontent.com/media/amazon-science/esci-data/main/shopping_queries_dataset/")
 PRODUCTS = "shopping_queries_dataset_products.parquet"
 EXAMPLES = "shopping_queries_dataset_examples.parquet"
 PRODUCT_COLS = ["product_id", "product_title", "product_brand", "product_color", "product_bullet_point",
@@ -44,11 +45,17 @@ def fetch(data_dir: Path = DEFAULT_DIR) -> None:
         if _is_parquet(path):
             continue
         tmp = path.with_suffix(".tmp")
-        urllib.request.urlretrieve(BASE_URL + name, tmp)
-        if not _is_parquet(tmp):
+        for base in BASE_URLS:  # github.com/raw redirects to the LFS host; some networks allow only the LFS host
+            try:
+                urllib.request.urlretrieve(base + name, tmp)
+            except OSError:
+                continue
+            if _is_parquet(tmp):
+                tmp.replace(path)
+                break
             tmp.unlink(missing_ok=True)
-            raise IOError(f"{name} is not a valid Parquet file")
-        tmp.replace(path)
+        else:
+            raise IOError(f"{name}: no valid Parquet file from {', '.join(BASE_URLS)}")
 
 
 def _examples(data_dir: Path, locale: str) -> pd.DataFrame:
