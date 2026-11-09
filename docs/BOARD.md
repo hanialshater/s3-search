@@ -21,12 +21,12 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S1-1 | Interfaces sections 4 to 6: segment format, request and response, plan | claimed | architect, 2026-11-09 |
-| S1-2 | `engine/ops/`: analysis and BM25F (multi-field, query-time weights), checked against a reference implementation | open | |
-| S1-3 | Exact dense search with a small CPU model; device-agnostic (CPU and CUDA) | open | |
-| S1-4 | Filters as bitmaps, terms facets over the full match set, top-k with from/size and search_after | open | |
-| S1-5 | RRF fusion and feature gather; the GBDT trained on judged items plus random negatives, not top unjudged | open | |
-| S1-6 | `engine/api.py` and the referee's contract checks on `toy` | open | |
+| S1-1 | Interfaces sections 4 to 6: segment format, request and response, plan | in review | architect, 2026-11-09 |
+| S1-2 | `engine/ops/`: analysis and BM25F (multi-field, query-time weights), checked against a reference implementation | in review | architect, 2026-11-09 |
+| S1-3 | Exact dense search with a small CPU model; device-agnostic (CPU and CUDA) | in review | architect, 2026-11-09 |
+| S1-4 | Filters as bitmaps, terms facets over the full match set, top-k with from/size and search_after | in review | architect, 2026-11-09 |
+| S1-5 | RRF fusion and feature gather; the GBDT trained on judged items plus random negatives, not top unjudged | in review | architect, 2026-11-09 |
+| S1-6 | `engine/api.py` and the referee's contract checks on `toy` | in review | architect, 2026-11-09 |
 | S1-7 | Reproduce 0.304 nDCG@10 on ESCI-US in Colab, with title-only parity against OpenSearch | open | |
 
 ## S2 · Data plane (dataplane-engineer)

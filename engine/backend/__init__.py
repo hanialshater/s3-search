@@ -11,7 +11,8 @@ Determinism rules every implementation keeps:
 - scores are float32; reductions are deterministic on a device (sort-based segment sums, never float atomics);
 - every ranking op breaks ties by index (doc id) ascending.
 
-The implementations (``engine/backend/numpy_backend.py``, ``engine/backend/torch_backend.py``) land in S1.
+The implementations: ``engine/backend/numpy_backend.py`` and ``engine/backend/torch_backend.py``. On torch devices a
+bitmap lives as a bool mask; ``pack_bits``/``unpack_bits`` give the packed uint32 form for storage.
 """
 from __future__ import annotations
 
@@ -26,12 +27,7 @@ ENV_BUDGET = "S3_SEARCH_DEVICE_BUDGET"
 ENV_FAST = "S3_SEARCH_FAST"
 
 
-class DeviceUnavailable(RuntimeError):
-    """The requested device cannot be used here (torch missing, no CUDA)."""
-
-
-class OverBudget(MemoryError):
-    """A load or a double-buffered swap would exceed ``Backend.memory_budget()``."""
+from ..errors import DeviceUnavailable, OverBudget  # noqa: E402  (one home for the named errors)
 
 
 @runtime_checkable
@@ -51,6 +47,19 @@ class Backend(Protocol):
     def concatenate(self, arrays: Sequence[Array], axis: int = 0) -> Array: ...
     def astype(self, a: Array, dtype: str) -> Array: ...
     def where(self, cond: Array, a: Array | float, b: Array | float) -> Array: ...
+    def stack(self, arrays: Sequence[Array], axis: int = 0) -> Array: ...
+    def copy(self, a: Array) -> Array: ...
+
+    # ---- elementwise, reductions, indexing (names differ between numpy and torch, so they are here)
+    def log1p(self, a: Array) -> Array: ...
+    def isnan(self, a: Array) -> Array: ...
+    def sum(self, a: Array, axis: int | None = None) -> Array: ...
+    def nonzero(self, mask: Array) -> tuple[Array, ...]:
+        """Indices of true entries, one int64 array per axis, in row-major order."""
+    def take_along(self, a: Array, idx: Array, axis: int = -1) -> Array: ...
+    def searchsorted(self, sorted_a: Array, v: Array, right: bool = False) -> Array: ...
+    def argsort(self, a: Array, descending: bool = False) -> Array:
+        """Stable argsort along the last axis (equal keys keep index order)."""
 
     # ---- sparse CSR (BM25F) -------------------------------------------------------------------------------------
     def csr_expand(self, ptr: Array, rows: Array, owners: Array) -> tuple[Array, Array]:
@@ -64,9 +73,13 @@ class Backend(Protocol):
         """``out[k] = sum(values[keys == k])`` for k in ``range(n)``; float32; deterministic order of summation
         (by entry index) on every device."""
 
+    def segment_count(self, keys: Array, n: int) -> Array:
+        """``int32[n]`` counts of ``keys``."""
+
     # ---- dense ----------------------------------------------------------------------------------------------------
     def matmul(self, a: Array, b: Array) -> Array:
-        """``a @ b`` accumulated in float32 (inputs may be float16)."""
+        """``a @ b`` as float32, accumulated in float64 (so a row's result does not depend on the batch it is in);
+        chunked over b's columns. A float32 GEMM is an S6 fast path."""
 
     def topk(self, scores: Array, k: int, valid: Array | None = None) -> tuple[Array, Array]:
         """Per row of ``scores f32[Q,N]``: the k best indices by score descending, ties by index ascending.
@@ -75,11 +88,7 @@ class Backend(Protocol):
         valid entries are padded with idx -1 and val -inf.
         """
 
-    # ---- sort and pagination --------------------------------------------------------------------------------------
-    def lexsort_rows(self, keys: Sequence[Array], descending: Sequence[bool], valid: Array | None = None) -> Array:
-        """Per row, the stable order of indices by ``keys[0]``, then ``keys[1]``, ...; each key ``[Q,N]`` (or ``[N]``,
-        broadcast), with its direction; ties after all keys by index ascending. Invalid entries go last.
-        Returns ``int64[Q,N]``."""
+    # Multi-key sorts (pagination) are composed by the operators from stable ``argsort`` passes, last key first.
 
     # ---- bitmaps (filters) ----------------------------------------------------------------------------------------
     def pack_bits(self, mask: Array) -> Array:
@@ -135,7 +144,17 @@ def resolve_device(device: str | None = None) -> str:
     return device
 
 
+_CACHE: dict = {}
+
+
 def get_backend(device: str | None = None) -> Backend:
-    """The backend for a device. The implementations land with S1 (S1-2 to S1-4)."""
+    """The backend for a device (one instance per device)."""
     device = resolve_device(device)
-    raise NotImplementedError(f"backend {device!r}: lands in S1 (engine/backend/numpy_backend.py, torch_backend.py)")
+    if device not in _CACHE:
+        if device == "cpu":
+            from .numpy_backend import NumpyBackend
+            _CACHE[device] = NumpyBackend()
+        else:
+            from .torch_backend import TorchBackend
+            _CACHE[device] = TorchBackend(device)
+    return _CACHE[device]

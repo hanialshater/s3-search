@@ -20,7 +20,8 @@ One owner per area. Nobody edits another area's paths except by a claimed board 
 | Referee: datasets, loader, metrics, contract tests, benchmark, Colab | evaluation-steward | `referee/`, `datasets/` | 1 |
 
 Import direction (enforced by review, and by a test S1 adds): `referee` imports `engine.api` only;
-`dataplane` imports `engine.analysis`, `engine.segment`, `engine.build`, `engine.backend`; `serving` imports `engine.api`
+`dataplane` imports `engine.analysis`, `engine.segment`, `engine.build`, `engine.backend`, `engine.errors` and
+`engine.api` (for `Index.from_segment`; ruling of 2026-11-09); `serving` imports `engine.api`, `engine.errors`
 and `dataplane`; `tools` imports `serving`'s HTTP API or `engine.api`. **`engine` never imports `dataplane`, `serving`
 or `tools`.** Nobody imports `referee` except `referee.loader` (the data rule) and the referee itself.
 
@@ -113,7 +114,7 @@ names.
 - **Types (v1):** `text` (searchable; BM25F field), `keyword` (term/terms filters, terms aggs, sort; single-valued
   in v1), `float`, `integer`, `long`, `boolean` (term/range filters, sort), `knn_vector` (exact dense; the `method`
   is accepted for OpenSearch and ignored: the engine is exact). Sub-fields are addressed as `product_brand.keyword`.
-- **Analyzer:** one, `s3_english` (the prototype's: lowercase, `[a-z0-9']+` words, strip `'s` and `'`, English
+- **Analyzer:** one, `s3_english` (the prototype's: lowercase, `[a-z0-9]+(?:'[a-z0-9]+)?` words, strip a trailing `'s`, then `'`, English
   stopwords, Porter stemmer via `snowballstemmer`, which S1 adds to `requirements.txt`). Code:
   `engine.analysis.analyze(text: str, analyzer: str = "s3_english") -> list[str]`. The conformance suite defines the
   same analyzer in the OpenSearch index settings.
@@ -223,6 +224,7 @@ Layout (`seg-<version>-<8 hex>/`):
 | `num/<field>.npy` | float32, int32, int64 or bool [N] | the column |
 | `num/<field>.missing.npy` | uint32 bitmap | missing values |
 | `vec/<field>.npy` | float16 or float32 [N, D] | L2-normalised vectors |
+| `vec/<field>.encoder.terms.parquet`, `.encoder.idf.npy`, `.encoder.components.npy` | string; float32 [V]; float32 [V, D] | the fitted query encoder (`tfidf-svd-<d>`), when the engine produced the vectors |
 
 `manifest.json`:
 
@@ -261,7 +263,32 @@ class Index:
     def patch(self, field: str, ids: Sequence[str], values: Sequence) -> None   # hot fields only; NotHot otherwise
     def delete(self, ids: Sequence[str]) -> None                                # clears live bits
     def set_version(self, version: int) -> None                                 # the updater, after a poll
+    def save(self, path) -> Path          # a segment of the current state (patches, deletes, version)
+    def add_ranker(self, name: str, model) -> None   # for rescore.s3_ranker
+    def candidate_features(self, request: dict, window: int) -> tuple[list[str], numpy.ndarray]
 ```
+
+The S1 rules for the data plane (settled 2026-11-09):
+
+- `build_segment(catalogue, mapping, version=0, vector_models=None)` reads only mapped columns and the id column;
+  other columns, including the store's `_`-prefixed ones, are ignored, except `_first_offset` (per doc; `0..N-1` when
+  absent). Numeric columns may be numpy dtypes, object columns with `None`, or pandas' nullable `Int32`, `Int64`,
+  `Float32`, `boolean`; missing values go to the missing bitmap. Vectors given as a column may have `None` rows
+  (stored as zero vectors). `vector_models={field: name}` (or `catalogue.attrs["vector_models"]`) names the encoder
+  that produced given vectors and is written as `vector_fields.<f>.model`; without it the model is `"given"`. A
+  `neural` query needs an encoder stored in the segment (only `tfidf-svd-<d>` fitted at build in v1); with given
+  vectors only `knn` works.
+- **The version:** `build_segment(..., version=)` sets `manifest["version"]`; a caller may also set
+  `seg.manifest["version"]` before writing. `write_segment` writes whatever it holds and derives
+  `segment_id = seg-<version>-<first 8 hex of the checksum>` from it and the content.
+- `write_segment(seg, path)`: `path` is the segment directory itself; it must not exist or be an empty directory
+  (`FileExistsError` otherwise); written to a sibling `<name>.tmp`, then renamed. `Index.save(path)` follows the same
+  rule.
+- `Index.patch` and `Index.delete`: `NoSuchKey` (a `KeyError`) for ids the segment never held; already-deleted ids
+  are ignored by both (a patch to a deleted id is not applied). `None` or NaN in a patch makes the value missing.
+- **Concurrency:** an `Index` is thread-safe. `search`, `search_batch`, `patch`, `delete`, `set_version`, `save`
+  and `candidate_features` take one re-entrant lock per `Index`, so a search sees a whole `patch`/`delete` call or
+  none of it. Searches on one `Index` therefore run one batch at a time; serving batches with `search_batch`.
 
 ## 5. The search request and response (serving → engine) · owner architect
 
@@ -270,9 +297,15 @@ class Index:
 ```python
 def build_index(catalogue: pandas.DataFrame, mapping: dict, device: str = "cpu") -> Index
 def available_devices() -> list[str]
+# engine/errors.py (imports nothing; all re-exported by engine.api; serving matches them by class name)
 class UnsupportedQuery(ValueError):   # .path (JSON path, e.g. "query.bool.must[1].fuzzy"), .reason
-class InvalidRequest(UnsupportedQuery) # malformed but in-subset (bad types, from+size over 10,000)
-class InvalidMapping(ValueError)
+class InvalidRequest(UnsupportedQuery) # malformed but in-subset (bad types, from+size over 10,000, unknown field)
+class InvalidMapping(ValueError)      # .path, .reason
+class NotHot(ValueError)              # Index.patch on a field not in _meta.engine.hot
+class NoSuchKey(KeyError)             # Index.patch / Index.delete with an _id the segment never held
+class DeviceUnavailable(RuntimeError) # also engine.backend.DeviceUnavailable (the same class)
+class OverBudget(MemoryError)         # also engine.backend.OverBudget
+class CorruptSegment(IOError)         # also engine.segment.CorruptSegment
 Index.search(request: dict) -> dict
 Index.search_batch(requests: list[dict]) -> list[dict]   # same result as [search(r) for r in requests], batched
 Index.from_segment(path, device) -> Index
@@ -286,14 +319,14 @@ Index.from_segment(path, device) -> Index
 | `query.match` | `{field: "text"}` or `{field: {"query", "operator": "or"\|"and", "minimum_should_match", "boost"}}` | text fields; BM25 on one field |
 | `query.multi_match` | `query`, `fields` (`"f^w"` boosts), `type` `best_fields`\|`most_fields`\|`cross_fields`, `operator`, `minimum_should_match`, `tie_breaker` | **all types are scored as BM25F** with field weights = boosts (the prototype's scorer); hit sets follow `operator`/`minimum_should_match` over the analysed query terms |
 | `query.bool` | `must`, `should`, `filter`, `must_not`, `minimum_should_match`, `boost` | scores: sum of `must` and `should`; `filter`/`must_not` do not score |
-| `query.term`, `query.terms` | keyword, numeric, boolean fields | filter context; score 1.0 alone (OpenSearch), 0 inside `filter` |
-| `query.range` | `gte`, `gt`, `lte`, `lt` on numeric and keyword fields | |
+| `query.term`, `query.terms` | keyword, numeric, boolean fields | constant score `1.0 * boost` in a scoring context (alone, `must`, `should`); 0 in `filter` and `must_not` |
+| `query.range` | `gte`, `gt`, `lte`, `lt` on numeric and keyword fields | constant score, as `term` |
 | `query.knn` | `{field: {"vector": [...], "k": int, "filter": query}}` | exact; `_score = (1 + cos) / 2` (OpenSearch `cosinesimil`); `filter` is a pre-filter |
 | `query.match_all` | `{}` | score 1.0 |
 | `query.neural` (S3) | `{field: {"query_text", "k"}}` | encoded by the field's encoder |
 | `query.hybrid` + `rank.rrf` (S1-5, extension) | `{"hybrid": {"queries": [...]}}`, `"rank": {"rrf": {"rank_constant": 60, "window_size": 20000}}` | RRF fusion; `_score` is the RRF score |
 | `rescore` (S1-5, extension) | `{"window_size": 1000, "s3_ranker": {"model": "<name>"}}` | the learned ranker over the top window |
-| `aggs` / `aggregations` | `{name: {"terms": {"field", "size": 10}}}` | over the **full match set**, independent of from/size; buckets by count desc, then key asc |
+| `aggs` / `aggregations` | `{name: {"terms": {"field", "size": 10}}}` on keyword and numeric fields | over the **full match set**, independent of from/size; buckets by count desc, then key asc; keys are strings (keyword), ints (integer, long), floats (float), bools (boolean) |
 | `sort` | `"_score"`, `{"_score": {"order"}}`, `{field: {"order": "asc"\|"desc", "missing": "_last"\|"_first"}}`, `"field"` | default `[_score desc]`; ties always end by doc id asc |
 | `from`, `size` | ints, `from + size <= 10,000` | default 0, 10 |
 | `search_after` | the last hit's `sort` list | with `from` 0 |
@@ -305,6 +338,17 @@ Scoring, exactly:
   `score = sum_terms idf * pseudo_tf * (k1 + 1) / (k1 + pseudo_tf)`. Single-field `match` is the same with one field and
   that field's idf (`df_field`): equal to Lucene's BM25 times `(k1 + 1)` (Lucene drops the constant) up to Lucene's
   lossy length encoding. Query terms are deduplicated.
+- **idf:** `match` uses its field's df (`df_field`). `multi_match` uses the global df (the term in any text field of
+  the mapping, the segment's `df`), except a `multi_match` naming exactly one field (with a weight above 0), which uses
+  that field's df (the prototype's `single_field` rule). Field weights never change the df.
+- **Constant scores:** `term`, `terms`, `range` and `match_all` score `1.0 * boost` in a scoring context, and 0 in
+  `filter` and `must_not`. A `bool` with only `filter`/`must_not` clauses scores 0. (OpenSearch scores a keyword
+  `term` by idf; the conformance suite compares hit sets there, not scores.)
+- `bool`: `must` and `should` scores add; without `must` or `filter`, at least one `should` must match unless
+  `minimum_should_match` says otherwise; with them, `should` is optional.
+- `minimum_should_match`: an int, a negative int (all but n), a percentage rounded down, a negative percentage; for
+  `match` it counts analysed query terms including unknown ones, so `operator: and` with an unknown term matches
+  nothing.
 - `boost` multiplies a clause's score. Scores are float32.
 
 **The response:**
@@ -320,7 +364,8 @@ Scoring, exactly:
 
 - `hits.total` is an int (exact). `_score` is a float; for a non-score sort it is still the query score.
 - `sort` is on every hit: the values of the sort keys, then the internal doc id as the last element (the tie-breaker
-  that makes `search_after` exact). Clients pass it back verbatim.
+  that makes `search_after` exact). Clients pass it back verbatim. A missing field value sorts as `None`. Under
+  `rescore`, the first value is the tier (1 inside the rescored window, 0 below it), so the window comes first.
 - `aggregations` is present only when requested. `took_ms` always has `total`, plus each stage that ran; stage names
   are the closed set above plus `encode` (additive).
 - `explain` (when requested) is a list in hit order, Lucene-shaped: `{value, description, details}` per hit, with per
@@ -329,9 +374,10 @@ Scoring, exactly:
 
 ## 6. The plan (DSL → operators) · owner architect
 
-`engine/dsl/parse.py: parse(request: dict) -> Request` (validates; raises the named errors).
-`engine/plan/plan.py: plan(req: Request, index_meta) -> Plan`. `engine/plan/execute.py: execute(plans: list[Plan],
-state: IndexState, backend: Backend) -> list[dict]`. Plans are frozen dataclasses (hashable, so the executor groups
+`engine/dsl/parse.py: parse(request: dict, state: IndexState) -> Plan` (validates; raises the named errors; in S1
+parsing and planning are one pass, because the parser needs the index's field kinds), wrapped by
+`engine/plan/plan.py: plan(request, state) -> Plan`. `engine/plan/execute.py: Executor(state, rankers).run(plans:
+list[Plan]) -> list[dict]`. Plans are frozen dataclasses (hashable, so the executor groups
 equal shapes into one batch).
 
 ```python
@@ -417,3 +463,26 @@ status:
 
 - 2026-11-09, architect: v1 written from the lab's skeleton (sections 0 and 1 to 7 filled; section 0 added for the
   GPU-portable backend).
+- 2026-11-09, architect (S1 landed; rulings on the evaluation-steward's reading of the contract, `referee/contract/
+  README.md` on the steward's branch):
+  1. **Word pattern:** the prototype's, `[a-z0-9]+(?:'[a-z0-9]+)?`, then a trailing `'s` is cut, then `'` removed.
+     Section 2 said `[a-z0-9']+`, which was a slip; the 0.304 reproduction used the prototype's. `snowballstemmer`'s
+     `porter` agrees with the referee's own Porter stemmer on all 1,000 toy texts and 3,560 other words checked.
+  3. **idf:** confirmed as the steward read it (section 5, "idf").
+  4. **Constant scores:** confirmed as the steward read it (section 5, "Constant scores").
+  Also confirmed: `product_id` may be (and in the referee's mappings is) a keyword property; sort defaults `_score`
+  desc, fields asc, `missing: _last`; knn `_score = (1 + cos) / 2`, total not promised; terms facets on numeric
+  fields with typed keys (added in S1); `.path` names the offending key; cross-implementation tolerance
+  `1e-4 * max(1, |ref|)` with tie groups (section 0's `rtol=1e-5` stays the cross-device bound).
+- 2026-11-09, architect (rulings on the dataplane-engineer's eight questions; section 4 "The S1 rules for the data
+  plane"): (1) `_first_offset` from the snapshot, else `0..N-1`; unmapped and `_`-prefixed columns ignored. (2) Either
+  `build_segment(version=)` or setting `seg.manifest["version"]`; `write_segment` writes what the manifest holds and
+  derives `segment_id` from it. (3) `write_segment` takes the segment directory, which may exist if empty. (4)
+  `NoSuchKey` (a `KeyError`) for unknown ids; deleted ids ignored by `patch` and `delete`. (5) `Index` is
+  thread-safe by one re-entrant lock: a search never sees half a patch. (6) The data plane may import `engine.api`;
+  every named error is in `engine.errors`. (7) `build_segment(vector_models=)` records the encoder of given vectors.
+  (8) Nullable pandas dtypes accepted. Why: these are what the S2 code needs to call the engine without a fake, and
+  each keeps the engine's invariants (doc-id order, checksums, atomic writes).
+- 2026-11-09, architect: all named errors moved to `engine.errors` (serving matches them by class name); `NoSuchKey`
+  added. `Index` gained `save`, `add_ranker`, `candidate_features`, `segment_id`. Section 6: parse and plan are one
+  pass in S1. Section 5: rescore puts a tier first in `sort`.
