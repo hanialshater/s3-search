@@ -54,4 +54,5 @@ def test_devices_agree(ds):
     for dev in DEVICES[1:]:
         other = api.build_index(ds.catalogue, ds.mapping, device=dev)
         for r in checks.lexical_requests(ds)[:60]:
-            checks.assert_same_ranking(other.search(r), base.search(r), f"{dev} vs cpu: {r['query']}")
+            checks.assert_same_ranking(other.search(r), base.search(r), f"{dev} vs cpu: {r['query']}",
+                                       tol=checks.DEVICE_RTOL)

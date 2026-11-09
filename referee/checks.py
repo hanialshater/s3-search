@@ -21,6 +21,7 @@ import pandas as pd
 from referee import reference
 
 SCORE_TOL = 1e-4      # |engine - reference| <= SCORE_TOL * max(1, |reference|); engine scores are float32
+DEVICE_RTOL = 1e-5    # between two devices of the engine (INTERFACES section 0)
 ALL = 10_000          # a page large enough for every toy match
 
 
@@ -30,15 +31,15 @@ def _ids(resp):
     return [h["_id"] for h in resp["hits"]["hits"]]
 
 
-def _close(a, b):
-    return abs(float(a) - float(b)) <= SCORE_TOL * max(1.0, abs(float(b)))
+def _close(a, b, tol=SCORE_TOL):
+    return abs(float(a) - float(b)) <= tol * max(1.0, abs(float(b)))
 
 
-def _groups(scores):
-    """Tie groups: runs of consecutive (descending) scores within SCORE_TOL of their neighbour."""
+def _groups(scores, tol=SCORE_TOL):
+    """Tie groups: runs of consecutive (descending) scores within tol of their neighbour."""
     out, cur = [], [0]
     for i in range(1, len(scores)):
-        if _close(scores[i], scores[i - 1]):
+        if _close(scores[i], scores[i - 1], tol):
             cur.append(i)
         else:
             out.append(cur)
@@ -48,7 +49,7 @@ def _groups(scores):
     return out
 
 
-def assert_same_ranking(got: dict, exp: dict, what: str):
+def assert_same_ranking(got: dict, exp: dict, what: str, tol: float = SCORE_TOL):
     """Full result lists (every match) of a score-sorted request: same total, same scores per id, same order up to
     tie groups."""
     g, e = got["hits"]["hits"], exp["hits"]["hits"]
@@ -59,10 +60,10 @@ def assert_same_ranking(got: dict, exp: dict, what: str):
     escore = {h["_id"]: h["_score"] for h in e}
     for i, h in enumerate(g):
         assert h["_id"] in escore, f"{what}: {h['_id']} is not a match"
-        assert _close(h["_score"], escore[h["_id"]]), \
+        assert _close(h["_score"], escore[h["_id"]], tol), \
             f"{what}: {h['_id']} scored {h['_score']}, reference {escore[h['_id']]}"
-        assert _close(h["_score"], e[i]["_score"]), f"{what}: rank {i} has score {h['_score']}, reference {e[i]['_score']}"
-    for grp in _groups([h["_score"] for h in e]):
+        assert _close(h["_score"], e[i]["_score"], tol), f"{what}: rank {i} has score {h['_score']}, reference {e[i]['_score']}"
+    for grp in _groups([h["_score"] for h in e], tol):
         assert {gids[i] for i in grp} == {e[i]["_id"] for i in grp}, f"{what}: tie group at rank {grp[0]} differs"
 
 
