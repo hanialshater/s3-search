@@ -60,10 +60,10 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S5-1 | Side by side: the engine against OpenSearch, or two versions | open | |
-| S5-2 | Debug (explain): every score and feature contribution for one product | open | |
-| S5-3 | The test-drive report from a referee run | open | |
-| S5-4 | The demo page over ESCI-sample: search, facets, pagination | open | |
+| S5-1 | Side by side: the engine against OpenSearch, or two versions | claimed | tools-engineer, 2026-11-09 |
+| S5-2 | Debug (explain): every score and feature contribution for one product | claimed | tools-engineer, 2026-11-09 |
+| S5-3 | The test-drive report from a referee run | claimed | tools-engineer, 2026-11-09 |
+| S5-4 | The demo page over ESCI-sample: search, facets, pagination | claimed | tools-engineer, 2026-11-09 |
 
 ## S6 · Serving speed (architect)
 
