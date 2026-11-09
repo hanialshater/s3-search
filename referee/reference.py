@@ -78,7 +78,7 @@ class ReferenceIndex:
                 self.keyword[name] = self._keyword(col, spec.get("ignore_above"))
             elif t in ("float", "double", "integer", "long", "boolean"):
                 self.numeric[name] = pd.to_numeric(col.astype(object).where(col.notna(), np.nan),
-                                                   errors="coerce").to_numpy(dtype=np.float64)
+                                                   errors="coerce").to_numpy(dtype=np.float64, copy=True)
                 self.ntype[name] = t
             elif t == "knn_vector":
                 if name in catalogue.columns:

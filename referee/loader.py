@@ -44,6 +44,7 @@ TEXT_FIELDS = PRODUCT_COLS[1:]
 ESCI_MAPPING = {
     "_meta": {"engine": {"id_field": "product_id", "hot": [], "bm25": {"k1": 1.2, "b": 0.75}}},
     "properties": {
+        "product_id": {"type": "keyword"},  # the id as a filterable keyword (freshness probes, lookups)
         "product_title": {"type": "text", "analyzer": "s3_english"},
         "product_brand": {"type": "text", "analyzer": "s3_english",
                           "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
