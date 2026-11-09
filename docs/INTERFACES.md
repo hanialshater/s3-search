@@ -464,22 +464,51 @@ page(b, keys: list[arr[Q,N]], mask bool[Q,N], from_: int, size: int, after: tupl
 
 ## 7. The admin API and the `SearchIndex` resource (platform → data plane) · owner platform-engineer
 
-**Serving** (`serving/`): `serving.app.create_app(config: ServingConfig) -> ASGI app`; stdlib-friendly, the HTTP
-framework is the platform-engineer's call (a decision record if it adds a dependency).
+**Serving** (`serving/`): `serving.app.create_app(config: ServingConfig, ports: Ports | None = None) -> App`, on the
+standard library (`docs/decisions/2026-11-09-serving-and-operator.md`). `App.handle(method, path, body, headers) ->
+Response(status, body, content_type, headers)` is the whole API; `serving.app.make_server(app, host, port)` serves it
+(`python -m serving`). `serving.ports.Ports` is what serving needs from the engine and the data plane (open the store,
+ingest, validate and enrich changes, build a segment from the store, load an `Index`); the defaults call
+`dataplane.kv.Store`, `dataplane.intake.ingest/validate/enrich`, `dataplane.indexer.build` and
+`engine.api.Index.from_segment` exactly as §3 to §5 define them.
 
 | Method, path | Body → response |
 |---|---|
 | `POST /indexes/{name}/_search` | §5 request → §5 response (+ `_source` per hit when asked) |
 | `POST /indexes/{name}/_msearch` | `[request, ...]` → `[response, ...]` (one `search_batch`) |
 | `PUT /indexes/{name}` | `{"mapping": {...}, "source": {"path": "..."}}` → `{"name", "version"}`: intake, build, load |
-| `POST /indexes/{name}/_docs` | `[change record without offset, ...]` → `{"first_offset", "last_offset", "rejected": [...]}` |
+| `POST /indexes/{name}/_docs` | `[change record without offset, ...]` → `{"first_offset", "last_offset", "rejected": [...], "applied": {"patched", "deleted", "pending_upserts"}}`: validate, `store.apply`, then replay the log onto the live index (patches and deletes are visible at once; upserts after the next reindex) |
 | `POST /indexes/{name}/_reindex` | `{}` → `{"segment_id", "version"}`: build from the store, swap |
 | `GET /indexes/{name}/versions` | → `[{"segment_id", "version", "created", "live": bool}]` |
 | `POST /indexes/{name}/_rollback` | `{"segment_id"}` → `{"segment_id", "version"}`: swap to a kept segment, replay the log after it |
-| `GET /healthz`, `GET /readyz`, `GET /metrics` | liveness; ready once a segment is loaded; Prometheus text (stage timings, counters) |
+| `GET /indexes`, `GET /indexes/{name}` | what is loaded: segment id, version, docs, device, cache counters |
+| `GET /healthz`, `GET /readyz`, `GET /metrics` | liveness; ready once every configured index has a segment loaded (503 while loading or draining); Prometheus text (below) |
 
-Errors: HTTP 400 with `{"error": {"type": "unsupported_query" | "invalid_request" | "invalid_mapping", "path", "reason"}}`;
-409 for `over_budget`; 404 for an unknown index or segment.
+- **Batching.** `_search` requests are queued per index; a worker sends up to `max_batch` of them (default 32) to one
+  `Index.search_batch`, waiting at most `max_wait_ms` (default 2.0) after the first arrives. `_msearch` is one
+  `search_batch` itself. If a batch raises, its requests are retried singly so a bad request fails alone.
+- **Query cache.** LRU (`cache_size` entries per index, default 1024) keyed by (segment id, epoch, canonical request
+  JSON); the epoch moves on every swap, patch, delete and `_docs` call, so nothing stale is reachable.
+- **`_source`.** A request carrying `_source` (true, a list of fields, or `{includes, excludes}`) gets each hit's stored
+  document from the store (vectors removed); a replica without the store answers 400 with path `_source`.
+- **Response headers on `_search`:** `X-Request-Id` (echoed or generated), `X-S3-Cache: hit|miss`, `X-S3-Queue-Ms`
+  (time in the scheduler), `X-S3-Serve-Ms`. The engine's `took_ms` is passed through unchanged.
+- **Metrics** (names are the contract the benchmark reads): `s3_http_requests_total{route,status}`,
+  `s3_search_requests_total{index,outcome}`, `s3_cache_hits_total`, `s3_cache_misses_total`, `s3_cache_entries`,
+  `s3_batches_total`, `s3_batch_size` (histogram), `s3_queue_wait_ms` (histogram), `s3_stage_ms{stage}` (histogram of
+  the engine's `took_ms` per stage), `s3_request_ms` (histogram), `s3_errors_total{type}`, `s3_index_version`,
+  `s3_index_docs`, `s3_index_ready`, `s3_swaps_total{kind=load|reindex|rollback}`, `s3_patches_total`,
+  `s3_queue_depth`.
+- **Swaps.** `_reindex` and `_rollback` load the new `Index` first (the budget check, §0, may refuse with
+  `over_budget` and leave the old one serving), replay the change log after its version, then replace one reference;
+  searches in flight finish on the old index. Segments are kept (`keep_segments`, default 5; the live one never pruned).
+- **Configuration** (`serving.config.ServingConfig`, env `S3_SERVING_*`, `S3_SEARCH_DEVICE`): data dir, device,
+  `max_batch`, `max_wait_ms`, `cache_size`, `keep_segments`, `S3_SERVING_PRELOAD=name[:segment_id]`.
+
+Errors: HTTP 400 with `{"error": {"type": "unsupported_query" | "invalid_request" | "invalid_mapping" | "not_hot", "path", "reason"}}`;
+409 for `over_budget`, `index_exists`, `device_unavailable`; 404 for `index_not_found`, `segment_not_found`; 405 for a wrong
+method; 503 for `not_ready` and `overloaded`. The engine's exceptions are recognised by class name (§5), so the
+mapping needs no import.
 
 **The `SearchIndex` custom resource** (`search.s3.dev/v1alpha1`, `deploy/`):
 
@@ -493,22 +522,37 @@ spec:
   device: cpu                                               # cpu | torch-cpu | cuda
   replicas: 2
   resources: {requests: {cpu: "1", memory: 2Gi}, limits: {memory: 4Gi}}   # + nvidia.com/gpu: 1 when device is cuda
-  segmentVersion: null                                      # null: latest; a segment_id pins (rollback)
-  image: s3-search:cpu
+  segmentVersion: null                                      # null: latest; a segment_id pins it (rollback)
+  reindexToken: ""                                          # change it to build again from the same inputs
+  storage: {size: 5Gi, accessModes: [ReadWriteOnce]}        # the segment volume; {existingClaim: name} uses one
+  serving: {maxBatch: 32, maxWaitMs: 2.0, cacheSize: 1024}
+  image: s3-search:cpu                                      # default by device: s3-search:cpu | s3-search:cuda
 status:
   phase: Pending | Indexing | Ready | Swapping | Failed
-  segmentId: seg-1044-3fa2c9d1
+  segmentId: seg-1044-3fa2c9d1        # what the replicas have fully rolled to
+  latestSegmentId: seg-1044-3fa2c9d1  # the newest build
   version: 1044
   readyReplicas: 2
-  conditions: [...]
+  segments: [{segmentId, version, build}]   # the last 10 builds: what segmentVersion may pin
+  indexJob: {name, hash, state, segmentId, version}
+  conditions: [Valid, MappingAvailable, IndexBuilt, Available, Ready]
 ```
 
-- The operator reconciles a `SearchIndex` into a `Job` (the indexer: `python -m dataplane.indexer`), a
-  `Deployment` of replicas (`python -m serving`), a `Service`, and a PVC for segments. A new segment rolls out by a
-  rolling update with `maxUnavailable: 0`; `segmentVersion` pins one (rollback).
+- The operator (`deploy/s3operator/`, standard library, `docs/decisions/2026-11-09-serving-and-operator.md`) reconciles
+  a `SearchIndex` into a `Job` (the indexer, `python -m serving build`, which calls the data plane's intake and
+  `indexer.build` through `serving/ports.py` and reports `{segment_id, version}` as its termination message), a
+  `Deployment` of replicas (`python -m serving`, loading `S3_SERVING_PRELOAD=<name>:<segment_id>`), a `Service`, and a
+  PVC for segments. The Job is named by a hash of the mapping content, source, image and `reindexToken`, so a change to
+  any of them rebuilds and a change to `replicas` or `segmentVersion` does not. A new segment (or a pin) changes the
+  segment id in the Deployment's pod template, so it rolls out by a rolling update with `maxUnavailable: 0`, readiness on
+  `/readyz`, and a SIGTERM that fails readiness and drains before exit. Phases: `Indexing` while a build runs (replicas
+  keep serving), `Swapping` while replicas roll to another segment, `Failed` for an invalid spec or a failed build (the
+  last segment keeps serving).
 - **It never assumes a GPU.** Only when `device: cuda` does it add `nvidia.com/gpu` limits from `resources`, a
   `nodeSelector` (`nvidia.com/gpu.present: "true"`) and the `nvidia.com/gpu` toleration. One `Dockerfile` with
   `ARG BASE=cpu|cuda` selects the base image and `requirements-gpu.txt`.
+- CRD: `deploy/crd/searchindex.yaml`; operator manifests: `deploy/manifests/operator.yaml`; samples:
+  `deploy/samples/`; image: `deploy/Dockerfile` (`ARG BASE=cpu|cuda`, built from the repository root).
 - Tests: the reconciler against a real kube-apiserver and etcd (envtest binaries at
   `/tmp/claude-0/envtest/controller-tools/envtest/` in the dev container, where kind cannot run pods); the full kind
   end-to-end in GitHub Actions.
@@ -548,3 +592,12 @@ status:
   writes, merges, gc and job, the updater's coalescing and its swap budget (current plus new, which is 2x for equal
   sizes), and the freshness hook. Why: these are what the code does, and the engine, serving and the steward's B1-4
   harness need them to call it. Sections 0 and 4 to 7 are unchanged; what they still need is in the S2 report.
+- 2026-11-09, platform-engineer: §7 amended while building S4. `create_app` returns an `App` (stdlib, not ASGI);
+  `_docs` also returns `applied`; added `GET /indexes`, the named error types, the batching, cache, `_source`, header and
+  metric contracts; the indexer Job runs `python -m serving build` (it needs ingest and build together, through the
+  data plane's own functions) rather than `python -m dataplane.indexer`; the `SearchIndex` spec gains `reindexToken`,
+  `storage`, `serving`, `source.pvc`, `imagePullPolicy`, and its status gains `latestSegmentId`, `segments`, `indexJob`.
+  All additive. Needs from others: `dataplane.kv.Store`, `dataplane.intake.{ingest,validate,enrich}`,
+  `dataplane.indexer.build` and `engine.api.Index` (`from_segment`, `search`, `search_batch`, `patch`, `delete`,
+  `set_version`, `.version`, `.n_docs`) exactly as §3 to §5 define them; engine exceptions named `UnsupportedQuery`,
+  `InvalidRequest`, `InvalidMapping`, `OverBudget`, `DeviceUnavailable`, `NotHot`, `NoSuchKey`, `CorruptSegment`.

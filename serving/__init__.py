@@ -1,6 +1,8 @@
-"""Serving, the admin API and observability (owner: platform-engineer). Contract: docs/INTERFACES.md §5 (the request
-and response it carries) and §7 (the HTTP API, the admin API and the ``SearchIndex`` resource; the operator is in
-``deploy/``).
+"""Serving: the HTTP front, the batching scheduler, the query cache, the admin API and metrics (S4).
 
-It calls the engine only through ``engine.api`` and the data plane through ``dataplane``.
+Owner: platform-engineer. Imports ``engine.api`` and ``dataplane`` lazily, through ``serving.ports``.
 """
+from .app import App, create_app, make_server
+from .config import ServingConfig
+
+__all__ = ["App", "ServingConfig", "create_app", "make_server"]
