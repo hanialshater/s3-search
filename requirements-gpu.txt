@@ -1,0 +1,3 @@
+# GPU nodes and Colab only (docs/decisions/2026-11-09-gpu-portable-backend.md). CI uses requirements.txt alone.
+-r requirements.txt
+torch>=2.3
