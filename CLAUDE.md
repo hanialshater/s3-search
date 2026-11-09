@@ -12,6 +12,22 @@ roles (`.claude/agents/`) and the lessons (`company/knowledge/entries.jsonl`). T
 2. Claim an item before touching an area that is not yours (the areas and owners are in `README.md`).
 3. Run `python -m referee fast` before you change anything, and record the result.
 
+## How the crew runs
+
+- **The roles.** The roles in `.claude/agents/` are the crew, run as subagents (`docs/KICKOFF.md`):
+  - architect;
+  - dataplane-engineer;
+  - platform-engineer;
+  - tools-engineer;
+  - evaluation-steward.
+
+  The session the founder talks to coordinates and keeps the records. It does not build (P11).
+- **The board.** Work items are in `docs/BOARD.md`. Claim one there, in a commit, before you touch an area.
+- **Development runs on CPU with small models** (for example TF-IDF reduced with SVD) and ESCI-sample.
+  - `python -m referee fast` stays under 1 minute, and the CPU benchmark under 5 minutes, on 2 cores.
+  - A test that breaks the budget is split or moved out of `fast`.
+  - GPU numbers come only from the Colab referee.
+
 ## Hard rules
 
 - **Clean room.** Public data and the founder's own work only. Nothing from any employer or client: no code, data,
