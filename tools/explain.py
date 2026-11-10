@@ -33,11 +33,12 @@ def _close(a: float, b: float, tol: float = TOL) -> bool:
     return math.isclose(a, b, rel_tol=tol, abs_tol=tol)
 
 
-def _combiner(desc: str, n_children: int):
+def _text_combiner(desc: str, n_children: int):
+    """The fallback for nodes without an ``op``: Lucene-style wording only. Anything else is unknown (unchecked)."""
     d = desc.lower().strip()
     if d.startswith("sum of"):
         return "sum", lambda v: sum(v)
-    if d.startswith("product of") or " * " in d or " x " in d:
+    if d.startswith("product of") or (d.startswith("score(") and " * " in d):
         return "product", lambda v: math.prod(v)
     if d.startswith("max of"):
         return "max", lambda v: max(v)
@@ -46,20 +47,38 @@ def _combiner(desc: str, n_children: int):
     return None, None
 
 
+def _combiner(node: dict, n_children: int):
+    """(kind, fn) from the node's machine-readable ``op`` when it has one (the engine's explain nodes do), else the
+    text rules. ops: sum, product, max, value (a leaf: nothing to check), ranker (base + contributions = sum)."""
+    op = node.get("op")
+    if op in ("sum", "ranker"):
+        return op, lambda v: sum(v)
+    if op == "product":
+        return op, lambda v: math.prod(v)
+    if op == "max":
+        return op, lambda v: max(v)
+    if op == "value":
+        return "value", None
+    if op is not None:
+        return None, None  # an op this tool does not know: unchecked, not guessed from the text
+    return _text_combiner(node.get("description", ""), n_children)
+
+
 def check_tree(node: dict, path: str = "root") -> list[dict]:
     """Every node with children, in tree order: ``{path, description, value, expected, kind, ok}``; ``ok`` is None when
-    the combiner is unknown (unchecked)."""
+    the combiner is unknown (unchecked). An ``op: value`` node's children are explanatory and not summed."""
     out = []
     kids = node.get("details") or []
     if kids:
-        kind, fn = _combiner(node.get("description", ""), len(kids))
-        if fn is None:
-            out.append({"path": path, "description": node["description"], "value": node["value"], "expected": None,
-                        "kind": None, "ok": None})
-        else:
-            exp = float(fn([float(k["value"]) for k in kids]))
-            out.append({"path": path, "description": node["description"], "value": node["value"], "expected": exp,
-                        "kind": kind, "ok": _close(float(node["value"]), exp)})
+        kind, fn = _combiner(node, len(kids))
+        if kind != "value":
+            if fn is None:
+                out.append({"path": path, "description": node["description"], "value": node["value"], "expected": None,
+                            "kind": None, "ok": None})
+            else:
+                exp = float(fn([float(k["value"]) for k in kids]))
+                out.append({"path": path, "description": node["description"], "value": node["value"], "expected": exp,
+                            "kind": kind, "ok": _close(float(node["value"]), exp)})
         for i, k in enumerate(kids):
             out += check_tree(k, f"{path}/{i}")
     return out
@@ -67,7 +86,7 @@ def check_tree(node: dict, path: str = "root") -> list[dict]:
 
 def leaves(node: dict, path: str = "root") -> list[dict]:
     kids = node.get("details") or []
-    if not kids:
+    if not kids or node.get("op") == "value":
         return [{"path": path, "description": node["description"], "value": node["value"]}]
     return [x for i, k in enumerate(kids) for x in leaves(k, f"{path}/{i}")]
 
