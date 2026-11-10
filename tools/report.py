@@ -7,8 +7,9 @@
 (``data-key`` = its dotted path, ``data-value`` = its exact value). ``check_report`` re-reads the HTML and fails when
 any tagged number differs from the file, or any numeric field of the file is missing from the page: that is the
 correctness check the floor's land gate runs (a mismatch fails the land). ``--recompute-run`` additionally recomputes
-the quality metrics from a recorded run with ``referee.metrics`` (fit-split judgments, so only for a results.json
-written on the fit split) and shows both, failing loudly on any difference.
+the quality metrics from a recorded run with ``referee.metrics`` (the dataset's fit judgments, named by results.json's
+``dataset``; only for a results.json written on the fit split). Only the metrics and depths results.json holds are
+recomputed and shows both, failing loudly on any difference.
 
 Shape it reads (a proposal to the steward, the referee's ``full.py`` is not written yet: any extra numeric field is
 still shown, under "Other"):
@@ -61,8 +62,7 @@ def key_of(path) -> str:
 
 
 def is_development(results: dict) -> bool:
-    meta = results.get("meta") or {}
-    dev = str(meta.get("device", "")).lower()
+    dev = str(run_meta(results).get("device", "")).lower()
     return not ("cuda" in dev or "gpu" in dev)
 
 
@@ -81,18 +81,35 @@ def load_predictions(path, milestone: str) -> list[dict]:
 
 
 def recompute(results: dict, runs: dict, judgments: dict) -> list[dict]:
-    """Quality metrics recomputed from a run with the referee's metrics, against ``results['quality']``. Exact equality
-    up to float noise (1e-9): a report that disagrees with the referee on the same run is wrong."""
-    mean = metrics.score_run({str(q): v for q, v in runs.items()},
-                             {str(q): {str(p): l for p, l in j.items()} for q, j in judgments.items()})["mean"]
+    """Recompute exactly the quality metrics and depths ``results['quality']`` holds, from a run, with the referee's
+    metrics. Nothing else is scored, so a results.json written at k=100 is not failed for lacking recall@1000. Exact
+    equality up to float noise (1e-9): a report that disagrees with the referee on the same run is wrong. The query
+    set is the run's own (the referee scores the queries it ran)."""
+    q = results.get("quality") or {}
+    ndcg_ks = sorted({int(m.group(1)) for k in q if (m := re.fullmatch(r"ndcg@(\d+)", k))})
+    recall_ks = tuple(sorted({int(m.group(1)) for k in q if (m := re.fullmatch(r"exact_recall@(\d+)", k))}))
+    runs = {str(k): v for k, v in runs.items()}
+    judged = {str(k): {str(p): l for p, l in j.items()} for k, j in judgments.items() if str(k) in runs}
+    mean: dict = {}
+    for i, kn in enumerate(ndcg_ks):
+        got = metrics.score_run(runs, judged, k_ndcg=kn, recall_ks=recall_ks if i == 0 else ())["mean"]
+        mean.update({k: v for k, v in got.items() if i == 0 or k.startswith(("ndcg", "n_ndcg"))})
+    if not ndcg_ks and recall_ks:
+        mean.update(metrics.score_run(runs, judged, recall_ks=recall_ks)["mean"])
     rows = []
-    for k, v in mean.items():
-        if k.startswith("n_"):
-            continue
-        rep = (results.get("quality") or {}).get(k)
+    for k, rep in q.items():
+        if not re.fullmatch(r"(n_)?(ndcg|exact_recall)@\d+", k):
+            continue  # not a metric the referee's scorer defines (e.g. a count of products)
+        v = mean.get(k)
         rows.append({"metric": k, "referee_results": rep, "recomputed": v,
                      "ok": rep is not None and v is not None and abs(rep - v) <= 1e-9})
     return rows
+
+
+def run_meta(results: dict) -> dict:
+    """The run's descriptive fields: ``meta`` if present, plus the top-level scalars the referee's bench writes."""
+    top = {k: v for k, v in results.items() if not isinstance(v, (dict, list))}
+    return {**top, **(results.get("meta") or {})}
 
 
 # -- rendering ------------------------------------------------------------------------------------------------------
@@ -180,7 +197,7 @@ pre{overflow:auto;background:var(--card);padding:8px;font-size:.85em}
 
 def render(results: dict, predictions=None, recomputed=None, title="Test-drive report") -> str:
     p = _Page(results)
-    meta = results.get("meta") or {}
+    meta = run_meta(results)
     dev = is_development(results)
     banner = f'<div class="banner{"" if dev else " rec"}">{DEV_BANNER if dev else REC_BANNER}</div>'
     meta_rows = "".join(f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>"
@@ -188,7 +205,7 @@ def render(results: dict, predictions=None, recomputed=None, title="Test-drive r
     p.table("Recall", p.paths((), "recall"))
     p.table("Quality" + (" (development only)" if dev else ""), p.paths(("quality",)), 1)
     p.slices()
-    p.table("Latency" + (" (development only: CPU)" if dev else ""), p.paths(("latency",)), 1)
+    p.table("Latency" + (" (development only: CPU)" if dev else ""), p.paths(("latency",)) + p.paths(("latency_ms",)), 1)
     p.table("Throughput and cost" + (" (development only)" if dev else ""),
             p.paths(("throughput",)) + p.paths(("cost",)) + p.paths((), "qps") + p.paths((), "cost"))
     p.table("Freshness", p.paths(("freshness",)), 1)
@@ -237,16 +254,23 @@ def main(argv=None) -> int:
     ap.add_argument("--milestones")
     ap.add_argument("--milestone", default="S5")
     ap.add_argument("--recompute-run", help="a run JSONL; recompute quality on the fit split (dev results.json only)")
-    ap.add_argument("--data-dir")
+    ap.add_argument("--dataset", help="named dataset to take fit judgments from (default: results.json's own)")
     args = ap.parse_args(argv)
     results = json.loads(Path(args.results).read_text())
     preds = load_predictions(args.milestones, args.milestone) if args.milestones else None
     rec = None
     if args.recompute_run:
         from referee import loader
-        from .compare import fit_judgments, load_run
-        fit = loader.load_fit(**({"data_dir": args.data_dir} if args.data_dir else {}))
-        rec = recompute(results, load_run(args.recompute_run), fit_judgments(fit))
+        from .compare import load_run
+        meta = run_meta(results)
+        name = args.dataset or meta.get("dataset")
+        if not name:
+            raise SystemExit("--recompute-run: results.json names no dataset; pass --dataset")
+        if meta.get("split", "fit") != "fit":
+            raise SystemExit(f"--recompute-run: results.json is the {meta['split']} split; only fit judgments are readable")
+        rec = recompute(results, load_run(args.recompute_run), loader.fit_judgments(loader.load_dataset(name)))
+        if not rec:
+            raise SystemExit("--recompute-run: results.json has no ndcg@k / exact_recall@k metrics to recompute")
     page = render(results, preds, rec)
     problems = check_report(results, page) + [f"recompute {r['metric']}: {r['referee_results']} != {r['recomputed']}"
                                               for r in rec or [] if not r["ok"]]

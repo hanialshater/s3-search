@@ -40,7 +40,7 @@ let PAGE;
   await page.waitForFunction(() => [...document.querySelectorAll("#results .meta")].every((x) => x.textContent.includes("Lamps")));
   const lamps = await ids();
   check(lamps.length > 0, "lamps shown");
-  const brandBoxes = await page.$$eval('input[data-facet="brand"]', (l) => l.length);
+  const brandBoxes = await page.$$eval(`input[data-facet="product_brand.keyword"]`, (l) => l.length);
   check(brandBoxes > 0, "brand facet rendered");
 
   // price range

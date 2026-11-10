@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tools import report
 from tools.explain import explain_product
 from tools.common import text_request
@@ -62,6 +64,36 @@ def test_recompute_matches_referee_and_flags_difference():
     res["quality"]["ndcg@10"] += 0.01
     assert [r["metric"] for r in report.recompute(res, runs, j) if not r["ok"]] == ["ndcg@10"]
     assert "DIFFERENT" in report.render(res, recomputed=report.recompute(res, runs, j))
+
+
+def test_recompute_only_the_depths_the_referee_wrote():
+    from referee.metrics import score_run
+    runs = {"1": ["a", "b"], "2": ["y"]}
+    j = {"1": {"a": "E", "b": "S"}, "2": {"x": "E", "y": "C"}, "3": {"z": "E"}}  # query 3 was not run
+    m = score_run({q: runs[q] for q in runs}, {q: j[q] for q in runs}, recall_ks=(100,))["mean"]
+    res = {"quality": dict(m)}  # k=100 only, with the n_ counts, as bench writes them
+    rows = report.recompute(res, runs, j)
+    assert {r["metric"] for r in rows} == set(m) and all(r["ok"] for r in rows)
+    assert not any("1000" in r["metric"] for r in rows)
+    assert report.recompute({"quality": {"latency": 1.0}}, runs, j) == []
+
+
+def test_top_level_bench_fields_decide_development_and_are_shown():
+    res = {"dataset": "esci-sample", "device": "cuda", "split": "fit", "commit": "abc", "quality": {"ndcg@10": 0.2}}
+    assert not report.is_development(res) and report.is_development({**res, "device": "cpu"})
+    assert "esci-sample" in report.render(res)
+
+
+def test_recompute_matches_a_real_bench_run_on_toy():
+    api = pytest.importorskip("engine.api")
+    from referee import bench, loader
+    ds = loader.load_dataset("toy")
+    runs: dict = {}
+    res = bench.run(ds, ds.fit[["query_id", "query"]].drop_duplicates("query_id"), loader.fit_judgments(ds), api,
+                    k=100, latency_queries=5, runs_out=runs)
+    rows = report.recompute(res, runs, loader.fit_judgments(ds))
+    assert rows and all(r["ok"] for r in rows), rows
+    assert report.check_report(res, report.render(res, recomputed=rows)) == []
 
 
 def test_predictions_from_milestones_file(tmp_path):

@@ -19,12 +19,8 @@
 
 <div class="layout">
   <aside id="filters" aria-label="Filters">
-    <fieldset id="facet-category"><legend>Category</legend><div class="opts"></div></fieldset>
-    <fieldset id="facet-brand"><legend>Brand</legend><div class="opts"></div></fieldset>
-    <fieldset id="price"><legend>Price</legend>
-      <label>Min <input id="price-min" type="number" min="0" step="any" inputmode="decimal"></label>
-      <label>Max <input id="price-max" type="number" min="0" step="any" inputmode="decimal"></label>
-    </fieldset>
+    <div id="dynamic-filters"></div>
+    <label class="sortbox" hidden>Sort <select id="sort"></select></label>
     <button id="clear" type="button">Clear filters</button>
   </aside>
 
