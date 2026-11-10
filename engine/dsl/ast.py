@@ -144,6 +144,27 @@ class QIds:
 
 
 @dataclass(frozen=True)
+class QFunctionScore:
+    """function_score (S7-5): ``functions`` are (filter query or None, field_value_factor params or None, weight
+    or None)."""
+    query: Any
+    functions: tuple
+    score_mode: str = "multiply"
+    boost_mode: str = "multiply"
+    max_boost: float | None = None
+    min_score: float | None = None
+    boost: float = 1.0
+    path: str = "query.function_score"
+
+
+@dataclass(frozen=True)
+class Highlight:
+    """highlight (S7-5): ``fields`` are (field, fragment_size, number_of_fragments, pre_tag, post_tag)."""
+    fields: tuple
+    require_field_match: bool = True
+
+
+@dataclass(frozen=True)
 class QMatchAll:
     boost: float = 1.0
     path: str = "query.match_all"
@@ -155,7 +176,7 @@ class QHybrid:
     path: str = "query.hybrid"
 
 
-Query = Union[QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
+Query = Union[QFunctionScore, QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
 
 
 @dataclass(frozen=True)
@@ -194,3 +215,4 @@ class Request:
     rescore: tuple | None = None          # (window_size, model) from rescore.s3_ranker
     post_filter: Any = None               # a query (S7-3): filters hits after aggregations
     collapse: str | None = None           # a field (S7-3): the top hit per value
+    highlight: Any = None                 # Highlight (S7-5)

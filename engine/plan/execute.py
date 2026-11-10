@@ -13,7 +13,7 @@ import numpy as np
 
 from ..errors import InvalidRequest, UnsupportedQuery
 from .. import ops
-from .nodes import Bool, Dense, Exists, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
+from .nodes import Bool, Dense, Exists, FunctionScore, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
 
 INF = float("inf")
 
@@ -28,6 +28,31 @@ def walk(node):
             yield from walk(c)
     elif isinstance(node, Dense) and node.filter is not None:
         yield from walk(node.filter)
+    elif isinstance(node, FunctionScore):
+        yield from walk(node.query)
+        for flt, _, _ in node.functions:
+            if flt is not None:
+                yield from walk(flt)
+
+
+def _modify(b, mod: str, x):
+    """field_value_factor's modifier (Lucene's: log and its variants are base 10, ln natural)."""
+    import math
+    if mod == "none":
+        return x
+    if mod in ("log", "log1p", "log2p"):
+        add = {"log": 0.0, "log1p": 1.0, "log2p": 2.0}[mod]
+        return b.log1p(x + add - 1.0) / math.log(10.0)
+    if mod in ("ln", "ln1p", "ln2p"):
+        add = {"ln": 0.0, "ln1p": 1.0, "ln2p": 2.0}[mod]
+        return b.log1p(x + add - 1.0)
+    if mod == "square":
+        return x * x
+    if mod == "sqrt":
+        return b.where(x >= 0, x, float("nan")) ** 0.5
+    if mod == "reciprocal":
+        return 1.0 / x
+    raise ValueError(mod)
 
 
 class Timer:
@@ -129,6 +154,8 @@ class Executor:
             out = self._groups(node)
         elif isinstance(node, MatchAll):
             out = (b.full(N, node.boost, "float32"), b.full(N, True, "bool"))
+        elif isinstance(node, FunctionScore):
+            out = self._function_score(node, ctx)
         elif isinstance(node, Exists):
             m = st.exists_mask(node.field)
             out = (b.where(m, node.boost, 0.0), m)
@@ -211,6 +238,83 @@ class Executor:
                       for alts in node.slots)
         sc = phrase_scores(b, st, f_i, freq, idf_sum, st.mapping.k1, st.mapping.b)
         return b.where(m, sc * node.boost, 0.0), m
+
+    def _function_score(self, node, ctx):
+        """function_score (S7-5), as OpenSearch combines it: each function applies where its filter matches; the
+        applying functions combine by score_mode (a doc no function applies to gets 1), capped at max_boost; the
+        result combines with the query's score by boost_mode, times boost; min_score drops docs below it."""
+        b, st = self.b, self.st
+        N = st.N
+        q, m = self.eval(node.query, ctx)
+        q = b.astype(q, "float64")
+        vals, applies, weights = [], [], []
+        for flt, fvf, w in node.functions:
+            app = m if flt is None else m & self.eval(flt, ctx)[1]
+            v = b.full(N, 1.0, "float64")
+            if fvf is not None:
+                field, factor, mod, missing = fvf
+                col = b.astype(st.numerics[field], "float64")
+                miss = st.missing[field]
+                if missing is None:
+                    if int(b.count_nonzero(app & miss)):
+                        raise InvalidRequest(node.path, f"Missing value for field [{field}] (give missing)")
+                    x = col * factor
+                else:
+                    x = b.where(miss, missing, col) * factor
+                v = _modify(b, mod, x)
+                bad = app & (b.isnan(v) | (v < 0) | (v == float("inf")))
+                if int(b.count_nonzero(bad)):
+                    raise InvalidRequest(node.path, "field_value_factor gives a negative, infinite or NaN score")
+            if w is not None:
+                v = v * w
+            vals.append(v)
+            applies.append(app)
+            weights.append(1.0 if w is None else w)
+        f = b.full(N, 1.0, "float64")
+        if vals:
+            any_app = applies[0]
+            for a in applies[1:]:
+                any_app = any_app | a
+            sm = node.score_mode
+            if sm == "multiply":
+                for v, a in zip(vals, applies):
+                    f = b.where(a, f * v, f)
+            elif sm in ("sum", "avg"):
+                tot, wsum = b.zeros(N, "float64"), b.zeros(N, "float64")
+                for v, a, w in zip(vals, applies, weights):
+                    tot = b.where(a, tot + v, tot)
+                    wsum = b.where(a, wsum + w, wsum)
+                f = tot if sm == "sum" else b.where(wsum > 0, tot / b.where(wsum > 0, wsum, 1.0), 1.0)
+            elif sm == "first":
+                done = b.full(N, False, "bool")
+                for v, a in zip(vals, applies):
+                    f = b.where(a & ~done, v, f)
+                    done = done | a
+            else:                                         # max, min
+                best = b.full(N, float("-inf") if sm == "max" else float("inf"), "float64")
+                for v, a in zip(vals, applies):
+                    best = b.where(a & ((v > best) if sm == "max" else (v < best)), v, best)
+                f = best
+            f = b.where(any_app, f, 1.0)
+            if node.max_boost is not None:
+                f = b.where(f > node.max_boost, node.max_boost, f)
+        bm = node.boost_mode
+        if bm == "multiply":
+            s = q * f
+        elif bm == "replace":
+            s = f
+        elif bm == "sum":
+            s = q + f
+        elif bm == "avg":
+            s = (q + f) / 2.0
+        elif bm == "max":
+            s = b.where(q > f, q, f)
+        else:
+            s = b.where(q < f, q, f)
+        s = b.astype(s * node.boost, "float32")
+        if node.min_score is not None:
+            m = m & (s >= node.min_score)
+        return b.where(m, s, 0.0), m
 
     def _bool(self, node, ctx):
         b, N = self.b, self.st.N
@@ -467,6 +571,11 @@ class Executor:
                     h["fields"] = {plan.collapse: [None if c == 0 else group_keys[c]]}
             t.lap("page")
             resp = {"hits": {"total": total, "hits": hits}, **resp}
+            if plan.highlight is not None:
+                from ..highlight import highlight_hits
+                for h, hl in zip(hits, highlight_hits(st, plan, ids)):
+                    if hl:
+                        h["highlight"] = hl
             if plan.explain:
                 from ..explain import explain_hits
                 resp["explain"] = explain_hits(self, plan, ctx, ids, score_h)

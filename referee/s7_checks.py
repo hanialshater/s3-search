@@ -306,7 +306,195 @@ def check_s7_4(index, ds):
     return problems
 
 
-CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3, "S7-4": check_s7_4}
+_EM = __import__("re").compile(r"<em>(.*?)</em>")
+
+
+def _highlight_problems(hit, fields, terms, source, n_frags=5, pre="<em>", post="</em>"):
+    import re
+    out = []
+    hl = hit.get("highlight") or {}
+    tag = re.compile(re.escape(pre) + r"(.*?)" + re.escape(post))
+    for f in fields:
+        text = source[f]
+        has = text is not None and bool(set(analyze(text)) & terms[f])
+        frags = hl.get(f)
+        if not has:
+            if frags:
+                out.append(f"{hit['_id']} {f}: highlighted, but holds no query term")
+            continue
+        if not frags:
+            out.append(f"{hit['_id']} {f}: holds a query term but has no highlight")
+            continue
+        if n_frags and len(frags) > n_frags:
+            out.append(f"{hit['_id']} {f}: {len(frags)} fragments > {n_frags}")
+        for fr in frags:
+            plain = fr.replace(pre, "").replace(post, "")
+            if plain not in str(text):
+                out.append(f"{hit['_id']} {f}: fragment is not source text: {fr[:60]!r}")
+            spans = tag.findall(fr)
+            if not spans:
+                out.append(f"{hit['_id']} {f}: a fragment with no highlighted term: {fr[:60]!r}")
+            for sp in spans:
+                a = analyze(sp)
+                if len(a) != 1 or a[0] not in terms[f]:
+                    out.append(f"{hit['_id']} {f}: highlighted {sp!r}, not a query term")
+            rest = tag.sub(" ", fr)
+            if set(analyze(rest)) & terms[f]:
+                out.append(f"{hit['_id']} {f}: a query term left unhighlighted in {fr[:60]!r}")
+        if n_frags == 0 and (len(frags) != 1 or frags[0].replace(pre, "").replace(post, "") != str(text)):
+            out.append(f"{hit['_id']} {f}: number_of_fragments 0 must return the whole field")
+    return out
+
+
+def check_s7_5(index, ds):
+    """highlight (plain, text fields) by its properties, and function_score by brute force."""
+    import math
+
+    import numpy as np
+    import pandas as pd
+    from referee import reference
+    c = ds.catalogue.reset_index(drop=True)
+    ids = list(c["product_id"])
+    src = {p: {f: (None if pd.isna(v) else v) for f, v in r.items()} for p, r in
+           zip(ids, c.drop(columns=["embedding"]).to_dict("records"))}
+    problems = []
+    tf = ["product_title", "product_bullet_point", "product_description"]
+    hl_cases = [
+        ({"multi_match": {"query": "waterproof boots hiking", "fields": tf}}, {f: {} for f in tf}, {}),
+        ({"match": {"product_description": "steel kettle drinks"}}, {"product_description": {}, "product_title": {}}, {}),
+        ({"bool": {"must": [{"match": {"product_title": "red lamp"}}],
+                   "should": [{"match": {"product_bullet_point": "travel camping"}}]}},
+         {"product_title": {}, "product_bullet_point": {}}, {}),
+        ({"match": {"product_bullet_point": "keeps drinks hot hours"}},
+         {"product_bullet_point": {"number_of_fragments": 0}}, {}),
+        ({"match": {"product_title": "portable speakers"}}, {"product_title": {}},
+         {"pre_tags": ["<b>"], "post_tags": ["</b>"]}),
+    ]
+
+    def query_terms(q, fields):
+        terms = {f: set() for f in fields}
+
+        def walk(n):
+            (k, v), = n.items()
+            if k == "match":
+                (f, t), = v.items()
+                t = t["query"] if isinstance(t, dict) else t
+                if f in terms:
+                    terms[f] |= set(analyze(t))
+            elif k == "multi_match":
+                for f in v["fields"]:
+                    if f.split("^")[0] in terms:
+                        terms[f.split("^")[0]] |= set(analyze(v["query"]))
+            elif k == "bool":
+                for part in ("must", "should"):
+                    for x in v.get(part, []):
+                        walk(x)
+        walk(q)
+        return terms
+
+    for q, fields, tags in hl_cases:
+        req = {"query": q, "size": ALL, "highlight": {**tags, "fields": fields}}
+        r = index.search(req)
+        terms = query_terms(q, fields)
+        pre, post = (tags.get("pre_tags") or ["<em>"])[0], (tags.get("post_tags") or ["</em>"])[0]
+        nf = {f: s.get("number_of_fragments", 5) for f, s in fields.items()}
+        for h in r["hits"]["hits"]:
+            for f in fields:
+                problems += _highlight_problems(h, [f], terms, src[h["_id"]], nf[f], pre, post)
+    problems = problems[:20]
+
+    # function_score
+    ref = reference.build_index(ds.catalogue, ds.mapping)
+    vals = {"price": [float(np.float32(v)) for v in c["price"]], "stock": [float(v) for v in c["stock"]]}
+    MOD = {"none": lambda x: x, "log": math.log10, "log1p": lambda x: math.log10(x + 1),
+           "log2p": lambda x: math.log10(x + 2), "ln": math.log, "ln1p": math.log1p, "ln2p": lambda x: math.log(x + 2),
+           "square": lambda x: x * x, "sqrt": math.sqrt, "reciprocal": lambda x: 1.0 / x}
+
+    def fvf(spec, i):
+        v = vals[spec["field"]][i]
+        return MOD[spec.get("modifier", "none")](float(spec.get("factor", 1.0)) * v)
+
+    def expected(q, functions, score_mode="multiply", boost_mode="multiply", max_boost=None, min_score=None):
+        base = {h["_id"]: h["_score"] for h in ref.search({"query": q, "size": ALL})["hits"]["hits"]}
+        out = []
+        for i, p in enumerate(ids):
+            if p not in base:
+                continue
+            got = []
+            for fn in functions:
+                if "filter" in fn and p not in fmatch[json.dumps(fn["filter"], sort_keys=True)]:
+                    continue
+                w = float(fn.get("weight", 1.0))
+                inner = fvf(fn["field_value_factor"], i) if "field_value_factor" in fn else 1.0
+                got.append((w * inner, w))
+            if not got:
+                f = 1.0
+            elif score_mode == "multiply":
+                f = math.prod(s for s, _ in got)
+            elif score_mode == "sum":
+                f = sum(s for s, _ in got)
+            elif score_mode == "avg":
+                f = sum(s for s, _ in got) / sum(w for _, w in got)
+            elif score_mode == "first":
+                f = got[0][0]
+            elif score_mode == "max":
+                f = max(s for s, _ in got)
+            else:
+                f = min(s for s, _ in got)
+            if max_boost is not None:
+                f = min(f, max_boost)
+            qs = base[p]
+            s = {"multiply": qs * f, "replace": f, "sum": qs + f, "avg": (qs + f) / 2, "max": max(qs, f),
+                 "min": min(qs, f)}[boost_mode]
+            if min_score is None or s >= min_score:
+                out.append((s, i, p))
+        out.sort(key=lambda t: (-t[0], t[1]))
+        return {"hits": {"total": len(out), "hits": [{"_id": p, "_score": s} for s, _, p in out]}}
+
+    import json
+    lamp = {"match": {"product_title": "lamp"}}
+    red = {"multi_match": {"query": "red waterproof boots", "fields": tf}}
+    fmatch = {}
+    for flt in ({"term": {"category": "lamp"}}, {"range": {"price": {"lt": 100}}}, {"term": {"category": "boot"}}):
+        fmatch[json.dumps(flt, sort_keys=True)] = {h["_id"] for h in ref.search({"query": {"bool": {"filter": [flt]}},
+                                                                              "size": ALL})["hits"]["hits"]}
+    fs_cases = []
+    for mod in MOD:
+        field = "price" if mod in ("log", "ln", "reciprocal") else "stock"
+        fs_cases.append((lamp, [{"field_value_factor": {"field": field, "modifier": mod, "factor": 1.5,
+                                                        "missing": 1}}], {}))
+    fns = [{"filter": {"term": {"category": "lamp"}}, "weight": 3},
+           {"filter": {"range": {"price": {"lt": 100}}}, "field_value_factor": {"field": "stock", "modifier": "sqrt"},
+            "weight": 2},
+           {"filter": {"term": {"category": "boot"}}, "weight": 0.5}]
+    for sm in ("multiply", "sum", "avg", "first", "max", "min"):
+        fs_cases.append((red, fns, {"score_mode": sm}))
+    for bm in ("multiply", "replace", "sum", "avg", "max", "min"):
+        fs_cases.append((red, fns, {"score_mode": "sum", "boost_mode": bm}))
+    fs_cases.append((red, fns, {"score_mode": "sum", "max_boost": 2.5}))
+    fs_cases.append((red, fns, {"score_mode": "sum", "min_score": 4.0}))
+    fs_cases.append(({"match_all": {}}, [{"field_value_factor": {"field": "price", "modifier": "sqrt"}}],
+                     {"boost_mode": "replace"}))
+    from referee import checks as _checks
+    for q, functions, opts in fs_cases:
+        body = {"query": q, **({k: v for k, v in opts.items() if k != "min_score"})}
+        if len(functions) == 1 and "filter" not in functions[0] and not opts.get("score_mode"):
+            body.update(functions[0])
+        else:
+            body["functions"] = functions
+        req = {"query": {"function_score": body}, "size": ALL}
+        if "min_score" in opts:
+            req["query"]["function_score"]["min_score"] = opts["min_score"]
+        exp = expected(q, functions, opts.get("score_mode", "multiply"), opts.get("boost_mode", "multiply"),
+                       opts.get("max_boost"), opts.get("min_score"))
+        try:
+            _checks.assert_same_ranking(index.search(req), exp, f"function_score {json.dumps(body)[:120]}")
+        except AssertionError as e:
+            problems.append(str(e)[:300])
+    return problems
+
+
+CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3, "S7-4": check_s7_4, "S7-5": check_s7_5}
 
 
 def check_landed_correct(index, ds):

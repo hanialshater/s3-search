@@ -24,6 +24,7 @@ class Mapping:
     embeddings: dict[str, dict] = field(default_factory=dict)
     dynamic: str = "true"
     positions: bool = True                 # _meta.engine.positions (S7-1): index term positions for phrases
+    source: bool = True                    # _meta.engine.source (S7-5): keep text fields' raw text, for highlight
 
     def kind(self, name: str) -> str | None:
         if name in self.text:
@@ -93,4 +94,4 @@ def parse_mapping(raw: dict) -> Mapping:
     return Mapping(raw=raw, id_field=eng.get("id_field", "_id"), text=text, keyword=keyword, numeric=numeric,
                    vector=vector, hot=hot, k1=float(bm25.get("k1", 1.2)), b=float(bm25.get("b", 0.75)),
                    embeddings=embeddings, dynamic=str(raw.get("dynamic", "true")).lower(),
-                   positions=bool(eng.get("positions", True)))
+                   positions=bool(eng.get("positions", True)), source=bool(eng.get("source", True)))

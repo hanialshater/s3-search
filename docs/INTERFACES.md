@@ -311,6 +311,7 @@ Layout (`seg-<version>-<8 hex>/`):
 | `text/df.npy`, `text/df_field.npy` | int32 [V], int32 [V, F] | document frequency, overall and per field |
 | `text/avg_len.npy` | float32 [F] | mean field length |
 | `text/pos_ptr.npy`, `text/positions.npy` (optional, S7-1) | int64 [P+1]; uint32 [T] | positions, CSR over postings: posting p's are `positions[pos_ptr[p]:pos_ptr[p+1]]`, each `(field << 24) \| position`, ascending; absent in segments built before S7 or with `positions: false`, which still load (phrases are then refused) |
+| `src/<field>.parquet` (optional, S7-5) | `text` string; N rows | a text field's raw text, for highlight (host only; `_meta.engine.source`, default true); older segments load without it (highlight is then refused) |
 | `kw/<field>.codes.npy` | int32 [N] | 0 = missing; codes order = sorted value order |
 | `kw/<field>.values.parquet` | `value` string | row = code; row 0 is `""` |
 | `num/<field>.npy` | float32, int32, int64 or bool [N] | the column |
@@ -460,6 +461,8 @@ Index.from_segment(path, device) -> Index
 | `range` aggregation (S7-4) | `{"field", "ranges": [{"from", "to", "key"}]}` | buckets sorted by (from, to); `from` inclusive, `to` exclusive (compared in float64, unlike the range query's float32 bounds, as OpenSearch); key `"<from>-<to>"` with `*` for an open end (Python's float repr, e.g. `"10.0-20.0"`) unless given; `keyed` refused |
 | `histogram` aggregation (S7-4) | `{"field", "interval", "offset": 0, "min_doc_count": 0}` | key `floor((v - offset) / interval) * interval + offset` (a float), ascending; with min_doc_count 0 the empty buckets between the first and last are returned; bounds and `keyed` refused |
 | sub-aggregations (S7-4) | `"aggs"` inside a `terms` aggregation, one level | any of the above per bucket, over that bucket's docs |
+| `highlight` (S7-5) | `{"fields": {field: {...}} or [{field: {...}}], "fragment_size": 100, "number_of_fragments": 5, "pre_tags": ["<em>"], "post_tags": ["</em>"], "type": "plain", "require_field_match": true}` | text fields, from the segment's source text (`src/`); the plain highlighter: words whose analysed token is a term of the query's clauses on that field (all fields when `require_field_match` is false; never `must_not`'s; fuzzy, prefix and synonym expansions included) are wrapped in the tags; fragments cut at the token that ends past each multiple of `fragment_size`, the best `number_of_fragments` by distinct terms returned in text order, only fragments with a term; `number_of_fragments: 0` returns the whole text; each hit gains `"highlight": {field: [fragments]}` (fields without a fragment left out); other types and options refused |
+| `query.function_score` (S7-5) | `{"query", "functions": [{"filter", "field_value_factor": {"field", "factor": 1, "modifier": "none", "missing"}, "weight"}], "score_mode": "multiply", "boost_mode": "multiply", "max_boost", "min_score", "boost"}`, or one function at the top level | each function applies where its filter matches; `field_value_factor` = modifier(factor x value) (none, log, log1p, log2p: base 10; ln, ln1p, ln2p; square, sqrt, reciprocal), times `weight`; a doc without the value and no `missing`, or a negative, infinite or NaN result, is `InvalidRequest` (OpenSearch errors too); score_mode multiply, sum, avg (sum / sum of weights), first, max, min over the applying functions, 1 where none applies; capped at `max_boost`; boost_mode multiply, replace, sum, avg, max, min with the query score; times `boost`; `min_score` drops docs below it; other functions (script_score, random_score, decay) refused |
 | `query.neural` (S3) | `{field: {"query_text", "k"}}` | encoded by the field's encoder |
 | `query.hybrid` + `rank.rrf` (S1-5, extension) | `{"hybrid": {"queries": [...]}}`, `"rank": {"rrf": {"rank_constant": 60, "window_size": 20000}}` | RRF fusion; `_score` is the RRF score |
 | `rescore` (S1-5, extension) | `{"window_size": 1000, "s3_ranker": {"model": "<name>"}}` | the learned ranker over the top window |
@@ -813,3 +816,6 @@ status:
   `search_after` compares it. Additive. Why: S7 (multi-select facets, one hit per brand).
 - 2026-11-10, architect (S7-4): section 5 gains the metric aggregations, `range`, `histogram` and one level of
   sub-aggregations under `terms` (`engine/aggs.py`, on the backend, one transfer per aggregation). Additive. Why: S7.
+- 2026-11-10, architect (S7-5): section 4 gains the optional source text (`src/<field>.parquet`, listed in the
+  manifest's `source_fields`); section 2 gains `_meta.engine.source`; section 5 gains `highlight` (plain) and
+  `function_score` with `field_value_factor` and `weight`. Additive. Why: S7.
