@@ -34,10 +34,46 @@ def _tokens(s: str) -> list[str]:
 class FakeIndex:
     """``search(request) -> response`` per §5. Doc id (the tie-breaker) is the catalogue position."""
 
-    def __init__(self, docs=None, explain_ok: bool = True):
+    def __init__(self, docs=None, explain_ok: bool = True, fields=None, with_mapping: bool = False):
         self.docs = list(docs if docs is not None else make_catalogue())
+        self.fields = set(fields) if fields is not None else None  # fields that exist; any other is a 400 (like serving)
+        self.with_mapping = with_mapping
         self.explain_ok = explain_ok  # False: explain values that do NOT sum (to test the check)
         self.calls = 0
+
+    def _need(self, field):
+        base = field.removesuffix(".keyword")
+        if self.fields is not None and field not in self.fields and base not in self.fields:
+            raise ValueError(f"unknown field '{field}'")
+
+    def mapping(self):
+        keyword = {"product_brand", "product_color"}
+        props = {}
+        for f in sorted(self.fields or set(self.docs[0])):
+            if f in ("product_id", "embedding"):
+                continue
+            if f in ("price", "stock"):
+                props[f] = {"type": "float" if f == "price" else "integer"}
+            elif f == "category":
+                props[f] = {"type": "keyword"}
+            else:
+                props[f] = {"type": "text", **({"fields": {"keyword": {"type": "keyword"}}} if f in keyword else {})}
+        return {"_meta": {"engine": {"id_field": "product_id"}}, "properties": props}
+
+    def capabilities(self):
+        """serving's ``field_capabilities`` for this mapping: sub-fields as ``f.keyword``."""
+        out, scalar = {}, ("keyword", "float", "integer", "long", "boolean")
+
+        def add(f, p):
+            t = p["type"]
+            out[f] = {"type": t, "searchable": t == "text", "filterable": t in scalar, "facetable": t == "keyword",
+                      "sortable": t in scalar, "dense": False, "hot": False}
+            for sub, sp in (p.get("fields") or {}).items():
+                add(f"{f}.{sub}", sp)
+
+        for f, p in self.mapping()["properties"].items():
+            add(f, p)
+        return out
 
     # -- matching and scoring ------------------------------------------------------------------------------------
     def _score(self, doc, clause):
@@ -46,10 +82,13 @@ class FakeIndex:
             return True, 1.0, [("match_all", 1.0)]
         if "multi_match" in clause:
             mm = clause["multi_match"]
+            for f in mm["fields"]:
+                self._need(f.split("^")[0])
             fields = [(f.split("^")[0], float(f.split("^")[1]) if "^" in f else 1.0) for f in mm["fields"]]
             terms = list(dict.fromkeys(_tokens(mm["query"])))
         else:
             ((field, spec),) = clause["match"].items()
+            self._need(field)
             fields, terms = [(field, 1.0)], list(dict.fromkeys(_tokens(spec if isinstance(spec, str) else spec["query"])))
         parts = []
         for t in terms:
@@ -62,12 +101,15 @@ class FakeIndex:
     def _filter_ok(self, doc, f):
         if "term" in f:
             ((k, v),) = f["term"].items()
+            self._need(k)
             return doc.get(k.removesuffix(".keyword")) == (v["value"] if isinstance(v, dict) else v)
         if "terms" in f:
             ((k, vs),) = f["terms"].items()
+            self._need(k)
             return doc.get(k.removesuffix(".keyword")) in vs
         if "range" in f:
             ((k, r),) = f["range"].items()
+            self._need(k)
             x = doc.get(k)
             return x is not None and all({"gte": x >= v, "gt": x > v, "lte": x <= v, "lt": x < v}[op]
                                          for op, v in r.items())
@@ -119,21 +161,36 @@ class FakeIndex:
             ok, s, parts = self._eval(d, q)
             if ok:
                 matched.append((i, d, round(s, 6), parts))
-        matched.sort(key=lambda m: (-m[2], m[0]))
+        sortf, sign = None, 1
+        for sk in request.get("sort") or []:
+            if isinstance(sk, dict) and "_score" not in sk:
+                ((sortf, spec),) = sk.items()
+                self._need(sortf)
+                sign = -1 if spec.get("order") == "desc" else 1
+                break
+
+        def skey(m):
+            return (sign * m[1][sortf], m[0]) if sortf else (-m[2], m[0])
+
+        def sval(m):
+            return [m[1][sortf], m[0]] if sortf else [m[2], m[0]]
+
+        matched.sort(key=skey)
         after = request.get("search_after")
         if after:
-            s0, i0 = after[0], after[-1]
-            matched_page = [m for m in matched if m[2] < s0 or (m[2] == s0 and m[0] > i0)]
+            k0 = (sign * after[0], after[-1]) if sortf else (-after[0], after[-1])
+            matched_page = [m for m in matched if skey(m) > k0]
         else:
             matched_page = matched
         page = matched_page[frm:frm + size]
-        hits = [{"_id": d["product_id"], "_score": s, "sort": [s, i], "_source": d} for i, d, s, _ in page]
+        hits = [{"_id": d["product_id"], "_score": s, "sort": sval((i, d, s, p)), "_source": d} for i, d, s, p in page]
         resp = {"hits": {"total": len(matched), "hits": hits},
                 "took_ms": {"parse": 0.1, "retrieve": 0.5, "total": 0.8}}
         aggs = request.get("aggs") or request.get("aggregations")
         if aggs:
             resp["aggregations"] = {}
             for name, a in aggs.items():
+                self._need(a["terms"]["field"])
                 field = a["terms"]["field"].removesuffix(".keyword")
                 counts: dict = {}
                 for _, d, _, _ in matched:
@@ -179,7 +236,12 @@ def serve_fake(index: FakeIndex | None = None, name: str = "esci-sample", host: 
             self.end_headers()
 
         def do_GET(self):
-            self._send(200, {"status": "ok"}) if self.path in ("/healthz", "/readyz") else self._send(404, {})
+            if self.path in ("/healthz", "/readyz"):
+                self._send(200, {"status": "ok"})
+            elif self.path == f"/indexes/{name}/_mapping" and index.with_mapping:  # §7, as serving answers it
+                self._send(200, {name: {"mappings": index.mapping(), "s3_fields": index.capabilities()}})
+            else:
+                self._send(404, {"error": {"type": "index_not_found", "reason": self.path}})
 
         def do_POST(self):
             if self.path != f"/indexes/{name}/_search":

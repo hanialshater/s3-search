@@ -138,3 +138,29 @@ def test_sample_check_over_http_fake():
 def test_real_engine_skips_until_it_imports():
     api = pytest.importorskip("engine.api", reason="the architect's engine/api.py is not in yet")
     assert hasattr(api, "build_index")
+
+
+def _n(v, d="x", op=None, kids=()):
+    return {"value": v, "description": d, **({"op": op} if op else {}), "details": list(kids)}
+
+
+def test_op_field_decides_and_text_is_only_a_fallback():
+    # the engine's wording contains " x " and " * " but is a sum / a value: op wins
+    tree = _n(5.0, "BM25F (k1 1.2, b 0.75) x boost 1.0", "sum",
+              [_n(2.0, "term 'a': idf 1 * pseudo_tf * (k1 + 1) / (k1 + pseudo_tf)", "value", [_n(9.0, "field")]),
+               _n(3.0, "term 'b': idf 1 * pseudo_tf", "value", [_n(7.0, "field")])])
+    assert [c["ok"] for c in explain.check_tree(tree)] == [True]  # the value nodes' children are not summed
+    assert explain.leaves(tree)[0]["value"] == 2.0
+    # no op: the same wording is not guessed as a product, it is unchecked
+    bare = _n(5.0, "BM25F (k1 1.2, b 0.75) x boost 1.0", None, [_n(2.0), _n(3.0)])
+    assert explain.check_tree(bare)[0]["ok"] is None
+
+
+def test_op_kinds():
+    prod = _n(6.0, "anything", "product", [_n(2.0), _n(3.0)])
+    assert explain.check_tree(prod)[0]["ok"] is True
+    bad = _n(7.0, "anything", "max", [_n(2.0), _n(3.0)])
+    assert explain.check_tree(bad)[0]["ok"] is False
+    ranker = _n(4.5, "ranker", "ranker", [_n(1.0, "base"), _n(2.0, "f1"), _n(1.5, "f2")])
+    assert explain.check_tree(ranker)[0]["ok"] is True
+    assert explain.check_tree(_n(1.0, "?", "weird", [_n(1.0)]))[0]["ok"] is None

@@ -1,47 +1,97 @@
 // The demo page: one static page over the serving HTTP API (docs/INTERFACES.md §5 request/response, §7 routes).
 // Local only. Query string: ?api=http://host:port (default: same origin) and ?index=NAME (default esci-sample).
+//
+// The page does not assume fields. On load it discovers which fields the index has (see discoverSchema): text fields
+// to search, keyword fields to facet and filter on, numeric fields to range-filter and sort on. It renders only those.
 "use strict";
 
 const PARAMS = new URLSearchParams(location.search);
 const API = (PARAMS.get("api") || "").replace(/\/$/, "");
 const INDEX = PARAMS.get("index") || "esci-sample";
 const SIZE = 10;
-const FIELDS = ["product_title^3", "product_brand^2", "product_color", "product_bullet_point", "product_description"];
-const FACETS = { category: "category", brand: "product_brand.keyword" };
 
-const state = { q: "", category: new Set(), brand: new Set(), min: "", max: "", page: 1, explain: false, last: null };
+// Candidates probed when the index info carries no mapping (GET /indexes/{name} has none in §7 yet).
+const TEXT_CANDIDATES = ["product_title^3", "product_brand^2", "product_color", "product_bullet_point", "product_description"];
+const KEYWORD_CANDIDATES = ["category", "product_brand.keyword", "product_color.keyword"];
+const NUMERIC_CANDIDATES = ["price", "stock"];
+const NUMERIC_TYPES = new Set(["float", "double", "half_float", "scaled_float", "integer", "long", "short", "byte"]);
+
+const state = { q: "", filters: {}, ranges: {}, sort: "", page: 1, explain: false, last: null, pendingAfter: null };
+let schema = { text: [], facets: [], numerics: [] };
 const latencies = []; // browser round trips of page-1 searches (ms), for the p95 the S5 prediction names
 let seq = 0;
 
 /** The §5 request for the current state. `after` is the previous page's last hit `sort` (next), else `from` is used. */
-function buildRequest(s, page, after) {
+function buildRequest(s, page, after, sch = schema) {
   const filter = [];
-  for (const [name, field] of Object.entries(FACETS)) {
-    if (s[name].size) filter.push({ terms: { [field]: [...s[name]] } });
+  for (const f of sch.facets) {
+    const sel = s.filters[f.field];
+    if (sel && sel.size) filter.push({ terms: { [f.field]: [...sel] } });
   }
-  const range = {};
-  if (s.min !== "" && !isNaN(+s.min)) range.gte = +s.min;
-  if (s.max !== "" && !isNaN(+s.max)) range.lte = +s.max;
-  if (Object.keys(range).length) filter.push({ range: { price: range } });
+  for (const n of sch.numerics) {
+    const r = s.ranges[n.field] || {};
+    const range = {};
+    if (r.min !== "" && r.min != null && !isNaN(+r.min)) range.gte = +r.min;
+    if (r.max !== "" && r.max != null && !isNaN(+r.max)) range.lte = +r.max;
+    if (Object.keys(range).length) filter.push({ range: { [n.field]: range } });
+  }
   const text = s.q.trim();
-  const must = text ? [{ multi_match: { query: text, fields: FIELDS, type: "cross_fields" } }] : [{ match_all: {} }];
-  const req = {
-    query: { bool: { must, filter } },
-    aggs: Object.fromEntries(Object.entries(FACETS).map(([n, f]) => [n, { terms: { field: f, size: 10 } }])),
-    size: SIZE,
-  };
+  const must = text && sch.text.length ? [{ multi_match: { query: text, fields: sch.text, type: "cross_fields" } }] : [{ match_all: {} }];
+  const req = { query: { bool: { must, filter } }, size: SIZE, _source: true };
+  if (sch.facets.length) req.aggs = Object.fromEntries(sch.facets.map((f) => [f.field, { terms: { field: f.field, size: 10 } }]));
+  if (s.sort) {
+    const [field, order] = s.sort.split(":");
+    req.sort = [{ [field]: { order } }, "_score"];
+  }
   if (after) { req.search_after = after; req.from = 0; } else { req.from = (page - 1) * SIZE; }
   if (s.explain) req.explain = true;
   return req;
 }
 
-async function post(req) {
+async function post(req, index = INDEX) {
   const t0 = performance.now();
-  const res = await fetch(`${API}/indexes/${encodeURIComponent(INDEX)}/_search`, {
+  const res = await fetch(`${API}/indexes/${encodeURIComponent(index)}/_search`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req),
   });
   const body = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, body, ms: performance.now() - t0 };
+}
+
+/** What the index supports, from GET /indexes/{name}/_mapping (§7): {name: {mappings, s3_fields: {field: {type,
+ *  searchable, filterable, facetable, sortable}}}}. Sub-fields are `f.keyword`. The id field is not offered as a facet. */
+function schemaFromCapabilities(caps, mapping) {
+  const idField = (((mapping || {})._meta || {}).engine || {}).id_field;
+  const boosts = { product_title: 3, product_brand: 2 };
+  const out = { text: [], facets: [], numerics: [] };
+  const label = (f) => f.replace(/^product_/, "").replace(/\.keyword$/, "");
+  for (const [field, c] of Object.entries(caps || {})) {
+    if (field === idField) continue;
+    if (c.searchable) out.text.push(boosts[field] ? `${field}^${boosts[field]}` : field);
+    if (c.facetable && c.filterable) out.facets.push({ field, label: label(field) });
+    if (NUMERIC_TYPES.has(c.type) && c.filterable && c.sortable) out.numerics.push({ field, label: label(field) });
+  }
+  return out;
+}
+
+/** Find what the index supports: its `_mapping` route, else probe the candidate fields one by one. */
+async function discoverSchema() {
+  try {
+    const res = await fetch(`${API}/indexes/${encodeURIComponent(INDEX)}/_mapping`);
+    if (res.ok) {
+      const body = await res.json();
+      const m = body[INDEX] || Object.values(body)[0];
+      if (m && m.s3_fields) return schemaFromCapabilities(m.s3_fields, m.mappings);
+    }
+  } catch (e) { /* fall through to probing */ }
+  const ok = async (req) => { try { return (await post({ size: 1, ...req })).ok; } catch (e) { return false; } };
+  const [text, facets, numerics] = await Promise.all([
+    Promise.all(TEXT_CANDIDATES.map(async (f) => (await ok({ query: { multi_match: { query: "a", fields: [f] } } })) ? f : null)),
+    Promise.all(KEYWORD_CANDIDATES.map(async (f) => (await ok({ query: { match_all: {} }, aggs: { x: { terms: { field: f, size: 1 } } } }))
+      ? { field: f, label: f.replace(/^product_/, "").replace(/\.keyword$/, "") } : null)),
+    Promise.all(NUMERIC_CANDIDATES.map(async (f) => (await ok({ query: { bool: { filter: [{ range: { [f]: { gte: 0 } } }] } }, sort: [{ [f]: { order: "asc" } }, "_score"] }))
+      ? { field: f, label: f } : null)),
+  ]);
+  return { text: text.filter(Boolean), facets: facets.filter(Boolean), numerics: numerics.filter(Boolean) };
 }
 
 const $ = (id) => document.getElementById(id);
@@ -57,17 +107,49 @@ function p95(xs) {
   return s[Math.min(s.length - 1, Math.ceil(0.95 * s.length) - 1)];
 }
 
-function renderFacet(name, agg) {
-  const box = $("facet-" + name).querySelector(".opts");
+function buildControls() {
+  const box = $("dynamic-filters");
   box.replaceChildren();
+  for (const f of schema.facets) {
+    state.filters[f.field] = new Set();
+    const fs = el("fieldset", {}, el("legend", { textContent: f.label }));
+    const opts = el("div", { className: "opts" });
+    opts.dataset.field = f.field;
+    fs.append(opts);
+    box.append(fs);
+  }
+  for (const n of schema.numerics) {
+    state.ranges[n.field] = { min: "", max: "" };
+    const mk = (kind) => {
+      const inp = el("input", { type: "number", min: "0", step: "any", id: `${n.field}-${kind}` });
+      inp.inputMode = "decimal";
+      inp.addEventListener("change", () => { state.ranges[n.field][kind] = inp.value; resetAndSearch(); });
+      return el("label", {}, `${kind === "min" ? "Min" : "Max"} `, inp);
+    };
+    box.append(el("fieldset", {}, el("legend", { textContent: n.label }), mk("min"), mk("max")));
+  }
+  const sel = $("sort");
+  sel.replaceChildren(el("option", { value: "", textContent: "Relevance" }));
+  for (const n of schema.numerics) {
+    sel.append(el("option", { value: `${n.field}:asc`, textContent: `${n.label}, low to high` }),
+               el("option", { value: `${n.field}:desc`, textContent: `${n.label}, high to low` }));
+  }
+  sel.parentElement.hidden = schema.numerics.length === 0;
+}
+
+function renderFacet(f, agg) {
+  const box = document.querySelector(`.opts[data-field="${CSS.escape(f.field)}"]`);
+  if (!box) return;
+  box.replaceChildren();
+  const chosen = state.filters[f.field];
   const buckets = new Map(((agg && agg.buckets) || []).map((b) => [String(b.key), b.doc_count]));
-  for (const k of state[name]) if (!buckets.has(k)) buckets.set(k, 0); // a chosen value stays visible, so it can be unchecked
+  for (const k of chosen) if (!buckets.has(k)) buckets.set(k, 0); // a chosen value stays visible, so it can be unchecked
   for (const [key, count] of buckets) {
-    const cb = el("input", { type: "checkbox", checked: state[name].has(key) });
-    cb.dataset.facet = name; cb.dataset.value = key;
+    const cb = el("input", { type: "checkbox", checked: chosen.has(key) });
+    cb.dataset.facet = f.field; cb.dataset.value = key;
     cb.addEventListener("change", () => {
-      cb.checked ? state[name].add(key) : state[name].delete(key);
-      state.page = 1; search();
+      cb.checked ? chosen.add(key) : chosen.delete(key);
+      resetAndSearch();
     });
     box.append(el("label", {}, cb, el("span", { textContent: key }), el("span", { className: "count", textContent: String(count) })));
   }
@@ -87,7 +169,7 @@ function renderHits(body) {
     const li = el("li");
     li.dataset.id = h._id;
     li.append(el("div", { className: "title", textContent: src.product_title || h._id }));
-    const bits = [src.product_brand, src.category, src.price != null ? "$" + src.price : null].filter(Boolean);
+    const bits = [src.product_brand, src.product_color, src.category, src.price != null ? "$" + src.price : null].filter(Boolean);
     li.append(el("div", { className: "meta", textContent: bits.join(" · ") }));
     li.append(el("div", { className: "score", textContent: `${h._id} · score ${Number(h._score).toFixed(4)}` }));
     if (state.explain && ex.has(String(h._id))) {
@@ -117,7 +199,7 @@ async function search() {
   const total = body.hits.total;
   const from = (state.page - 1) * SIZE;
   renderHits(body);
-  for (const name of Object.keys(FACETS)) renderFacet(name, (body.aggregations || {})[name]);
+  for (const f of schema.facets) renderFacet(f, (body.aggregations || {})[f.field]);
   $("summary").textContent = total === 0 ? "No results" : `${total.toLocaleString()} results`;
   $("page-label").textContent = total ? `Page ${state.page} of ${Math.max(1, Math.ceil(Math.min(total, 10000) / SIZE))}` : "";
   $("prev").disabled = state.page <= 1;
@@ -126,7 +208,7 @@ async function search() {
   const took = body.took_ms && body.took_ms.total;
   $("timing").textContent = `server ${took != null ? took.toFixed(1) : "?"} ms · browser ${r.ms.toFixed(0)} ms` +
     (latencies.length ? ` · page-1 p95 ${p95(latencies).toFixed(0)} ms (n=${latencies.length})` : "");
-  window.__demo = { latencies, p95: p95(latencies), state: { q: state.q, page: state.page }, lastRequest: req };
+  window.__demo = { latencies, p95: p95(latencies), state: { q: state.q, page: state.page }, lastRequest: req, schema };
 }
 
 function resetAndSearch() { state.page = 1; state.pendingAfter = null; search(); }
@@ -135,12 +217,12 @@ let typing;
 $("search-form").addEventListener("submit", (e) => { e.preventDefault(); clearTimeout(typing); state.q = $("q").value; resetAndSearch(); });
 $("q").addEventListener("input", () => { clearTimeout(typing); typing = setTimeout(() => { state.q = $("q").value; resetAndSearch(); }, 250); });
 $("explain").addEventListener("change", (e) => { state.explain = e.target.checked; search(); });
-for (const [id, key] of [["price-min", "min"], ["price-max", "max"]]) {
-  $(id).addEventListener("change", (e) => { state[key] = e.target.value; resetAndSearch(); });
-}
+$("sort").addEventListener("change", (e) => { state.sort = e.target.value; resetAndSearch(); });
 $("clear").addEventListener("click", () => {
-  state.category.clear(); state.brand.clear(); state.min = state.max = "";
-  $("price-min").value = $("price-max").value = ""; resetAndSearch();
+  for (const s of Object.values(state.filters)) s.clear();
+  for (const r of Object.values(state.ranges)) { r.min = ""; r.max = ""; }
+  for (const i of document.querySelectorAll("#dynamic-filters input[type=number]")) i.value = "";
+  resetAndSearch();
 });
 // Next uses search_after (the last hit's `sort`, passed back verbatim); previous uses from/size.
 $("next").addEventListener("click", () => {
@@ -150,5 +232,9 @@ $("next").addEventListener("click", () => {
 });
 $("prev").addEventListener("click", () => { state.page = Math.max(1, state.page - 1); state.pendingAfter = null; search(); });
 
-window.DemoCore = { buildRequest, p95 };
-search();
+window.DemoCore = { buildRequest, p95, schemaFromCapabilities };
+(async () => {
+  schema = await discoverSchema();
+  buildControls();
+  search();
+})();

@@ -18,7 +18,8 @@ from typing import Any, Iterable, Iterator
 
 import numpy as np
 
-from dataplane.intake.encoders import Encoder, HashingEncoder, get_encoder, register  # noqa: F401 (re-exported)
+from dataplane.intake.encoders import (Encoder, HashingEncoder, doc_text, fitted_arrays, get_encoder,  # noqa: F401
+                                       load_fitted, needs_fit, register, save_fitted)
 from dataplane.mapping import (ID_MAX_BYTES, BadValue, Mapping, as_mapping, coerce, is_missing, json_safe)
 
 # The closed set of rejection reasons (additive). The first six are the architect's draft; the last four were added
@@ -137,61 +138,79 @@ def validate(doc: Any, mapping: dict | Mapping) -> dict | Rejection:
 
 # ---- enrichment -------------------------------------------------------------------------------------------------------
 
-_DEFAULTS: dict[tuple[str, int], Encoder] = {}
+_DEFAULTS: dict[tuple[str, int], Encoder] = {}   # stateless defaults only (never a fittable encoder)
 
 
-def resolve_encoder(encoder: Encoder | dict | None, field_name: str, model: str, dim: int) -> Encoder:
+def resolve_encoder(encoder: Encoder | dict | None, field_name: str, model: str, dim: int, store=None) -> Encoder:
+    """The encoder for one vector field: the one passed (or ``encoder[field_name]``), else the model's default
+    (``encoders.get_encoder``). A fittable default is restored from ``store`` when the store holds a fitted one."""
     if isinstance(encoder, dict):
         encoder = encoder.get(field_name)
     if encoder is None:
         encoder = _DEFAULTS.get((model, dim))
         if encoder is None:
-            encoder = _DEFAULTS[(model, dim)] = get_encoder(model, dim)
+            encoder = get_encoder(model, dim)
+            if needs_fit(encoder):
+                if store is not None:
+                    encoder = load_fitted(store, field_name, encoder) or encoder
+            else:
+                _DEFAULTS[(model, dim)] = encoder
     if int(encoder.dim) != dim:
         raise ValueError(f"encoder {encoder.name!r} gives {encoder.dim} dims; {field_name!r} is mapped with {dim}")
     return encoder
 
 
 def enrich(docs: list[dict], mapping: dict | Mapping, encoder: Encoder | dict | None = None) -> list[dict]:
-    """Add the vector of each ``_meta.engine.embeddings`` field a doc lacks, from its input fields (joined by a
-    space). A doc with no input text, or whose vector is zero, stays without one. Works in place; returns ``docs``."""
+    """Add the vector of each ``_meta.engine.embeddings`` field a doc lacks, from its input fields (the engine's text
+    form, ``encoders.doc_text``). A doc with no input value, or whose vector is zero, stays without one. An unfitted
+    fittable encoder is fitted first on all of ``docs``. Works in place; returns ``docs``."""
     m = as_mapping(mapping)
     for vf, spec in m.embeddings.items():
-        need = [d for d in docs if is_missing(d.get(vf))]
-        texts = [" ".join(str(d[i]) for i in spec["inputs"] if not is_missing(d.get(i))) for d in need]
-        pairs = [(d, t) for d, t in zip(need, texts) if t.strip()]
-        if not pairs:
-            continue
+        inputs = spec["inputs"]
         enc = resolve_encoder(encoder, vf, spec["model"], m.fields[vf].dim)
-        vecs = np.asarray(enc.encode([t for _, t in pairs]), dtype=np.float32)
-        if vecs.shape != (len(pairs), m.fields[vf].dim):
+        if needs_fit(enc) and docs:
+            enc.fit([doc_text(d, inputs) for d in docs])
+        need = [d for d in docs if is_missing(d.get(vf)) and any(not is_missing(d.get(i)) for i in inputs)]
+        if not need:
+            continue
+        vecs = np.asarray(enc.encode([doc_text(d, inputs) for d in need]), dtype=np.float32)
+        if vecs.shape != (len(need), m.fields[vf].dim):
             raise ValueError(f"encoder {enc.name!r} returned shape {vecs.shape}")
-        norms = np.linalg.norm(vecs, axis=1)
-        for (d, _), v, n in zip(pairs, vecs, norms):
+        norms = np.linalg.norm(vecs.astype(np.float64), axis=1)
+        for d, v, n in zip(need, vecs, norms):
             if n > 0 and np.isfinite(n):
-                d[vf] = (v / n).astype(np.float32)
+                d[vf] = v if abs(n - 1.0) < 1e-6 else (v / n).astype(np.float32)   # keep unit vectors bit-exact
     return docs
 
 
-def encoder_names(mapping: dict | Mapping, encoder: Encoder | dict | None = None) -> dict[str, str]:
-    m = as_mapping(mapping)
-    return {vf: resolve_encoder(encoder, vf, s["model"], m.fields[vf].dim).name for vf, s in m.embeddings.items()}
-
-
-def _check_encoders(store, mapping: Mapping, encoder) -> dict[str, str]:
-    """One store, one encoder per vector field: vectors from two encoders are not comparable."""
-    names = encoder_names(mapping, encoder)
-    for vf, name in names.items():
+def _store_encoders(store, mapping: Mapping, encoder) -> dict[str, Encoder]:
+    """The encoders for a store's vector fields. One store, one encoder per vector field: vectors from two encoders
+    are not comparable, so a name other than the recorded one is refused."""
+    encs = {vf: resolve_encoder(encoder, vf, s["model"], mapping.fields[vf].dim, store)
+            for vf, s in mapping.embeddings.items()}
+    for vf, enc in encs.items():
         have = store.meta(f"encoder.{vf}")
-        if have is not None and have != name:
-            raise ValueError(f"{vf!r} in this store was enriched by {have!r}; refusing to mix in {name!r}")
-    return names
+        if have is not None and have != enc.name:
+            raise ValueError(f"{vf!r} in this store was enriched by {have!r}; refusing to mix in {enc.name!r}")
+        if have is not None and needs_fit(enc):
+            raise ValueError(f"{vf!r} was enriched by {have!r}, but the store holds no fitted copy of it")
+    return encs
 
 
-def _record_encoders(store, names: dict[str, str]) -> None:
-    for vf, name in names.items():
+def encoder_names(mapping: dict | Mapping, encoder: Encoder | dict | None = None, store=None) -> dict[str, str]:
+    m = as_mapping(mapping)
+    return {vf: resolve_encoder(encoder, vf, s["model"], m.fields[vf].dim, store).name
+            for vf, s in m.embeddings.items()}
+
+
+def _record_encoders(store, encs: dict[str, Encoder], fitted_here: set[str]) -> None:
+    """After a batch committed: the encoder's name in ``meta("encoder.<field>")`` and, for an encoder fitted by
+    this batch, its arrays in ``blob("encoder.<field>")`` (the indexer puts them in the segment, for ``neural``)."""
+    for vf, enc in encs.items():
+        if vf in fitted_here:
+            save_fitted(store, vf, enc)
         if store.meta(f"encoder.{vf}") is None:
-            store.set_meta(f"encoder.{vf}", name)
+            store.set_meta(f"encoder.{vf}", enc.name)
 
 
 # ---- ingest -----------------------------------------------------------------------------------------------------------
@@ -205,12 +224,44 @@ def _write_rejection(fh, record: Any, rej: Rejection) -> None:
     fh.write(json.dumps({"record": json_safe(record), "rejection": rej.to_dict()}, ensure_ascii=False) + "\n")
 
 
+def _accepted(path, m: Mapping, reject) -> Iterator[dict]:
+    """The validated docs of a batch file, first valid record of an id only; ``reject(record, rejection)`` for the
+    rest."""
+    seen: set[str] = set()
+    for item in read_batch(path, m):
+        if isinstance(item, Rejection):
+            reject(getattr(item, "raw", None), item)
+            continue
+        doc = validate(item, m)
+        if isinstance(doc, Rejection):
+            reject(item, doc)
+            continue
+        _id = doc[m.id_field]
+        if _id in seen:
+            reject(item, Rejection(_id, "duplicate_id_in_batch", m.id_field, "an earlier record has this id"))
+            continue
+        seen.add(_id)
+        yield doc
+
+
 def ingest(path: str | Path, mapping: dict | Mapping, store, rejected: str | Path,
            encoder: Encoder | dict | None = None, chunk: int = 2000) -> IntakeReport:
     """A batch file into the store as one atomic batch of upserts. Within the file, the first valid record of an id
-    wins; later ones are rejected (``duplicate_id_in_batch``)."""
+    wins; later ones are rejected (``duplicate_id_in_batch``). When a vector field's encoder must be fitted and the
+    store holds no fitted one, a first pass over the file fits it on every accepted doc (as ``build_index`` fits on
+    the catalogue), and the fitted encoder is kept in the store once the batch commits."""
     m = as_mapping(mapping)
-    names = _check_encoders(store, m, encoder)
+    encs = _store_encoders(store, m, encoder)
+    fitted_here = {vf for vf, enc in encs.items() if needs_fit(enc)}
+    if fitted_here:
+        texts: dict[str, list[str]] = {vf: [] for vf in fitted_here}
+        for doc in _accepted(path, m, lambda record, rej: None):
+            for vf in fitted_here:
+                texts[vf].append(doc_text(doc, m.embeddings[vf]["inputs"]))
+        for vf in fitted_here:
+            if texts[vf]:
+                encs[vf].fit(texts[vf])
+        fitted_here = {vf for vf in fitted_here if not needs_fit(encs[vf])}
     reasons: Counter = Counter()
     accepted = 0
     rpath = _rejected_path(rejected)
@@ -223,30 +274,17 @@ def ingest(path: str | Path, mapping: dict | Mapping, store, rejected: str | Pat
 
         def upserts() -> Iterator[dict]:
             nonlocal accepted
-            seen: set[str] = set()
             buf: list[dict] = []
 
             def flush():
                 nonlocal accepted
-                enrich(buf, m, encoder)
+                enrich(buf, m, encs)
                 accepted += len(buf)
                 out = [{"op": "upsert", "_id": d[m.id_field], "doc": d} for d in buf]
                 buf.clear()
                 return out
 
-            for item in read_batch(path, m):
-                if isinstance(item, Rejection):
-                    reject(getattr(item, "raw", None), item)
-                    continue
-                doc = validate(item, m)
-                if isinstance(doc, Rejection):
-                    reject(item, doc)
-                    continue
-                _id = doc[m.id_field]
-                if _id in seen:
-                    reject(item, Rejection(_id, "duplicate_id_in_batch", m.id_field, "an earlier record has this id"))
-                    continue
-                seen.add(_id)
+            for doc in _accepted(path, m, reject):
                 buf.append(doc)
                 if len(buf) >= chunk:
                     yield from flush()
@@ -255,7 +293,7 @@ def ingest(path: str | Path, mapping: dict | Mapping, store, rejected: str | Pat
 
         first, last = store.apply(upserts())
     if accepted:
-        _record_encoders(store, names)
+        _record_encoders(store, encs, fitted_here)
     return IntakeReport(accepted, sum(reasons.values()), first, last, dict(reasons))
 
 
@@ -268,7 +306,7 @@ def apply_changes(changes: Iterable[dict], mapping: dict | Mapping, store, encod
     ``missing_id``, ``not_hot``, ``no_such_key``, and the validation reasons for upserts and patch values)."""
     m = as_mapping(mapping)
     changes = list(changes)
-    names = _check_encoders(store, m, encoder)
+    encs = _store_encoders(store, m, encoder)
     hot = set(m.hot)
     patch_ids = [c.get("_id") for c in changes if isinstance(c, dict) and c.get("op") == "patch"
                  and isinstance(c.get("_id"), str)]
@@ -339,10 +377,11 @@ def apply_changes(changes: Iterable[dict], mapping: dict | Mapping, store, encod
             bad.append((ch, rej))
             continue
         accepted.append({"op": "patch", "_id": _id, "fields": vals})
-    enrich(upsert_docs, m, encoder)
+    fitted_here = {vf for vf, enc in encs.items() if needs_fit(enc)} if upsert_docs else set()
+    enrich(upsert_docs, m, encs)
     first, last = store.apply(accepted)
     if upsert_docs:
-        _record_encoders(store, names)
+        _record_encoders(store, encs, fitted_here)
     if rejected is not None and bad:
         rpath = _rejected_path(rejected)
         rpath.parent.mkdir(parents=True, exist_ok=True)

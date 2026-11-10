@@ -40,7 +40,28 @@ def _set_version(seg, version: int) -> None:
         raise TypeError("build_segment returned no manifest dict to carry the version (§4)")
 
 
-def build(store, mapping: dict | Mapping | None, out_dir: str | Path, device_budget: int | None = None) -> Path:
+def attach_encoders(seg, store, mapping: Mapping) -> list[str]:
+    """Put the store's fitted encoders (``intake.encoders.fitted_arrays``) into the segment, for the vector fields
+    whose vectors they produced, so the segment answers ``neural`` queries (§4: ``vec/<f>.encoder.*``, and
+    ``vector_fields.<f>.encoder``). ``build_segment`` stores an encoder only when it fits one itself; the store's
+    vectors come in as given vectors, so the indexer adds the one intake fitted. Returns the fields given one."""
+    from dataplane.intake.encoders import fitted_arrays
+    done = []
+    vf_meta = seg.manifest.get("vector_fields", {})
+    for vf in mapping.vector_fields:
+        arrays = fitted_arrays(store, vf)
+        if arrays is None or vf not in getattr(seg, "vectors", {}) or vf not in vf_meta:
+            continue
+        if int(arrays["dim"]) != int(vf_meta[vf]["dim"]):
+            raise ValueError(f"the store's encoder for {vf!r} gives {int(arrays['dim'])} dims, not {vf_meta[vf]['dim']}")
+        seg.encoders[vf] = arrays
+        vf_meta[vf]["encoder"] = True
+        vf_meta[vf]["model"] = store.meta(f"encoder.{vf}") or vf_meta[vf].get("model")
+        done.append(vf)
+    return done
+
+
+def build(store,mapping: dict | Mapping | None, out_dir: str | Path, device_budget: int | None = None) -> Path:
     """Build a segment of the store at its head; returns the segment directory.
 
     ``device_budget`` (bytes): refuse a segment whose ``device_nbytes`` would not fit (``engine.backend.OverBudget``),
@@ -52,8 +73,10 @@ def build(store, mapping: dict | Mapping | None, out_dir: str | Path, device_bud
     snap = store.snapshot()
     version = snap.attrs["version"]
     h = _engine.hooks()
-    seg = h.build_segment(snap, m.raw)
+    models = {vf: store.meta(f"encoder.{vf}") for vf in m.vector_fields if store.meta(f"encoder.{vf}")}
+    seg = h.build_segment(snap, m.raw, version=version, vector_models=models)
     _set_version(seg, version)
+    attach_encoders(seg, store, m)
     tmp = out / f".tmp-{uuid.uuid4().hex[:12]}"
     tmp.mkdir()
     try:
