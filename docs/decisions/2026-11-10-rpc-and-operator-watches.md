@@ -55,3 +55,10 @@ is not held in memory, the store's batches stay small, and visibility of patches
 **Measured** (2 cores via `taskset`, over HTTP, `python -m serving.bench_bulk`): 48,439 documents (plus a 200-document seed
 index = ESCI-sample's 48,639) in 2.9 to 5.9 s over 6 runs (8,200 to 16,600 docs/s; the 5.9 s run was the first, cold), 0 errors; a following full-rebuild
 refresh 18.7 s.
+
+**With delta refresh (S8-4 hook, `dataplane.updater.serving_refresh`; default interval 500 ms, the S8-1 ruling).**
+`_bulk ?refresh=wait_for` on ESCI-sample, 2 cores, over HTTP, no full rebuild (no `reindex` swap, one base segment on disk,
+the last document found by search): 1,000 documents into a 47,639-document index visible in 0.85 s; 100 into 48,539 in 0.68 s
+(a full rebuild is 18.7 s). All 48,439 into a 200-document seed, with the background refresher running concurrently, 13.3 s
+end to end and visible (against 2.9 to 5.9 s with refresh off): the 15 s bar holds, with little margin when every document is
+refreshed while it streams in.
