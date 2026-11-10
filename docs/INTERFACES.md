@@ -489,7 +489,7 @@ Index.from_segment(path, device) -> Index
 | `query.term`, `query.terms` | keyword, numeric, boolean fields | constant score `1.0 * boost` in a scoring context (alone, `must`, `should`); 0 in `filter` and `must_not` |
 | `query.range` | `gte`, `gt`, `lte`, `lt` on numeric and keyword fields | constant score, as `term` |
 | `query.knn` | `{field: {"vector": [...], "k": int, "filter": query, "method": "exact", "method_parameters": {}}}` | exact; `_score = (1 + cos) / 2` (OpenSearch `cosinesimil`); `filter` is a pre-filter |
-| knn `method` (S9-1; on `knn` and `neural`) | `"exact"` (default), `"cagra"`, `"ivf_pq"`; `method_parameters`: cagra `itopk_size`, `search_width`; ivf_pq `n_probes` (positive integers; others `InvalidRequest`) | cagra and ivf_pq run cuVS on a `cuda` index with cuVS installed: an index per segment and field, built on first use and built afresh for a merged segment; the `filter` and deletes are cuVS's bitset prefilter; each segment returns up to `k` docs, and the top `k` of those by exact similarity are the hits (their `_score` is exact, only the set found is approximate). Elsewhere the method runs as `exact`. The response says which ran (`knn`, below) |
+| knn `method` (S9-1; on `knn` and `neural`) | `"exact"` (default), `"cagra"`, `"ivf_pq"`; `method_parameters`: cagra `itopk_size`, `search_width`; ivf_pq `n_probes` (positive integers; others `InvalidRequest`) | cagra and ivf_pq run cuVS on a `cuda` index with cuVS installed: an index per segment and field, built on first use and built afresh for a merged segment; the `filter` and deletes are cuVS's bitset prefilter; each segment returns up to `k` docs, and the top `k` of those by exact similarity are the hits (their `_score` is exact, only the set found is approximate). Elsewhere the method runs as `exact`. The response says which ran (`knn`, below). **Version tolerance:** the filter argument of cuVS's `search` and the bitset constructor (`cuvs.neighbors.filters.from_bitset`) are discovered from the installed cuVS, never from its version. **Post-filter:** when a segment has a filter or deletes and the method's `search` takes no filter (cuVS 26.06's `ivf_pq.search`), that segment asks for `k' = min(n, 8192, ceil(k / max(selectivity, 0.01)) * 2)` candidates (selectivity: the segment's valid docs / its docs), drops those failing, and keeps the top `k` by exact similarity; if fewer than `k` pass, that segment answers exactly. A segment with nothing to filter is searched without a filter. If cuVS fails (a build or a search raises), the clause runs exact |
 | `query.match_all` | `{}` | score 1.0 |
 | `query.match_phrase` (S7-1) | `{field: "text"}` or `{field: {"query", "slop": 0, "boost"}}` | text fields with positions; Lucene's rule: some choice of one position per term with `max(v) - min(v) <= slop`, `v = position - query offset` (stopwords keep their offsets); score = BM25 with the phrase frequency as tf and the sum of the terms' field idf (with slop > 0 the frequency is `sum 1 / (1 + matchLength)` over matching starts, an approximation of Lucene's); on a keyword or numeric field it is a `term` |
 | `query.fuzzy` (S7-2) | `{field: "v"}` or `{field: {"value", "fuzziness": "AUTO", "prefix_length": 0, "max_expansions": 50, "transpositions": true, "boost"}}` | term-level (the value is not analysed); expanded in the field's terms dictionary (`engine/dictionary.py`): Levenshtein, adjacent transpositions count 1, at most 2 edits, `AUTO` = 0 / 1 / 2 edits for 1-2 / 3-5 / 6+ characters (`AUTO:low,high` too), the `max_expansions` most similar terms (ties by term order); text fields: the BM25 scores of the expansions present add (Lucene blends their df; ours does not); keyword fields: a term over the expanded values (constant score); numeric fields refused |
@@ -582,7 +582,10 @@ Scoring, exactly:
   refuses other formats or versions with `ValueError`. Register a loaded model with `Index.add_ranker(name, model)`.
 - No hit beyond `total`: an empty page is `{"total": n, "hits": []}`.
 - `knn` (S9-1; present when the query has `knn` or `neural` clauses): `{field: {"requested": method, "ran": method}}`,
-  the method asked for and the one that ran (`"exact"` when cuVS or a GPU is absent). Several clauses on one field
+  the method asked for and the one that ran. `ran` is the method; `"<method>+postfilter"` when any segment was
+  post-filtered (above); or `"exact"` (no cuVS or GPU, a cuVS failure, or every segment answered exactly after a
+  post-filter). Whenever an approximate method did not run as itself (or some segments answered exactly), the object
+  also has `reason`, a sentence naming why (e.g. `"not a cuda index (device cpu)"`). Several clauses on one field
   give a list of these objects, in request order (a depth-first walk of the query, then `post_filter`).
 
 ## 6. The plan (DSL → operators) · owner architect
@@ -914,3 +917,9 @@ status:
 - 2026-11-10, architect (S9-5 fix, found by the dataplane-engineer end to end): section 4 states the rule for
   nested children in a commit: delete files cover parents only, and children's live bits are re-derived from their
   parents on load (`Index.from_commit` revived the children of a parent copy tombstoned by an edit). No format change.
+- 2026-11-10, architect (S9-1, the founder's first Colab run, cuVS 26.06): cuVS's filter argument is discovered from
+  the installed functions; a search without one (26.06's `ivf_pq.search`) is post-filtered per segment (the rule in
+  section 5's knn `method` row), `ran` gains `"<method>+postfilter"`, and the `knn` objects gain `reason` when an
+  approximate method did not run as itself; a cuVS failure runs the clause exact instead of raising. Lexical sums over
+  fields and synonym groups are elementwise adds in field (group) order, so every backend gives the same bits.
+  Additive.

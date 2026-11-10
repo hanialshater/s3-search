@@ -57,14 +57,18 @@ def _modify(b, mod: str, x):
 
 
 
-def _knn_methods(b, plan) -> dict:
-    """S9-1, §5: ``{field: {"requested", "ran"}}`` for the plan's knn and neural clauses, a list in request order when
-    several share a field."""
+def _knn_methods(b, plan, outcome=None) -> dict:
+    """S9-1, §5: ``{field: {"requested", "ran"}}`` for the plan's knn and neural clauses (with ``reason`` when an
+    approximate method ran as exact), a list in request order when several share a field. ``outcome``: node ->
+    (ran, reason) as executed."""
     out = {}
     roots = [plan.root] + ([plan.post_filter] if plan.post_filter is not None else [])
     for n in (m for r in roots for m in walk(r)):
         if isinstance(n, Dense):
-            e = {"requested": n.method, "ran": ann.ran(b, n.method)}
+            r, why = (outcome or {}).get(n) or ann.status(b, n.method)
+            e = {"requested": n.method, "ran": r}
+            if why is not None:
+                e["reason"] = why
             if n.field not in out:
                 out[n.field] = e
             elif isinstance(out[n.field], list):
@@ -92,6 +96,7 @@ class Executor:
     def __init__(self, st, rankers=None):
         self.st, self.b = st, st.b
         self.rankers = rankers if rankers is not None else {}
+        self.knn_outcome = {}
 
     # ---- retrieval, batched across plans
     def _prefetch(self, plans, timer):
@@ -213,9 +218,17 @@ class Executor:
             valid = st.live
             if node.filter is not None:
                 valid = valid & self.eval(node.filter, ctx)[1]
-            if ann.ran(b, node.method) != "exact":         # S9-1: the docs cuVS finds, scored exactly
-                valid = ann.candidates(b, st, node.field, node.method, dict(node.method_parameters),
-                                       self.dense_query[node], node.k, valid)
+            tried, why = ann.status(b, node.method)
+            if tried != "exact":                           # S9-1: the docs cuVS finds, scored exactly
+                try:
+                    cand, hows = ann.candidates(b, st, node.field, node.method, dict(node.method_parameters),
+                                                self.dense_query[node], node.k, valid)
+                except ann.Fallback as e:                  # cuVS could not answer: exact, with the reason
+                    tried, why = "exact", str(e)
+                else:
+                    valid = cand
+                    tried, why = ann.label(node.method, hows)
+            self.knn_outcome[node] = (tried, why)
             idx, _ = b.topk(sims.reshape(1, N), node.k, valid.reshape(1, N))
             idx = idx[0]
             idx = idx[idx >= 0]
@@ -258,7 +271,7 @@ class Executor:
             pidf = part.idf_field[:, f_i] if node.idf == "field" else part.idf
             groups = [[part.vocab[t] for t in g if t in part.vocab] for g in node.groups]
             sc, present = ops.bm25f_groups(b, part, groups, list(node.modes), w, bb, st.mapping.k1, pidf, group_idf)
-            sc = b.sum(sc, axis=0)
+            sc = ops.sum_lr(sc, 0) if sc.shape[0] else b.zeros(st.N, "float32")
             score = sc if score is None else score + sc
             count = present if count is None else count | present
         m = b.sum(b.astype(count, "int32"), axis=0) >= node.msm
@@ -634,6 +647,7 @@ class Executor:
         for plan in plans:
             t = Timer(b)
             ctx = {"explain": {} if plan.explain else None}
+            self.knn_outcome = {}
             score, match = self.eval(plan.root, ctx)
             match = match & st.live
             score = b.where(match, score, 0.0)
@@ -667,7 +681,7 @@ class Executor:
                     h["fields"] = {plan.collapse: [None if c == 0 else group_keys[c]]}
             t.lap("page")
             resp = {"hits": {"total": total, "hits": hits}, **resp}
-            knn = _knn_methods(b, plan)
+            knn = _knn_methods(b, plan, self.knn_outcome)
             if knn:
                 resp["knn"] = knn
             if plan.highlight is not None:

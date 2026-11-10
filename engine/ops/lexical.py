@@ -4,6 +4,18 @@ from __future__ import annotations
 MAX_POSTINGS_PER_CHUNK = 30_000_000
 
 
+def sum_lr(x, axis: int):
+    """The sum over a short axis (fields, groups), added left to right with elementwise adds. A library's
+    reduction kernel may order a float32 sum differently by version and device (torch-cpu 2.14 and 2.15 differ);
+    elementwise IEEE adds in a fixed order give the same bits on every backend."""
+    n = x.shape[axis]
+    pick = (lambda i: x[:, i]) if axis == 1 else (lambda i: x[i])
+    out = pick(0)
+    for i in range(1, n):
+        out = out + pick(i)
+    return out
+
+
 def bm25f_groups(b, st, groups, modes, w, bb, k1: float, idf, group_idf=None):
     """Score clause groups (S7-2, S7-6): each group is a list of alternative term ids that count as one clause.
 
@@ -28,7 +40,7 @@ def bm25f_groups(b, st, groups, modes, w, bb, k1: float, idf, group_idf=None):
     tf = b.astype(st.tf[entry], "float32")
     norm = (1.0 - bb) + bb * st.rel_len[docs]
     norm = b.where(norm > 1e-6, norm, 1e-6)
-    ptf = b.sum(w * tf / norm, axis=1)
+    ptf = sum_lr(w * tf / norm, 1)
     keys = q_of * N + docs
     hit = ptf > 0
     present = present + b.segment_count(keys[hit], G * N)
@@ -89,7 +101,7 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
         tf = b.astype(st.tf[entry], "float32")
         norm = (1.0 - bb) + bb * st.rel_len[docs]
         norm = b.where(norm > 1e-6, norm, 1e-6)
-        ptf = b.sum(w * tf / norm, axis=1)
+        ptf = sum_lr(w * tf / norm, 1)
         imp = idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf)
         keys = q_of * N + docs
         scores = scores + b.segment_sum(keys, imp, Q * N)
@@ -120,7 +132,7 @@ def bm25f_multi(b, parts, terms_per_part, w, bb, k1: float, idfs, N: int):
         tf = b.astype(st.tf[entry], "float32")
         norm = (1.0 - bb) + bb * st.rel_len[docs]
         norm = b.where(norm > 1e-6, norm, 1e-6)
-        ptf = b.sum(w * tf / norm, axis=1)
+        ptf = sum_lr(w * tf / norm, 1)
         keys_all.append(q_of * N + docs)
         imp_all.append(idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf))
         hit_all.append(ptf > 0)
