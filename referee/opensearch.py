@@ -74,6 +74,7 @@ def index_settings(mapping):
     bm = mapping.get("_meta", {}).get("engine", {}).get("bm25", {})
     return {"settings": {
         "number_of_shards": 1, "number_of_replicas": 0, "index.knn": True,
+        "index.translog.flush_threshold_size": "64mb",  # a small translog: the shared disk is tight
         "similarity": {"default": {"type": "BM25", "k1": bm.get("k1", 1.2), "b": bm.get("b", 0.75)}},
         "analysis": {
             "tokenizer": {"s3_words": {"type": "pattern", "pattern": "[a-z0-9]+(?:'[a-z0-9]+)?", "group": 0,
