@@ -38,7 +38,13 @@ def test_lexical_scores_match_the_reference(index, ds, ref):
 
 
 def test_errors_are_named(index):
+    """Everything referee/scope.py says must be refused is refused, naming its path."""
     checks.check_errors(index, api)
+
+
+def test_landed_constructs_are_answered(index):
+    """Everything referee/scope.py marks landed (S7) is answered; its correctness is S7-9's conformance."""
+    checks.check_landed_are_answered(index, api)
 
 
 @pytest.mark.parametrize("check", checks.ALL_INDEX_CHECKS, ids=lambda f: f.__name__)
