@@ -4,16 +4,13 @@ Part 1 runs the requests the page builds (the page's own JS, in headless Chromiu
 of ESCI-sample with the synthetic locations and offers (`tools/stack.py`, the kind the steward's s9-v1 suite uses), and
 checks the answers against a brute-force computation on the catalogue.
 
-Part 2 drives the page against a real serving replica. It cannot run yet: serving's intake (`dataplane/mapping.py`,
-`TYPES`) refuses `geo_point` and `nested`. That is reported as an expected failure naming the cause, and the test runs for
-real as soon as the data plane accepts the types.
+Part 2 drives the page against a real serving replica holding the same index.
 """
 import json
 import math
 import shutil
 import subprocess
 import threading
-import urllib.error
 from pathlib import Path
 
 import pytest
@@ -130,13 +127,7 @@ def test_text_request_with_nested_selection_runs(world):
 
 
 def test_page_against_serving_with_geo_and_nested():
-    try:
-        st = Stack(N, fields=True, geo=True)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        if "geo_point" in body or "nested" in body:
-            pytest.xfail("serving's intake refuses geo_point/nested (dataplane/mapping.py TYPES): " + body[:160])
-        raise
+    st = Stack(N, fields=True, geo=True)  # a failure to start is a failure
     srv = demo.make_server(st.base, port=0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
