@@ -373,13 +373,90 @@ def judge_s5a(out_path):
     return res
 
 
+def judge_s5b(out_path, variant="esci-sample"):
+    """The demo page in headless Chrome against a real serving replica, through the demo's own server
+    (`python -m tools.demo`). variant "esci-sample": the dataset as the loader serves it; "esci-sample+fields": with
+    synthetic category and price, to see the page work where its facet fields exist (stated as a deviation)."""
+    import os
+    import socket
+    import subprocess
+    res = {"kind": "judge-s5b", "label": "CPU, development only", "dataset": "esci-sample", "variant": variant}
+    ds = loader.load_dataset("esci-sample")
+    cat, mapping = ds.catalogue, ds.mapping
+    if variant == "esci-sample+fields":
+        cat, mapping = with_hot_fields(ds)
+        rng = np.random.default_rng(HOT_SEED + 5)
+        cat["category"] = rng.choice(["apparel", "home", "electronics", "toys", "sports", "beauty"], len(cat))
+        mapping["properties"]["category"] = {"type": "keyword"}
+    work = Path(tempfile.mkdtemp(prefix="judge-s5b-"))
+    src = work / "catalogue.parquet"
+    cat.to_parquet(src, index=False)
+    srv = Server(work / "serving")
+    demo = None
+    try:
+        srv.call("PUT", "/indexes/esci-sample", {"mapping": mapping, "source": {"path": str(src)}})
+        probe = {"query": {"bool": {"must": [{"match_all": {}}], "filter": []}}, "size": 10, "from": 0,
+                 "aggs": {"category": {"terms": {"field": "category", "size": 10}},
+                          "brand": {"terms": {"field": "product_brand.keyword", "size": 10}}}}
+        try:
+            srv.call("POST", "/indexes/esci-sample/_search", probe)
+            res["demo_request_direct"] = "ok"
+        except Exception as e:  # noqa: BLE001
+            res["demo_request_direct"] = f"{type(e).__name__}: {getattr(e, 'read', lambda: b'')().decode()[:300] or e}"
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        demo = subprocess.Popen(["taskset", "-c", "0,1", sys.executable, "-m", "tools.demo", "--api", srv.base,
+                                 "--port", str(port)], cwd=Path(__file__).resolve().parent.parent,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.0)
+        q = ds.fit[["query_id", "query"]].drop_duplicates("query_id")
+        rng = np.random.default_rng(HOT_SEED + 6)
+        texts = [str(t) for t in q["query"].iloc[np.sort(rng.choice(len(q), 100, replace=False))]]
+        qp = work / "queries.json"
+        qp.write_text(json.dumps(texts))
+        out_js = work / "browser.json"
+        npm_root = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True).stdout.strip()
+        t = time.perf_counter()
+        p = subprocess.run(["taskset", "-c", "0,1", "node", str(Path(__file__).with_name("judge_s5b.js")),
+                            f"http://127.0.0.1:{port}/?index=esci-sample", str(qp), str(out_js)],
+                           env={**os.environ, "NODE_PATH": npm_root}, capture_output=True, text=True, timeout=1800)
+        res["browser_s"] = time.perf_counter() - t
+        if p.returncode != 0:
+            res["browser_error"] = p.stderr[-1500:]
+        else:
+            res["browser"] = json.loads(out_js.read_text())
+    finally:
+        if demo is not None:
+            demo.terminate()
+        srv.close()
+    b = res.get("browser") or {}
+    p95 = (b.get("judge_page1_ms") or {}).get("p95")
+    works = bool(b) and not b.get("first_load_error") and b.get("n_errors", 1) == 0 and \
+        all(b["by_kind"].get(k, 0) > 0 for k in ("search", "facet", "next"))
+    res["verdict_inputs"] = {"page_works": works, "page1_p95_ms": p95}
+    res["verdict"] = "held" if works and p95 is not None and p95 < 300 else "wrong"
+    print(f"S5-b ({variant}): direct demo request: {res.get('demo_request_direct')}; page works: {works}; "
+          f"judge page-1 p95 {p95} ms; page-reported p95 {(b.get('page_reported') or {}).get('p95')} ms; "
+          f"errors {b.get('n_errors')} of {b.get('n_actions')}; first load: {b.get('first_load_error')} "
+          f"-> {res['verdict']}", flush=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps(res, indent=1, default=str) + "\n")
+    return res
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee.judge")
     ap.add_argument("what", choices=("s2", "s4b", "s5a", "s5b"))
+    ap.add_argument("--variant", default="esci-sample", choices=("esci-sample", "esci-sample+fields"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
-    out = a.out or f"results/judge-{a.what}.json"
-    {"s2": judge_s2, "s4b": judge_s4b, "s5a": judge_s5a}[a.what](out)
+    out = a.out or f"results/judge-{a.what}" + ("" if a.variant == "esci-sample" else "-fields") + ".json"
+    if a.what == "s5b":
+        judge_s5b(out, a.variant)
+    else:
+        {"s2": judge_s2, "s4b": judge_s4b, "s5a": judge_s5a}[a.what](out)
     return 0
 
 
