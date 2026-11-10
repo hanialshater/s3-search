@@ -8,6 +8,8 @@ Environment (all optional):
   S3_SERVING_RANKERS      "name=path,..." ranker JSON files (relative to the data dir) added to every preloaded index
   S3_SERVING_MAX_BATCH    scheduler maximum batch size (default 32)
   S3_SERVING_MAX_WAIT_MS  scheduler maximum wait for a fuller batch (default 2.0)
+  S3_SERVING_REFRESH_INTERVAL  default index.refresh_interval (1s; -1 off)
+  S3_SERVING_BULK_CHUNK   actions per store batch in _bulk (default 2000)
   S3_SERVING_CACHE        query cache entries per index, 0 disables (default 1024)
 """
 from __future__ import annotations
@@ -27,6 +29,8 @@ class ServingConfig:
     max_wait_ms: float = 2.0
     max_queue: int = 4096
     cache_size: int = 1024
+    refresh_interval: str = "1s"       # default index.refresh_interval (-1 turns the background refresh off)
+    bulk_chunk: int = 2000            # actions applied per store batch while a _bulk body streams in
     request_timeout_s: float = 30.0
     keep_segments: int = 5
     drain_seconds: float = 3.0
@@ -48,6 +52,8 @@ class ServingConfig:
         cfg.max_batch = int(e.get("S3_SERVING_MAX_BATCH", cfg.max_batch))
         cfg.max_wait_ms = float(e.get("S3_SERVING_MAX_WAIT_MS", cfg.max_wait_ms))
         cfg.cache_size = int(e.get("S3_SERVING_CACHE", cfg.cache_size))
+        cfg.refresh_interval = e.get("S3_SERVING_REFRESH_INTERVAL", cfg.refresh_interval)
+        cfg.bulk_chunk = int(e.get("S3_SERVING_BULK_CHUNK", cfg.bulk_chunk))
         cfg.drain_seconds = float(e.get("S3_SERVING_DRAIN_SECONDS", cfg.drain_seconds))
         cfg.preload = parse_preload(e.get("S3_SERVING_PRELOAD", ""))
         cfg.rankers = dict(x.split("=", 1) for x in e.get("S3_SERVING_RANKERS", "").split(",") if "=" in x)

@@ -23,6 +23,7 @@ Response headers on a search: ``X-Request-Id`` (echoed or generated), ``X-S3-Cac
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
@@ -33,6 +34,9 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from urllib.parse import parse_qsl
+
+from . import bulk as bulk_mod
 from . import metrics as metrics_mod
 from .config import ServingConfig
 from .errors import (BadJSON, InvalidRequestBody, MethodNotAllowed, NotFound, NotReady, ServingError, classify)
@@ -42,8 +46,9 @@ from .ports import Ports, default_ports
 log = logging.getLogger("serving")
 
 _INDEX_ROUTE = re.compile(r"^/indexes/([^/]+)(?:/([^/]+))?$")
-_ACTIONS = {"_search": "POST", "_msearch": "POST", "_docs": "POST", "_reindex": "POST", "_rollback": "POST", "_rankers": "POST", "_mapping": "GET",
-            "versions": "GET"}
+_ACTIONS = {"_search": ("POST",), "_msearch": ("POST",), "_docs": ("POST",), "_bulk": ("POST",), "_reindex": ("POST",),
+            "_rollback": ("POST",), "_rankers": ("POST",), "_mapping": ("GET",), "_settings": ("GET", "PUT"),
+            "_refresh": ("POST",), "versions": ("GET",)}
 
 
 @dataclass
@@ -77,14 +82,15 @@ class App:
         self.manager.close()
 
     # -- dispatch ---------------------------------------------------------------------------------------------------
-    def handle(self, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> Response:
+    def handle(self, method: str, path: str, body=b"", headers: dict | None = None) -> Response:
+        """``body`` is bytes, or for ``_bulk`` a ``read(n) -> bytes`` callable so the body can stream."""
         headers = {k.lower(): v for k, v in (headers or {}).items()}
         rid = headers.get("x-request-id") or uuid.uuid4().hex[:16]
         t0 = time.perf_counter()
         route = "unknown"
         try:
-            path = path.split("?", 1)[0]
-            route, resp = self._route(method.upper(), path, body)
+            path, _, qs = path.partition("?")
+            route, resp = self._route(method.upper(), path, body, dict(parse_qsl(qs, keep_blank_values=True)))
         except Exception as exc:  # noqa: BLE001 - every failure becomes a named error body
             status, obj = classify(exc)
             if status >= 500 and not isinstance(exc, ServingError):
@@ -96,7 +102,7 @@ class App:
         log.debug("req=%s %s %s -> %s %.1fms", rid, method, path, resp.status, (time.perf_counter() - t0) * 1000)
         return resp
 
-    def _route(self, method: str, path: str, body: bytes) -> tuple[str, Response]:
+    def _route(self, method: str, path: str, body, query: dict) -> tuple[str, Response]:
         if path in ("/healthz", "/readyz", "/metrics", "/indexes"):
             if method != "GET":
                 raise MethodNotAllowed(f"{path} takes GET")
@@ -121,9 +127,18 @@ class App:
             raise MethodNotAllowed(f"/indexes/{{name}} takes PUT or GET")
         if action not in _ACTIONS:
             raise NotFound(f"no route {path}", path=path)
-        if method != _ACTIONS[action]:
-            raise MethodNotAllowed(f"{action} takes {_ACTIONS[action]}")
+        if method not in _ACTIONS[action]:
+            raise MethodNotAllowed(f"{action} takes {' or '.join(_ACTIONS[action])}")
         mi = self.manager.get(name)
+        if action == "_bulk":
+            return "bulk", self._bulk(mi, body, query)
+        if callable(body):
+            reader = body
+            body = b"".join(iter(lambda: reader(1 << 20), b""))
+        if action == "_docs":
+            return "docs", self._docs(mi, body, query)
+        if action == "_settings":
+            return "settings", self._settings(mi, body, method)
         return action.lstrip("_"), getattr(self, "_" + action.lstrip("_"))(mi, body)
 
     # -- handlers ---------------------------------------------------------------------------------------------------
@@ -177,8 +192,26 @@ class App:
             raise InvalidRequestBody('body is {"mapping": {...}, "source": {"path": "..."}}', path="mapping")
         return _json(200, self.manager.create(name, spec["mapping"], spec.get("source")))
 
-    def _docs(self, mi, body: bytes) -> Response:
-        return _json(200, mi.add_docs(self._parse(body)))
+    def _docs(self, mi, body: bytes, query: dict) -> Response:
+        out = mi.add_docs(self._parse(body))
+        out.update(mi.after_write(_refresh_param(query), out.get("last_offset")))
+        return _json(200, out)
+
+    def _bulk(self, mi, body, query: dict) -> Response:
+        read = body if callable(body) else io.BytesIO(body).read
+        try:
+            status, out = mi.bulk(bulk_mod.parse_actions(bulk_mod.iter_lines(read)), _refresh_param(query))
+        except bulk_mod.BulkFormatError as exc:
+            raise BadJSON(exc.reason) from None
+        return _json(status, out)
+
+    def _settings(self, mi, body: bytes, method: str) -> Response:
+        if method == "GET":
+            return _json(200, {mi.name: {"settings": {"index": dict(mi.settings)}}})
+        return _json(200, mi.update_settings(self._parse(body)))
+
+    def _refresh(self, mi, body: bytes) -> Response:
+        return _json(200, mi.refresh())
 
     def _reindex(self, mi, body: bytes) -> Response:
         return _json(200, mi.reindex())
@@ -203,6 +236,15 @@ class App:
         return _json(200, mi.rollback(sid))
 
 
+def _refresh_param(query: dict) -> str:
+    v = (query.get("refresh") or "").lower()
+    if v == "" and "refresh" in query:
+        return "true"                       # a bare ?refresh means true, as in OpenSearch
+    if v not in ("", "true", "false", "wait_for"):
+        raise InvalidRequestBody('refresh is "true", "false" or "wait_for"', path="refresh")
+    return v or "false"
+
+
 def create_app(config: ServingConfig | None = None, ports: Ports | None = None) -> App:
     return App(config or ServingConfig.from_env(), ports)
 
@@ -215,7 +257,11 @@ def make_server(app: App, host: str | None = None, port: int | None = None) -> T
 
         def _do(self) -> None:
             n = int(self.headers.get("Content-Length") or 0)
-            if n > app.cfg.max_body_bytes:
+            if self.command == "POST" and self.path.split("?", 1)[0].endswith("/_bulk"):
+                read = bulk_mod.chunked_reader(self.rfile) if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower() \
+                    else bulk_mod.length_reader(self.rfile, n)
+                resp = app.handle(self.command, self.path, read, dict(self.headers))   # streamed, never buffered whole
+            elif n > app.cfg.max_body_bytes:
                 resp = _json(413, {"error": {"type": "invalid_request", "path": "", "reason": "body too large"}})
             else:
                 resp = app.handle(self.command, self.path, self.rfile.read(n) if n else b"", dict(self.headers))

@@ -11,6 +11,7 @@ carries (segment id, epoch), the epoch moving on every swap, patch and delete, s
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import threading
@@ -18,12 +19,28 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import bulk as bulk_mod
 from .cache import LRUCache, request_key
 from .config import ServingConfig
 from .errors import (IndexExists, InvalidRequestBody, NotReady, UnknownIndex, UnknownSegment)
 from .metrics import Metrics
 from .ports import Ports, read_manifest
 from .scheduler import BatchScheduler
+
+log = logging.getLogger("serving")
+INTERVAL_RE = re.compile(r"^(-1|\d+(?:\.\d+)?)(ms|s|m|h)?$")
+DEFAULT_SETTINGS = {"refresh_interval": "1s"}
+
+
+def parse_interval(text) -> float | None:
+    """OpenSearch interval ("1s", "500ms", "2m", "-1") to seconds; None disables the background refresh."""
+    m = INTERVAL_RE.match(str(text).strip())
+    if not m:
+        raise InvalidRequestBody(f"refresh_interval {text!r} is not like 1s, 500ms, 2m or -1", path="index.refresh_interval")
+    if m.group(1) == "-1":
+        return None
+    return float(m.group(1)) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600, None: 1}[m.group(2)]
+
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 VALID_OPS = ("upsert", "patch", "delete")
@@ -40,6 +57,15 @@ class ManagedIndex:
         self.epoch = 0
         self.applied_offset = 0
         self.pending_upserts = 0
+        self.pending_since: int | None = None     # offset of the oldest upsert not yet visible in the live index
+        self.settings = {**DEFAULT_SETTINGS, "refresh_interval": cfg.refresh_interval}
+        self._load_settings()
+        self.refreshed_upto = 0                   # every change up to this offset is visible (for refresh=wait_for)
+        self._refresh_cv = threading.Condition()
+        self._refresh_stop = threading.Event()
+        self._refresh_wake = threading.Event()
+        self._last_refresh_cost = 0.0
+        self._refresher: threading.Thread | None = None
         self.rankers: dict[str, Any] = {}        # re-registered on every new Index, so a swap keeps them
         self._admin = threading.RLock()          # one admin operation at a time
         self._store_lock = threading.RLock()     # the store is one SQLite connection
@@ -54,7 +80,123 @@ class ManagedIndex:
         return self.index is not None
 
     def close(self) -> None:
+        self._refresh_stop.set()
+        self._refresh_wake.set()
+        if self._refresher is not None:
+            self._refresher.join(5)
         self.scheduler.close()
+
+    # -- settings and the background refresh ------------------------------------------------------------------------
+    def _load_settings(self) -> None:
+        p = self.root / "settings.json"
+        if p.exists():
+            try:
+                self.settings.update(json.loads(p.read_text()))
+            except ValueError:
+                pass
+
+    def update_settings(self, body: dict) -> dict:
+        """``{"index": {"refresh_interval": "5s"}}`` (or the flat form). Only refresh_interval is known."""
+        if not isinstance(body, dict):
+            raise InvalidRequestBody("settings body is an object", path="")
+        flat = body.get("index", body)
+        if not isinstance(flat, dict):
+            raise InvalidRequestBody('"index" must be an object', path="index")
+        flat = {k.removeprefix("index."): v for k, v in flat.items()}
+        unknown = sorted(set(flat) - set(DEFAULT_SETTINGS))
+        if unknown:
+            raise InvalidRequestBody(f"unknown setting(s) {unknown}; known: {sorted(DEFAULT_SETTINGS)}",
+                                     path=f"index.{unknown[0]}")
+        if "refresh_interval" in flat:
+            parse_interval(flat["refresh_interval"])
+            self.settings["refresh_interval"] = str(flat["refresh_interval"])
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "settings.json").write_text(json.dumps(self.settings))
+        self._refresh_wake.set()
+        return {"acknowledged": True, "index": dict(self.settings)}
+
+    def start_refresher(self) -> None:
+        if self._refresher is None:
+            self._refresher = threading.Thread(target=self._refresh_loop, name=f"refresh-{self.name}", daemon=True)
+            self._refresher.start()
+
+    def _refresh_loop(self) -> None:
+        """Make pending upserts visible every ``refresh_interval`` (never while there is nothing to show). With the
+        full-rebuild backend a refresh costs seconds, so the gap is also at least 4x the last refresh's cost (at most
+        20% of the time spent rebuilding); a delta refresh from the data plane (``Ports.refresh``) is cheap and keeps the
+        configured interval."""
+        while not self._refresh_stop.is_set():
+            interval = parse_interval(self.settings["refresh_interval"])
+            wait = 1.0 if interval is None else interval
+            if self.ports.refresh is None:
+                wait = max(wait, 4 * self._last_refresh_cost)
+            self._refresh_wake.wait(wait)
+            self._refresh_wake.clear()
+            if self._refresh_stop.is_set():
+                break
+            if interval is not None and self.ready and self.pending_upserts:
+                try:
+                    self.refresh()
+                except Exception:  # noqa: BLE001 - try again next interval
+                    log.exception("background refresh of %s failed", self.name)
+
+    def refresh(self) -> dict:
+        """Make every stored change visible: a delta refresh when the data plane provides one (``Ports.refresh``), else a
+        full rebuild from the store and a swap (the reindex path)."""
+        with self._admin:
+            if not self.ready:
+                raise NotReady(f"index {self.name!r} is not loaded")
+            if not self.pending_upserts:
+                self._mark_refreshed()
+                return {"refreshed": False, "version": self.index.version, "segment_id": self.segment_id}
+            t0 = time.perf_counter()
+            if self.ports.refresh is not None:
+                out = self.ports.refresh(self) or {}
+                self._publish_gauges()
+            else:
+                out = self.reindex()
+            self._last_refresh_cost = time.perf_counter() - t0
+            self.metrics.observe("s3_refresh_ms", self._last_refresh_cost * 1000.0, index=self.name)
+            self._mark_refreshed()
+            return {"refreshed": True, **out}
+
+    def _mark_refreshed(self) -> None:
+        with self._refresh_cv:
+            self.refreshed_upto = max(self.refreshed_upto, self.applied_offset)
+            self._refresh_cv.notify_all()
+
+    def after_write(self, refresh: str, last_offset: int | None) -> dict:
+        """The ``refresh`` query parameter: ``false`` (default) leaves it to the interval, ``true`` refreshes before
+        returning, ``wait_for`` returns once a refresh covers the write (forcing one if the interval is off)."""
+        self._publish_gauges()
+        if last_offset is None or refresh in ("", "false"):
+            return {}
+        if refresh == "true":
+            self.refresh()
+            return {"forced_refresh": True}
+        # wait_for: with the interval off nothing would ever refresh, so force one; else wait for the next scheduled one
+        interval = parse_interval(self.settings["refresh_interval"])
+        if interval is None:
+            self.refresh()
+            return {"forced_refresh": True}
+        self._refresh_wake.set()
+        patience = 3 * interval + 4 * self._last_refresh_cost + 5
+        with self._refresh_cv:
+            if self._refresh_cv.wait_for(lambda: self.refreshed_upto >= last_offset or self.pending_since is None,
+                                         timeout=patience):
+                return {"forced_refresh": False}
+        self.refresh()
+        return {"forced_refresh": True}
+
+    def lag(self) -> int:
+        """Store head minus the highest offset that is entirely visible in the live index."""
+        store = self._get_store()
+        if store is None or not self.ready:
+            return 0
+        with self._store_lock:
+            head = store.head()
+        visible = (self.pending_since - 1) if self.pending_since else max(self.applied_offset, self.index.version)
+        return max(0, head - visible)
 
     def _get_store(self, create: bool = False):
         with self._store_lock:
@@ -70,6 +212,9 @@ class ManagedIndex:
             self.metrics.set("s3_index_version", getattr(self.index, "version", 0), index=self.name)
             self.metrics.set("s3_index_docs", getattr(self.index, "n_docs", 0), index=self.name)
         self.metrics.set("s3_cache_entries", len(self.cache), index=self.name)
+        if self.ready:
+            self.metrics.set("s3_index_pending_upserts", self.pending_upserts, index=self.name)
+            self.metrics.set("s3_index_lag", self.lag(), index=self.name)
 
     # -- segments ---------------------------------------------------------------------------------------------------
     def list_segments(self) -> list[dict]:
@@ -119,6 +264,7 @@ class ManagedIndex:
         self.cache.clear()
         self.metrics.inc("s3_swaps_total", index=self.name, kind=kind)
         self._publish_gauges()
+        self.start_refresher()
 
     def load_existing(self, segment_id: str | None = None) -> str:
         """Load a kept segment (newest when ``segment_id`` is None); used at start and by replicas."""
@@ -252,23 +398,137 @@ class ManagedIndex:
             self._publish_gauges()
             return {"first_offset": first, "last_offset": last, "rejected": rejected, "applied": applied}
 
+    # -- _bulk ------------------------------------------------------------------------------------------------------
+    def bulk_chunk(self, actions: list) -> tuple[list[dict], int | None]:
+        """Plan, apply (one atomic store batch) and replay one chunk of actions. ``(items, last_offset or None)``."""
+        if not self.ready:
+            raise NotReady(f"index {self.name!r} is not loaded")
+        if self.ports.apply_changes is None:
+            raise InvalidRequestBody("no apply_changes port configured", path="")
+        m = self.mapping
+        meta = (m.get("_meta") or {}).get("engine") or {}
+        id_field, hot = meta.get("id_field", "_id"), set(meta.get("hot") or [])
+        with self._admin:
+            with self._store_lock:
+                store = self._get_store()
+                if store is None:
+                    raise InvalidRequestBody("this index has no store to write to", path="")
+                ids = bulk_mod.chunk_ids(actions, id_field)
+                existing = dict(zip(ids, store.get(ids))) if ids else {}
+                plan = bulk_mod.plan_chunk(actions, self.name, hot, id_field, existing)
+                changes = [p.change for p in plan if p.change is not None]
+                report = self.ports.apply_changes(changes, m, store) if changes else None
+                if report is not None and report.accepted:
+                    self._replay(self.index, after=self.applied_offset)
+            if report is not None and report.accepted:
+                self.epoch += 1
+                self.cache.clear()
+        last = report.last_offset if report is not None and report.accepted else None
+        return bulk_mod.finish(plan, report, self.name), last
+
+    def bulk(self, lines, refresh: str = "false") -> tuple[int, dict]:
+        """Stream actions in chunks. Returns ``(http_status, response)``; every action has an item."""
+        t0 = time.perf_counter()
+        items: list[dict] = []
+        last_offset: int | None = None
+        failure: dict | None = None
+        chunk: list = []
+
+        def flush() -> bool:
+            nonlocal last_offset, failure
+            if not chunk:
+                return True
+            try:
+                got, last = self.bulk_chunk(chunk)
+            except Exception as exc:  # noqa: BLE001 - this chunk was not applied; say so per action and stop
+                from .errors import classify
+                status, body = classify(exc)
+                err = {**body["error"], "type": body["error"]["type"]}
+                for a in chunk:
+                    items.append({a.op: {"_index": self.name, "_id": a.meta.get("_id"), "status": status, "error": err}})
+                failure = {"status": status, **body["error"]}
+                chunk.clear()
+                return False
+            items.extend(got)
+            chunk.clear()
+            if last is not None:
+                last_offset = last
+            return True
+
+        fmt: bulk_mod.BulkFormatError | None = None
+        try:
+            for act in lines:
+                chunk.append(act)
+                if len(chunk) >= self.cfg.bulk_chunk and not flush():
+                    break
+        except bulk_mod.BulkFormatError as exc:
+            fmt = exc
+        if failure is None:
+            flush()
+        took = (time.perf_counter() - t0) * 1000.0
+        errors = any("error" in next(iter(i.values())) for i in items)
+        m = self.metrics
+        m.inc("s3_bulk_requests_total", index=self.name, refresh=refresh or "false")
+        for it in items:
+            op, body = next(iter(it.items()))
+            m.inc("s3_bulk_items_total", index=self.name, op=op, outcome="error" if "error" in body else "ok")
+            if "error" in body:
+                m.inc("s3_bulk_rejected_total", index=self.name,
+                      reason=body["error"].get("s3_reason") or body["error"]["type"])
+        m.observe("s3_bulk_ms", took, index=self.name)
+        if took > 0:
+            m.set("s3_bulk_items_per_second", len(items) * 1000.0 / took, index=self.name)
+        out: dict = {"took": int(took), "errors": errors, "items": items}
+        status = 200
+        if fmt is not None:
+            status, out["error"] = 400, {"type": "illegal_argument_exception", "reason": fmt.reason, "line": fmt.line,
+                                         "path": ""}
+            out["errors"] = True
+        elif failure is not None:
+            status, out["error"] = failure["status"], {k: v for k, v in failure.items() if k != "status"}
+            out["errors"] = True
+        if last_offset is not None and failure is None:
+            out.update(self.after_write(refresh, last_offset))
+        else:
+            self._publish_gauges()
+        return status, out
+
     def _replay(self, index: Any, after: int) -> dict:
         """Apply the store's changes after ``after`` to ``index``: patch, delete; upserts wait for a rebuild."""
         store = self._get_store()
         patched = deleted = pending = 0
+        first_pending: int | None = None
         last = after
         runs: dict[str, dict[str, Any]] = {}
+
+        def tolerant(fn, ids: list, *rest) -> None:
+            """Ids that are pending upserts are not in the segment yet (the engine raises NoSuchKey): they get their
+            patch or delete from the store at the next refresh, so skip them one by one."""
+            try:
+                fn(ids, *rest)
+            except Exception as exc:  # noqa: BLE001
+                if not any(c.__name__ in ("NoSuchKey", "KeyError") for c in type(exc).__mro__):
+                    raise
+                for i, _id in enumerate(ids):
+                    try:
+                        fn([_id], *[[r[i]] for r in rest])
+                    except Exception as exc2:  # noqa: BLE001
+                        if not any(c.__name__ in ("NoSuchKey", "KeyError") for c in type(exc2).__mro__):
+                            raise
 
         def flush() -> None:
             nonlocal patched
             for fld, kv in runs.items():
-                index.patch(fld, list(kv.keys()), list(kv.values()))
+                tolerant(lambda ids, vals, f=fld: index.patch(f, ids, vals), list(kv.keys()), list(kv.values()))
                 patched += len(kv)
                 self.metrics.inc("s3_patches_total", len(kv))
             runs.clear()
 
         while True:
-            batch = store.changes(last, 10_000)
+            try:
+                batch = store.changes(last, 10_000, docs=False)
+            except TypeError:
+                batch = store.changes(last, 10_000)
             if not batch:
                 break
             for ch in batch:
@@ -278,16 +538,24 @@ class ManagedIndex:
                         runs.setdefault(fld, {})[ch["_id"]] = val
                 elif ch["op"] == "delete":
                     flush()
-                    index.delete([ch["_id"]])
+                    tolerant(index.delete, [ch["_id"]])
                     deleted += 1
                 else:
                     pending += 1
+                    if first_pending is None:
+                        first_pending = ch["offset"]
         flush()
         if last != after and hasattr(index, "set_version"):
             index.set_version(last)
         self.applied_offset = last
         # on the live index upserts accumulate; a freshly loaded index starts from those after its own segment
         self.pending_upserts = self.pending_upserts + pending if index is self.index else pending
+        if index is self.index:
+            self.pending_since = self.pending_since or first_pending
+        else:
+            self.pending_since = first_pending
+        if not self.pending_upserts:
+            self.pending_since = None
         return {"patched": patched, "deleted": deleted, "pending_upserts": self.pending_upserts}
 
     # -- search -----------------------------------------------------------------------------------------------------
