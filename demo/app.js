@@ -328,8 +328,9 @@ function resetAndSearch() { state.page = 1; state.pendingAfter = null; search();
 
 // ---------------------------------------------------------------- autocomplete ----------------------------------
 const sug = { items: [], active: -1 };
+let sTimer;
 
-function closeSuggest() { sseq++; sug.items = []; sug.active = -1; $("suggest").hidden = true; $("suggest").replaceChildren(); $("q").setAttribute("aria-expanded", "false"); }
+function closeSuggest() { clearTimeout(sTimer); sseq++; sug.items = []; sug.active = -1; $("suggest").hidden = true; $("suggest").replaceChildren(); $("q").setAttribute("aria-expanded", "false"); }
 
 function pick(title) { $("q").value = title; closeSuggest(); state.q = title; resetAndSearch(); }
 
@@ -362,7 +363,7 @@ async function runSuggest(text, t0) {
     li.append(highlighted(((h.highlight || {})[TITLE] || [])[0] || title));
     const idx = sug.items.length - 1;
     li.addEventListener("mousedown", (e) => { e.preventDefault(); pick(title); });
-    li.addEventListener("mouseenter", () => setActive(idx));
+    li.addEventListener("mousemove", () => { if (sug.active !== idx) setActive(idx); }); // not mouseenter: a list appearing under a resting pointer must not take Enter
     list.append(li);
   }
   sug.active = -1;
@@ -373,7 +374,6 @@ async function runSuggest(text, t0) {
   window.__suggest = { rtt: suggestRtt, keystroke: suggestKey, p95: p95(suggestKey), shown: sug.items.length, text };
 }
 
-let sTimer;
 $("q").addEventListener("input", () => {
   const t0 = performance.now(), v = $("q").value.trim();
   clearTimeout(sTimer);
@@ -387,7 +387,7 @@ $("q").addEventListener("keydown", (e) => {
   else if (e.key === "Escape") closeSuggest();
   else if (e.key === "Enter" && sug.active >= 0) { e.preventDefault(); pick(sug.items[sug.active]); }
 });
-$("q").addEventListener("blur", () => setTimeout(closeSuggest, 120));
+$("q").addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== $("q")) closeSuggest(); }, 120)); // refocused since: keep it
 
 // ---------------------------------------------------------------- controls --------------------------------------
 $("search-form").addEventListener("submit", (e) => { e.preventDefault(); clearTimeout(sTimer); closeSuggest(); state.q = $("q").value; resetAndSearch(); });
