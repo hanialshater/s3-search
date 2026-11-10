@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..analysis import analyze
+from ..analysis import analyze, analyze_with_positions
 from ..dsl import ast as A
 from ..dsl.parse import parse, resolve_msm
 from ..errors import InvalidRequest, UnsupportedQuery
-from .nodes import Bool, Dense, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+from .nodes import Bool, Dense, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
 
 
 class Planner:
@@ -71,6 +71,19 @@ class Planner:
         if kind == "numeric":
             return Term(q.field, (self._numeric_value(q.field, q.query, q.path),), q.boost, q.path)
         return self._lexical(str(q.query), {q.field: 1.0}, q.operator, q.msm, q.boost, q.path)
+
+    def n_QMatchPhrase(self, q):
+        kind = self._field(q.field, q.path, ("text", "keyword", "numeric"))
+        if kind == "keyword":                  # OpenSearch: a phrase on a keyword field is a term
+            return Term(q.field, (str(q.query),), q.boost, q.path)
+        if kind == "numeric":
+            return Term(q.field, (self._numeric_value(q.field, q.query, q.path),), q.boost, q.path)
+        if not self.s.has_positions:
+            raise UnsupportedQuery(q.path, "this index was built without positions (_meta.engine.positions: false)")
+        toks, pos = analyze_with_positions(str(q.query))
+        slots = tuple((t,) for t in toks)
+        offsets = tuple(p - pos[0] for p in pos) if pos else ()
+        return Phrase(q.field, slots, offsets, q.slop, q.boost, q.path)
 
     def n_QMultiMatch(self, q):
         if q.fields is None:

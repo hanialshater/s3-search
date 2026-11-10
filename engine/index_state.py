@@ -90,6 +90,8 @@ class IndexState:
         self.live = b.unpack_bits(np.asarray(live), N)
         self._static = None
         self._value_codes: dict = {}
+        self.host_pos_ptr, self.host_positions = t.pos_ptr, t.positions
+        self._positions = None
 
     # ---- the updater's hooks
     def patch(self, field: str, ids, values) -> None:
@@ -107,6 +109,18 @@ class IndexState:
         self.numerics[field][r] = self.b.asarray(filled)
         self.missing[field][r] = self.b.asarray(miss)
         self._value_codes.pop(field, None)          # refreshed on next use, for this field only
+
+    @property
+    def has_positions(self) -> bool:
+        return self.host_positions is not None
+
+    def positions(self):
+        """``(pos_ptr int64[P+1], positions int32[T])`` on the device, moved there on first use (a phrase)."""
+        if self._positions is None:
+            b = self.b
+            self._positions = (b.asarray(np.asarray(self.host_pos_ptr), "int64"),
+                               b.asarray(np.asarray(self.host_positions).astype(np.int32), "int32"))
+        return self._positions
 
     def value_codes(self, field: str):
         """For a numeric field: ``(codes int64[N] on the device, 0 = missing; keys list)``, codes in ascending value

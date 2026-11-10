@@ -16,6 +16,16 @@ class Lexical:
 
 
 @dataclass(frozen=True)
+class Phrase:
+    field: str
+    slots: tuple             # per slot, its alternative analysed terms (one term, or a synonym set)
+    offsets: tuple           # each slot's position in the query (stopwords leave gaps)
+    slop: int = 0
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
 class Dense:
     field: str
     vector: tuple | None
@@ -70,7 +80,7 @@ class Hybrid:
     path: str = "query"
 
 
-Node = Union[Lexical, Dense, Term, Range, MatchAll, Bool, Hybrid]
+Node = Union[Lexical, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
 
 
 @dataclass(frozen=True)
