@@ -12,14 +12,15 @@ import math
 import re
 
 from ..errors import InvalidRequest, UnsupportedQuery
-from .ast import (Agg, Fuzzy, QBool, QExists, QIds, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
+from .ast import (Agg, Fuzzy, Highlight, QFunctionScore, QBool, QExists, QIds, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
 
 MAX_WINDOW = 10_000
 TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_after", "explain", "_source",
-            "post_filter", "collapse",
+            "post_filter", "collapse", "highlight",
             "track_total_hits", "rank", "rescore"}
 QUERY_TYPES = ("match", "multi_match", "bool", "term", "terms", "range", "knn", "match_all", "hybrid", "neural",
-               "match_phrase", "fuzzy", "prefix", "match_bool_prefix", "exists", "ids")
+               "match_phrase", "fuzzy", "prefix", "match_bool_prefix", "exists", "ids",
+               "function_score")
 MULTI_MATCH_TYPES = ("best_fields", "most_fields", "cross_fields")
 
 
@@ -149,8 +150,54 @@ class Parser:
             if not isinstance(req["collapse"].get("field"), str):
                 raise InvalidRequest("collapse.field", "required: a field name")
             collapse = req["collapse"]["field"]
+        hl = self.highlight(req["highlight"]) if "highlight" in req else None
         return Request(query=query, aggs=aggs, sort=sort, from_=from_, size=size, search_after=after,
-                       explain=explain, rrf=rrf, rescore=rescore, post_filter=post, collapse=collapse)
+                       explain=explain, rrf=rrf, rescore=rescore, post_filter=post, collapse=collapse, highlight=hl)
+
+    HL_KEYS = {"fragment_size", "number_of_fragments", "pre_tags", "post_tags", "type"}
+
+    def highlight(self, body):
+        _keys(body, {"fields", "require_field_match"} | self.HL_KEYS, "highlight")
+        top = self._hl_opts(body, "highlight", (100, 5, "<em>", "</em>"))
+        fields = body.get("fields")
+        if isinstance(fields, list):
+            items = []
+            for i, x in enumerate(fields):
+                if not isinstance(x, dict) or len(x) != 1:
+                    raise InvalidRequest(f"highlight.fields[{i}]", "an object with one field")
+                items += list(x.items())
+        elif isinstance(fields, dict):
+            items = list(fields.items())
+        else:
+            raise InvalidRequest("highlight.fields", "required: an object of fields")
+        out = []
+        for f, spec in items:
+            p = f"highlight.fields.{f}"
+            if "*" in f:
+                raise UnsupportedQuery(p, "wildcard field names are not supported")
+            spec = spec or {}
+            _keys(spec, self.HL_KEYS, p)
+            out.append((f,) + self._hl_opts(spec, p, top))
+        rfm = body.get("require_field_match", True)
+        if not isinstance(rfm, bool):
+            raise InvalidRequest("highlight.require_field_match", "a bool")
+        return Highlight(tuple(out), rfm)
+
+    def _hl_opts(self, spec, p, default):
+        if spec.get("type", "plain") != "plain":
+            raise UnsupportedQuery(f"{p}.type", "only the plain highlighter")
+        size = _int(spec.get("fragment_size", default[0]), f"{p}.fragment_size")
+        n = _int(spec.get("number_of_fragments", default[1]), f"{p}.number_of_fragments")
+        tags = []
+        for k, d in (("pre_tags", default[2]), ("post_tags", default[3])):
+            v = spec.get(k)
+            if v is None:
+                tags.append(d)
+            elif isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+                tags.append(v[0])
+            else:
+                raise InvalidRequest(f"{p}.{k}", "a non-empty list of strings")
+        return (size, n, tags[0], tags[1])
 
     # ---- queries
     def query(self, q, path):
@@ -174,6 +221,54 @@ class Parser:
             raise InvalidRequest(f"{path}.values", "a list of ids")
         return QIds(tuple(str(_scalar(v, f"{path}.values[{i}]")) for i, v in enumerate(vals)),
                     _num(body.get("boost", 1.0), f"{path}.boost"), path)
+
+    SCORE_MODES = ("multiply", "sum", "avg", "first", "max", "min")
+    BOOST_MODES = ("multiply", "replace", "sum", "avg", "max", "min")
+    MODIFIERS = ("none", "log", "log1p", "log2p", "ln", "ln1p", "ln2p", "square", "sqrt", "reciprocal")
+
+    def _function(self, f, p):
+        _keys(f, {"filter", "field_value_factor", "weight"}, p)
+        if "field_value_factor" not in f and "weight" not in f:
+            raise InvalidRequest(p, "a function needs field_value_factor or weight")
+        flt = self.query(f["filter"], f"{p}.filter") if "filter" in f else None
+        fvf = None
+        if "field_value_factor" in f:
+            v = f["field_value_factor"]
+            q = f"{p}.field_value_factor"
+            _keys(v, {"field", "factor", "modifier", "missing"}, q)
+            if not isinstance(v.get("field"), str):
+                raise InvalidRequest(f"{q}.field", "required: a field name")
+            mod = v.get("modifier", "none")
+            if mod not in self.MODIFIERS:
+                raise InvalidRequest(f"{q}.modifier", " | ".join(self.MODIFIERS))
+            fvf = (v["field"], _num(v.get("factor", 1.0), f"{q}.factor"), mod,
+                   None if v.get("missing") is None else _num(v["missing"], f"{q}.missing"))
+        w = None if "weight" not in f else _num(f["weight"], f"{p}.weight")
+        return (flt, fvf, w)
+
+    def q_function_score(self, body, path):
+        fn_keys = {"field_value_factor", "weight"}
+        _keys(body, {"query", "functions", "score_mode", "boost_mode", "max_boost", "min_score", "boost"} | fn_keys,
+              path)
+        query = self.query(body["query"], f"{path}.query") if "query" in body else QMatchAll(path=f"{path}.query")
+        if "functions" in body:
+            if fn_keys & set(body):
+                raise InvalidRequest(path, "give functions, or one function at the top level, not both")
+            fl = body["functions"]
+            if not isinstance(fl, list):
+                raise InvalidRequest(f"{path}.functions", "a list of functions")
+            functions = tuple(self._function(f, f"{path}.functions[{i}]") for i, f in enumerate(fl))
+        else:
+            top = {k: body[k] for k in fn_keys if k in body}
+            functions = (self._function(top, path),) if top else ()
+        sm, bm = body.get("score_mode", "multiply"), body.get("boost_mode", "multiply")
+        if sm not in self.SCORE_MODES:
+            raise InvalidRequest(f"{path}.score_mode", " | ".join(self.SCORE_MODES))
+        if bm not in self.BOOST_MODES:
+            raise InvalidRequest(f"{path}.boost_mode", " | ".join(self.BOOST_MODES))
+        mb = None if body.get("max_boost") is None else _num(body["max_boost"], f"{path}.max_boost")
+        ms = None if body.get("min_score") is None else _num(body["min_score"], f"{path}.min_score")
+        return QFunctionScore(query, functions, sm, bm, mb, ms, _num(body.get("boost", 1.0), f"{path}.boost"), path)
 
     def q_match_all(self, body, path):
         _keys(body, {"boost"}, path)

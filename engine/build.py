@@ -163,6 +163,11 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
     first_offset = (catalogue[FIRST_OFFSET_COLUMN].to_numpy(np.int64) if FIRST_OFFSET_COLUMN in catalogue.columns
                     else np.arange(N, dtype=np.int64))
     text = build_text(catalogue, m.text, positions=m.positions)
+    source = {}
+    if m.source:                                          # raw text for highlight (S7-5), host only
+        for f in m.text:
+            col = catalogue[f].tolist() if f in catalogue.columns else [None] * len(catalogue)
+            source[f] = np.array([None if _is_missing(v) else str(v) for v in col], dtype=object)
     seg = SegmentArrays(manifest={}, ids=ids, first_offset=first_offset, text=text,
                         live=pack_bits(np.ones(N, bool)))
     for f, spec in m.keyword.items():
@@ -203,6 +208,7 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
                             "encoder": f in seg.encoders}
     raw = json.dumps(m.raw, sort_keys=True, default=str)
     ident = hashlib.sha256((raw + "\x00".join(ids[:1000]) + f"|{N}|{version}|{len(text.vocab)}").encode())
+    seg.source = source
     seg.manifest = {
         "version": int(version), "segment_id": f"seg-{int(version)}-{ident.hexdigest()[:8]}",
         "created": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "analyzer": ANALYZER_VERSION,
@@ -319,6 +325,13 @@ def merge_segments(segs: list[SegmentArrays], mapping: dict | None = None, versi
     for s in segs:
         for f, e in s.encoders.items():
             out.encoders.setdefault(f, e)
+    if all(s.source for s in segs):
+        for f in first.source:
+            col = np.empty(N, dtype=object)
+            for k, s in enumerate(segs):
+                sel = np.flatnonzero(si == k)
+                col[sel] = np.asarray(s.source[f], dtype=object)[li[sel]]
+            out.source[f] = col
     if mapping is not None:
         out.manifest["mapping"] = mapping
     out.manifest["version"] = int(version if version is not None else max(int(s.manifest.get("version", 0))
@@ -326,4 +339,5 @@ def merge_segments(segs: list[SegmentArrays], mapping: dict | None = None, versi
     out.manifest.pop("segment_id", None)
     out.manifest.pop("files", None)
     out.manifest.pop("checksum", None)
+    out.manifest.pop("source_fields", None)
     return out

@@ -14,7 +14,7 @@ from ..analysis import analyze, analyze_with_positions
 from ..dsl import ast as A
 from ..dsl.parse import parse, resolve_msm
 from ..errors import InvalidRequest, UnsupportedQuery
-from .nodes import Bool, Dense, Exists, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+from .nodes import Bool, Dense, Exists, FunctionScore, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
 
 
 class Planner:
@@ -54,8 +54,14 @@ class Planner:
             if rescore is not None:
                 raise InvalidRequest("collapse", "collapse cannot be combined with rescore (as OpenSearch)")
             collapse = r.collapse
+        hl = r.highlight
+        if hl is not None:
+            for f, *_ in hl.fields:
+                self._field(f, f"highlight.fields.{f}", ("text",))
+            if not all(p.seg.source for p in self.s.parts):
+                raise UnsupportedQuery("highlight", "this index keeps no source text (_meta.engine.source: false)")
         return Plan(root=root, aggs=aggs, sort=sort, from_=r.from_, size=r.size, search_after=r.search_after,
-                    rescore=rescore, explain=r.explain, post_filter=post, collapse=collapse)
+                    rescore=rescore, explain=r.explain, post_filter=post, collapse=collapse, highlight=hl)
 
     # ---- queries
     def node(self, q):
@@ -131,6 +137,17 @@ class Planner:
         n = len(groups)
         need = n if q.operator == "and" else max(1, resolve_msm(q.msm, n))
         return LexicalGroups(((q.field, 1.0),), groups, ("sum",) * (n - 1) + ("const",), min(need, n), "field",
+                             q.boost, q.path)
+
+    def n_QFunctionScore(self, q):
+        fns = []
+        for i, (flt, fvf, w) in enumerate(q.functions):
+            if fvf is not None:
+                p = f"{q.path}.functions[{i}].field_value_factor.field" if len(q.functions) > 1 or flt is not None \
+                    else f"{q.path}.field_value_factor.field"
+                self._field(fvf[0], p, ("numeric",))
+            fns.append((self.node(flt) if flt is not None else None, fvf, w))
+        return FunctionScore(self.node(q.query), tuple(fns), q.score_mode, q.boost_mode, q.max_boost, q.min_score,
                              q.boost, q.path)
 
     def n_QExists(self, q):
