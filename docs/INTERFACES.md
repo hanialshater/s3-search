@@ -319,14 +319,33 @@ Layout (`seg-<version>-<8 hex>/`):
 ```
 
 - **Version** = the store offset the segment includes up to; an `Index` built straight from a catalogue has version 0.
-- **Statistics** (`df`, `avg_len`, `N`) include deleted documents until the next build, as Lucene does until a merge.
-  The idf is `log(1 + (N - df + 0.5) / (df + 0.5))`, computed at load.
+- **Statistics** (`df`, `avg_len`, `N`) are stored per segment as built; the index's statistics are global over live
+  documents (S8, below). The idf is `log(1 + (N - df + 0.5) / (df + 0.5))`.
 - **`device_nbytes`** = bytes of every array the engine moves to the device (all of the above but the string tables)
   plus derived arrays (idf). `work_nbytes` (per batch) is `Q * N * 4 * 2` for the lexical score buffer and match counts
   at the configured batch size.
 - **Checksum:** `read_segment(verify=True)` recomputes each file's sha256 and the manifest checksum; any mismatch
   raises `engine.segment.CorruptSegment`.
-- v1 is **one segment per index**; multi-segment indexes are a later `format_version` (additive).
+- v1 was **one segment per index**. S8 makes an index an ordered list of v1 segments (the format of each is unchanged);
+  see "Multi-segment indexes (S8)" below.
+
+**Multi-segment indexes (S8; ruling on S8-1, `docs/proposals/2026-11-10-s8-1-multi-segment.md`).**
+- An index is an ordered list of segments, with a commit point `commit-<version>.json` (`{"format": "s3commit",
+  "format_version": 1, "version", "segments": [...], "deletes": {segment_id: "del-<version>-<segment_id>.npy"},
+  "checksum"}`); a delete file is a uint32 live bitmap. Each `_id` is live in at most one segment.
+- **Statistics are global and over live documents only** (this replaces "statistics include deleted documents until
+  the next build", also for one segment): N = live docs; `df` and `df_field` summed over segments minus the deleted
+  docs' terms; `avg_len_f` = int64 sum of live `field_len_f` / N in float64, then float32; idf in float64 then float32.
+  Recomputed on add, replace and delete, never per query. Term ids are global and append-only; keyword values have a
+  global dictionary per field (facet keys are strings, sorts use the global rank). One encoder per vector field.
+- **Doc order is `first_offset` order**: the engine places docs in append-only slots ordered by `first_offset` (an
+  edit keeps its slot), so ties break by `first_offset` ascending across segments, and a rebuild has the same order.
+- API (additive): `Index.from_segments(paths, device)`, `Index.from_commit(path, device)`,
+  `Index.add_segment(seg | path, version, delete_ids=())` (atomic; unknown delete ids ignored),
+  `Index.replace_segments(old_ids, new | None, version=None, delete_ids=())`, `Index.remove_segment(segment_id)`,
+  `Index.snapshot_segments(segment_ids) -> (segments, version)` (references to immutable arrays, copies of live bits
+  and hot columns), `Index.segments` (`[{segment_id, version, n_docs, live, device_nbytes}]`),
+  `Index.save_commit(dir) -> Path`, `engine.build.merge_segments(segs, mapping) -> SegmentArrays`.
 
 The engine side (`engine/api.py`):
 
@@ -453,7 +472,8 @@ Scoring, exactly:
 
 - `hits.total` is an int (exact). `_score` is a float; for a non-score sort it is still the query score.
 - `sort` is on every hit: the values of the sort keys, then the internal doc id as the last element (the tie-breaker
-  that makes `search_after` exact). Clients pass it back verbatim. A missing field value sorts as `None`. Under
+  that makes `search_after` exact). Clients pass it back verbatim. From S8 the last element is the doc's
+  `first_offset` (the global tie key; for an index built from a catalogue it is 0..N-1, the doc id, as before). A missing field value sorts as `None`. Under
   `rescore`, the first value is the tier (1 inside the rescored window, 0 below it), so the window comes first.
 - `aggregations` is present only when requested. `took_ms` always has `total`, plus each stage that ran; stage names
   are the closed set above plus `encode` (additive).
@@ -740,3 +760,9 @@ status:
   `engine._blas.limit_to_affinity()` sets OpenBLAS's threads to the CPU affinity mask (it ran 4 threads on 2 cores).
   On 2 cores, same machine: build_segment of ESCI-sample with positions 12.3-12.8 s before, 9.5-9.8 s after (bench
   build); the encoder's fit + encode 47-77 s before, 7.3-8.2 s after.
+- 2026-11-10, architect (ruling on S8-1, the dataplane-engineer's multi-segment proposal): accepted with amendments
+  (`docs/proposals/2026-11-10-s8-1-multi-segment.md`, Ruling). Section 4: an index is an ordered list of v1 segments
+  with commit points; statistics are global over live docs (replacing "deleted docs count until the next build");
+  doc order is `first_offset` order by append-only slots; the multi-segment API. Section 5: `sort`'s last element is
+  `first_offset` (unchanged for catalogue-built indexes). Why: S8's fast writes need deltas whose results equal a
+  rebuild's.
