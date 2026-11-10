@@ -46,10 +46,10 @@ SCOPE = [
     ("agg terms sub-aggregation", "S7-4", True, "aggs",
      {"size": 0, "aggs": {"c": {"terms": {"field": "category"}, "aggs": {"p": {"avg": {"field": "price"}}}}}}),
     # S7-5: highlight (plain, text fields), function_score with field_value_factor and weight
-    ("highlight text", "S7-5", False, "highlight", {"query": Q, "highlight": {"fields": {"product_title": {}}}}),
-    ("function_score field_value_factor", "S7-5", False, "function_score",
+    ("highlight text", "S7-5", True, "highlight", {"query": Q, "highlight": {"fields": {"product_title": {}}}}),
+    ("function_score field_value_factor", "S7-5", True, "function_score",
      {"query": {"function_score": {"query": Q, "field_value_factor": {"field": "stock", "missing": 1}}}}),
-    ("function_score weight", "S7-5", False, "function_score",
+    ("function_score weight", "S7-5", True, "function_score",
      {"query": {"function_score": {"query": Q, "functions": [{"filter": {"term": {"category": "lamp"}},
                                                                "weight": 2}]}}}),
     # Outside S7: refused for good

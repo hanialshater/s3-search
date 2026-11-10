@@ -111,8 +111,39 @@ def _avg_of_price(r):
     return r
 
 
+class _BadHighlight:
+    """Planted: tags one more word that is not a query term, or drops the last fragment of each field."""
+
+    def __init__(self, inner, mode):
+        self.inner, self.mode = inner, mode
+
+    def search(self, r):
+        out = self.inner.search(r)
+        for h in out["hits"]["hits"]:
+            for f, frags in (h.get("highlight") or {}).items():
+                if self.mode == "extra" and frags:
+                    import re
+                    words = [w for w in re.findall(r"(?<![<>/\w])([A-Za-z]{4,})(?![^<]*</em>)", frags[0])]
+                    if words:
+                        frags[0] = frags[0].replace(words[0], f"<em>{words[0]}</em>", 1)
+                elif self.mode == "drop" and frags:
+                    h["highlight"][f] = []
+        return out
+
+
+def _boost_mode_ignored(r):
+    q = r.get("query", {})
+    if "function_score" in q:
+        return {**r, "query": {"function_score": {k: v for k, v in q["function_score"].items()
+                                                  if k not in ("boost_mode", "min_score")}}}
+    return r
+
+
 def test_correctness_checks_catch_planted_errors(index, ds):
     from referee import s7_checks
+    assert s7_checks.check_s7_5(_BadHighlight(index, "extra"), ds), "a highlighted non-query word must be caught"
+    assert s7_checks.check_s7_5(_BadHighlight(index, "drop"), ds), "a missing highlight must be caught"
+    assert s7_checks.check_s7_5(_Rewrites(index, _boost_mode_ignored), ds), "an ignored boost_mode must be caught"
     assert s7_checks.check_s7_4(_DropsEmptyBuckets(index), ds), "a histogram without its empty buckets must be caught"
     assert s7_checks.check_s7_4(_Rewrites(index, _avg_of_price), ds), "an avg over the wrong field must be caught"
     assert s7_checks.check_s7_3(_Rewrites(index, _post_filter_into_query), ds), "facets after post_filter must be caught"
