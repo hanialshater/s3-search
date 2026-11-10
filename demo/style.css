@@ -33,3 +33,17 @@ details pre { overflow: auto; background: var(--card); padding: 8px; font-size: 
 #pager { display: flex; gap: 12px; align-items: center; margin: 16px 0 4px; }
 .mut { color: var(--mut); font-size: .85em; }
 #error { background: var(--err-bg); color: var(--err); padding: 8px 12px; border-radius: 6px; }
+
+.search-wrap { position: relative; flex: 1; min-width: 0; }
+.search-wrap #q { width: 100%; }
+#suggest { position: absolute; z-index: 5; left: 0; right: 0; top: 100%; margin: 2px 0 0; padding: 4px 0; list-style: none;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 14px rgba(0, 0, 0, .15); }
+#suggest li { padding: 5px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#suggest li.active { background: var(--card); }
+mark { background: color-mix(in srgb, var(--acc) 25%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
+.bar-row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+.bar-row #summary { flex: 1 1 auto; margin: 0 0 8px; }
+.bar-row select { font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; }
+.chip { margin: 2px 4px 2px 0; padding: 2px 8px; font-size: .85em; }
+.histogram { display: flex; align-items: flex-end; gap: 2px; height: 56px; margin-top: 8px; }
+.histogram .bar { flex: 1; height: var(--h); min-height: 2px; padding: 0; border: 0; border-radius: 2px 2px 0 0; background: var(--acc); }

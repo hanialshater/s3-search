@@ -1,14 +1,22 @@
 # demo/
 
-owner: tools-engineer · S5-4. A single static page (`index.html`, `app.js`, `style.css`) over the serving HTTP API:
-`POST /indexes/{name}/_search` with a `multi_match`, `bool.filter` (terms on `category` and `product_brand.keyword`,
-a `range` on `price`) and terms `aggs` as the facets. Pagination: "Next" sends `search_after` (the last hit's `sort`,
-verbatim), "Previous" sends `from`/`size`. The explain toggle sends `explain: true`. The page shows the server's
-`took_ms.total`, the browser round trip and the page-1 p95 (the S5 prediction's number).
+owner: tools-engineer · S5-4, S7-8. A single static page (`index.html`, `app.js`, `style.css`) over the serving HTTP
+API. It assumes no fields: `GET /indexes/{name}/_mapping` (`s3_fields`) says which are searchable, facetable and
+sortable, and the page renders only those.
 
-Run it locally: `python -m tools.demo --api http://127.0.0.1:8080` then open `http://127.0.0.1:8000/?index=esci-sample`
-(`--fake` runs it on a fake engine). **Local only.** It deploys only with the founder's approval of that deploy, and
-no commit here carries `[deploy]`.
+- **Autocomplete:** `match_bool_prefix` on the title, 40 ms debounce, six suggestions with highlights, arrow keys and
+  Enter. Metrics in `window.__suggest` (fetch round trip and keystroke-to-rendered-list).
+- **Highlights:** `highlight` on the title with tags that cannot occur in text; the page builds `<mark>` nodes itself, and
+  nothing from the API is ever set as HTML.
+- **Multi-select facets:** keyword facets as checkboxes; selections go in `post_filter`, so counts ignore them. Where
+  one facet is selected and another is not, the page asks again (`_msearch`, aggregations only) so each facet's counts
+  ignore only its own selection.
+- **Numeric fields** (when the mapping has them): min/max inputs, a `range` facet, a `histogram`, and a sort control
+  (relevance, low to high, high to low). ESCI-sample as served has none, and the page then shows none.
+- **Collapse by brand** (`collapse` on `product_brand.keyword`; pages by from/size, as `search_after` is refused).
+- **Pagination:** Next sends `search_after` (the last hit's `sort`, verbatim), Previous sends `from`/`size`. Explain
+  toggle sends `explain: true`. The page shows server and browser times and the page-1 p95.
 
-Known limits: facet counts follow the filters (no post-filter facets); it needs `_source` on hits for titles (§7 says
-serving adds it) and falls back to the id; the mapping's field names are the §2 example's.
+Run it locally: `python -m tools.demo --api http://127.0.0.1:8080` then open `http://127.0.0.1:8000/?index=esci-sample`,
+or `python -m tools.demo --real [--fields]` to start a real replica over ESCI-sample first. **Local only.** It deploys
+only with the founder's approval of that deploy, and no commit here carries `[deploy]`.
