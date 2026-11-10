@@ -100,6 +100,7 @@ is searchable only after a full rebuild. Predictions are in the lab's `company/m
 | S8-2 | Engine: search over base plus deltas with statistics equal to a rebuild's; `Index.add_segment`, `remove_segment` | architect | in review | architect, 2026-11-10 |
 | S8-3 | Build speed: back under 10 s on ESCI-sample with positions | architect | in review | architect, 2026-11-10 (c98b038) |
 | S8-2b | Incremental `add_segment` / `replace_segments`: no full `_relayout` per refresh; heavy work outside the `Index` lock (found by the dataplane-engineer's 2-core stream: add_segment 417-538 ms, query p99 +442%, visibility p99 2.0 s) | architect | open | |
+| S8-2c | Searches never wait on writes: build each new `IndexState` outside the `Index` lock and swap the reference under it; searches read a snapshot (found by the dataplane-engineer's re-run after S8-2b: query p99 4-6x idle under writes, from lock waits in add_segment and replace_segments) | architect | open | |
 | S8-4 | Data plane: delta segments from the change log every refresh interval, a tiered merge policy, the updater swapping deltas in and merges out | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
 | S8-5 | Intake speed: at least 20,000 docs/s lexical, the encoder fit under 10 s | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
 | S8-6 | `POST _bulk` (NDJSON), refresh interval and index-lag metrics | platform-engineer | in review | platform-engineer 2026-11-10 |
