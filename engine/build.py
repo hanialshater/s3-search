@@ -211,3 +211,119 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
         "vector_fields": vector_fields, "hot": list(m.hot), "bm25": {"k1": m.k1, "b": m.b},
     }
     return seg
+
+
+def merge_segments(segs: list[SegmentArrays], mapping: dict | None = None, version: int | None = None) -> SegmentArrays:
+    """One segment of the live docs of ``segs`` (each with its current live bits and hot columns, e.g. from
+    ``Index.snapshot_segments``), ordered by ``first_offset``: the postings, positions and vectors are merged as
+    arrays (no re-analysis, so no source text is needed). ``version``: the merged segment's (default: the inputs'
+    largest). Its statistics are its own; an index recomputes global ones."""
+    from .backend.numpy_backend import NumpyBackend
+    nb = NumpyBackend()
+    if not segs:
+        raise ValueError("merge_segments needs at least one segment")
+    first = segs[0]
+    lives = [nb.unpack_bits(np.asarray(s.live if s.live is not None else nb.pack_bits(np.ones(s.n_docs, bool))),
+                            s.n_docs) for s in segs]
+    si = np.concatenate([np.full(int(l.sum()), k, np.int64) for k, l in enumerate(lives)])
+    li = np.concatenate([np.flatnonzero(l) for l in lives]).astype(np.int64)
+    fo = np.concatenate([np.asarray(s.first_offset, np.int64)[np.flatnonzero(l)] for s, l in zip(segs, lives)])
+    order = np.lexsort((li, si, fo))
+    si, li, fo = si[order], li[order], fo[order]
+    N = len(si)
+    ids = np.array([segs[k].ids[i] for k, i in zip(si.tolist(), li.tolist())], dtype=object)
+    if len(set(ids.tolist())) != N:
+        raise ValueError("merge_segments: an _id is live in two inputs")
+    new_of = []
+    for k, s in enumerate(segs):
+        m = np.full(s.n_docs, -1, np.int64)
+        sel = np.flatnonzero(si == k)
+        m[li[sel]] = sel
+        new_of.append(m)
+    F = len(first.text.fields)
+    vocab = sorted(set().union(*(s.text.vocab for s in segs)))
+    gid_of = {w: i for i, w in enumerate(vocab)}
+    V = len(vocab)
+    keys, tfs, pos_starts, pos_counts, pos_all = [], [], [], [], []
+    with_pos = all(s.text.positions is not None for s in segs)
+    pos_base = 0
+    for k, s in enumerate(segs):
+        t = s.text
+        gid = np.fromiter((gid_of[w] for w in t.vocab), np.int64, len(t.vocab))
+        term = np.repeat(np.arange(len(t.vocab), dtype=np.int64), np.diff(np.asarray(t.term_ptr)))
+        doc = new_of[k][np.asarray(t.doc_ids, np.int64)]
+        keep = doc >= 0
+        keys.append(gid[term[keep]] * max(N, 1) + doc[keep])
+        tfs.append(np.asarray(t.tf)[keep])
+        if with_pos:
+            pp = np.asarray(t.pos_ptr, np.int64)
+            pos_starts.append(pp[:-1][keep] + pos_base)
+            pos_counts.append(np.diff(pp)[keep])
+            pos_all.append(np.asarray(t.positions))
+            pos_base += len(t.positions)
+    key = np.concatenate(keys) if keys else np.zeros(0, np.int64)
+    o = np.argsort(key, kind="stable")
+    key = key[o]
+    tf = np.concatenate(tfs)[o] if tfs else np.zeros((0, F), np.uint8)
+    terms_of_p, docs_of_p = (key // max(N, 1), key % max(N, 1))
+    df = np.bincount(terms_of_p, minlength=V).astype(np.int32)
+    df_field = np.stack([np.bincount(terms_of_p[tf[:, f] > 0], minlength=V) for f in range(F)], axis=1) \
+        if F else np.zeros((V, 0))
+    term_ptr = np.zeros(V + 1, np.int64)
+    term_ptr[1:] = np.cumsum(df)
+    field_len = np.zeros((N, F), np.int32)
+    for k, s in enumerate(segs):
+        sel = np.flatnonzero(si == k)
+        field_len[sel] = np.asarray(s.text.field_len)[li[sel]]
+    avg_len = (field_len.sum(axis=0, dtype=np.int64) / N).astype(np.float32) if N else np.zeros(F, np.float32)
+    pos_ptr = positions = None
+    if with_pos:
+        starts, counts = np.concatenate(pos_starts)[o], np.concatenate(pos_counts)[o]
+        _, idx = nb.csr_expand(np.r_[0, np.cumsum(counts)], np.arange(len(counts)), np.zeros(len(counts), np.int64))
+        seg_start = np.repeat(starts - np.r_[0, np.cumsum(counts)][:-1], counts)
+        positions = np.concatenate(pos_all)[idx + seg_start] if len(idx) else np.zeros(0, np.uint32)
+        pos_ptr = np.r_[0, np.cumsum(counts)].astype(np.int64)
+    text = TextArrays(fields=list(first.text.fields), vocab=vocab, term_ptr=term_ptr,
+                      doc_ids=docs_of_p.astype(np.int32), tf=tf, field_len=field_len, df=df,
+                      df_field=df_field.astype(np.int32), avg_len=avg_len, pos_ptr=pos_ptr,
+                      positions=None if positions is None else positions.astype(np.uint32))
+    out = SegmentArrays(manifest=dict(first.manifest), ids=ids, first_offset=fo, text=text,
+                        live=pack_bits(np.ones(N, bool)))
+
+    def gather(get, dtype):
+        col = np.zeros(N, dtype)
+        for k, s in enumerate(segs):
+            sel = np.flatnonzero(si == k)
+            col[sel] = np.asarray(get(s))[li[sel]]
+        return col
+    for f in first.keywords:
+        values = [""] + sorted(set().union(*(s.keywords[f].values[1:] for s in segs)))
+        idx = {v: i for i, v in enumerate(values)}
+        codes = np.zeros(N, np.int32)
+        for k, s in enumerate(segs):
+            remap = np.fromiter((idx[v] for v in s.keywords[f].values), np.int64, len(s.keywords[f].values))
+            sel = np.flatnonzero(si == k)
+            codes[sel] = remap[np.asarray(s.keywords[f].codes, np.int64)[li[sel]]]
+        out.keywords[f] = KeywordColumn(codes=codes, values=values)
+    for f, col in first.numerics.items():
+        values = gather(lambda s: s.numerics[f].values, np.asarray(col.values).dtype)
+        miss = gather(lambda s: nb.unpack_bits(np.asarray(s.numerics[f].missing), s.n_docs), bool)
+        out.numerics[f] = NumericColumn(values=values, missing=pack_bits(miss))
+    for f, v in first.vectors.items():
+        D = np.asarray(v).shape[1]
+        vec = np.zeros((N, D), np.float32)
+        for k, s in enumerate(segs):
+            sel = np.flatnonzero(si == k)
+            vec[sel] = np.asarray(s.vectors[f], np.float32)[li[sel]]
+        out.vectors[f] = vec
+    for s in segs:
+        for f, e in s.encoders.items():
+            out.encoders.setdefault(f, e)
+    if mapping is not None:
+        out.manifest["mapping"] = mapping
+    out.manifest["version"] = int(version if version is not None else max(int(s.manifest.get("version", 0))
+                                                                           for s in segs))
+    out.manifest.pop("segment_id", None)
+    out.manifest.pop("files", None)
+    out.manifest.pop("checksum", None)
+    return out

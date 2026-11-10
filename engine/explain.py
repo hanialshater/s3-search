@@ -39,19 +39,20 @@ def _lexical(ex, node, doc):
     k1, bpar = st.mapping.k1, st.mapping.b
     terms, total = [], 0.0
     f_one = next(st.field_index[f] for f, w in node.fields if w > 0) if node.idf == "field" else None
+    part, loc = st.owner(doc)                       # the segment that holds this slot's live doc
     for t in node.terms:
-        tid = st.vocab.get(t)
+        tid, gid = part.vocab.get(t), st.vocab.get(t)
         if tid is None:
             continue
-        lo, hi = int(st.host_term_ptr[tid]), int(st.host_term_ptr[tid + 1])
-        j = lo + int(np.searchsorted(st.host_doc_ids[lo:hi], doc))
-        if j >= hi or st.host_doc_ids[j] != doc:
+        lo, hi = int(part.host_term_ptr[tid]), int(part.host_term_ptr[tid + 1])
+        j = lo + int(np.searchsorted(part.host_doc_ids[lo:hi], loc))
+        if j >= hi or part.host_doc_ids[j] != loc:
             continue
-        idf = float(st.host_idf_field[tid, f_one] if f_one is not None else st.host_idf[tid])
+        idf = float(st.host_idf_field[gid, f_one] if f_one is not None else st.host_idf[gid])
         per_field, ptf = [], 0.0
         for f, w in node.fields:
             fi = st.field_index[f]
-            tf = int(st.host_tf[j, fi])
+            tf = int(part.host_tf[j, fi])
             if w <= 0 or tf == 0:
                 continue
             norm = max(1.0 - bpar + bpar * float(st.host_rel_len[doc, fi]), 1e-6)

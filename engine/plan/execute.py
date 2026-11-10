@@ -69,13 +69,13 @@ class Executor:
             for f, wt in fields:
                 w[st.field_index[f]] = wt
             bb = np.full(F, st.mapping.b, np.float32)
-            if idf_mode == "field":
-                f_i = next(st.field_index[f] for f, wt in fields if wt > 0)
-                idf = st.idf_field[:, f_i]
-            else:
-                idf = st.idf
-            terms = [[st.vocab[t] for t in n.terms if t in st.vocab] for n in nodes]
-            scores, nmatch = ops.bm25f(b, st, terms, w, bb, st.mapping.k1, idf)
+            f_i = next(st.field_index[f] for f, wt in fields if wt > 0) if idf_mode == "field" else None
+            scores = nmatch = None
+            for part in st.parts:                       # one pass per segment, into the slot-ordered buffers
+                idf = part.idf_field[:, f_i] if f_i is not None else part.idf
+                terms = [[part.vocab[t] for t in n.terms if t in part.vocab] for n in nodes]
+                sc, nm = ops.bm25f(b, part, terms, w, bb, st.mapping.k1, idf)
+                scores, nmatch = (sc, nm) if scores is None else (scores + sc, nmatch + nm)
             for i, n in enumerate(nodes):
                 self.lex_cache[n] = (scores[i], nmatch[i])
         timer.lap("retrieve")
@@ -93,7 +93,17 @@ class Executor:
                 q = q / np.where(norm > 0, norm, 1.0)
             if any(n.text is not None for n in nodes):
                 timer.lap("encode")
-            sims = ops.dense_scores(b, st.vectors[field], b.asarray(q, "float32"))
+            qd = b.asarray(q, "float32")
+            sims = None
+            for part in st.parts:
+                sp = ops.dense_scores(b, part.vectors[field], qd)
+                if part.identity:
+                    sims = sp
+                    continue
+                if sims is None:
+                    sims = b.zeros((len(nodes), st.N), "float32")
+                if len(part.live_local):
+                    sims[:, b.asarray(part.live_slot, "int64")] = sp[:, b.asarray(part.live_local, "int64")]
             for i, n in enumerate(nodes):
                 self.dense_cache[n] = sims[i]
         if dense:
@@ -161,25 +171,34 @@ class Executor:
         bb = np.full(F, st.mapping.b, np.float32)
         if node.idf == "field":
             f_i = next(st.field_index[f] for f, wt in node.fields if wt > 0)
-            idf, idf_h = st.idf_field[:, f_i], st.host_idf_field[:, f_i]
+            idf_h = st.host_idf_field[:, f_i]
         else:
-            idf, idf_h = st.idf, st.host_idf
-        groups = [[st.vocab[t] for t in g if t in st.vocab] for g in node.groups]
-        group_idf = [min((float(idf_h[t]) for t in g), default=0.0) for g in groups]
-        scores, present = ops.bm25f_groups(b, st, groups, list(node.modes), w, bb, st.mapping.k1, idf, group_idf)
-        score = b.sum(scores, axis=0)
-        m = b.sum(b.astype(present, "int32"), axis=0) >= node.msm
+            f_i, idf_h = None, st.host_idf
+        group_idf = [min((float(idf_h[st.vocab[t]]) for t in g if t in st.vocab), default=0.0) for g in node.groups]
+        score = count = None
+        for part in st.parts:
+            pidf = part.idf_field[:, f_i] if node.idf == "field" else part.idf
+            groups = [[part.vocab[t] for t in g if t in part.vocab] for g in node.groups]
+            sc, present = ops.bm25f_groups(b, part, groups, list(node.modes), w, bb, st.mapping.k1, pidf, group_idf)
+            sc = b.sum(sc, axis=0)
+            score = sc if score is None else score + sc
+            count = present if count is None else count | present
+        m = b.sum(b.astype(count, "int32"), axis=0) >= node.msm
         return b.where(m, score * node.boost, 0.0), m
 
     def _phrase(self, node):
         from ..ops.phrase import phrase, phrase_scores
         b, st = self.b, self.st
         f_i = st.field_index[node.field]
-        slots = [[st.vocab[t] for t in alts if t in st.vocab] for alts in node.slots]
-        if not slots:
+        if not node.slots:
             return b.zeros(st.N, "float32"), b.full(st.N, False, "bool")
-        freq, m = phrase(b, st, f_i, slots, list(node.offsets), node.slop)
-        idf_sum = sum(max((float(st.host_idf_field[t, f_i]) for t in s), default=0.0) for s in slots)
+        freq = m = None
+        for part in st.parts:
+            slots = [[part.vocab[t] for t in alts if t in part.vocab] for alts in node.slots]
+            fq, mm = phrase(b, part, f_i, slots, list(node.offsets), node.slop)
+            freq, m = (fq, mm) if freq is None else (freq + fq, m | mm)
+        idf_sum = sum(max((float(st.host_idf_field[st.vocab[t], f_i]) for t in alts if t in st.vocab), default=0.0)
+                      for alts in node.slots)
         sc = phrase_scores(b, st, f_i, freq, idf_sum, st.mapping.k1, st.mapping.b)
         return b.where(m, sc * node.boost, 0.0), m
 
