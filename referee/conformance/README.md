@@ -35,3 +35,26 @@ at scale (bench, 2,000 fit queries).
   `referee/lucene_model.py` reproduces OpenSearch's `match` scores to 1e-7, so the gap is by design. Lexical scoring
   does not count for prediction 1. A lexical query that only selects a match set (the `facets` family's `match`
   queries) does count, because the set does not depend on the scores.
+
+## S7-9: the S7 families (`opensearch-2.19-esci-sample-s7-v1.jsonl.gz`)
+
+The suite, its roles and rules are in `referee/conformance_s7.py`. They were committed before the recording
+(`0b69e2e`), and the recording before the engine ran against it (`d262631`).
+
+**A deviation, found by the first run (2026-11-10).** The adapter's `s3_english` used Lucene's `porter_stem`, which
+leaves words of one or two letters unstemmed (`xs`, `us`). INTERFACES §2 names Snowball's `porter`, which stems
+them, and so do the engine and the referee. On the first recording, `match` queries holding such words matched
+different sets, and the aggregation families that use them inherited the gap: engine against OpenSearch, exact
+137/146, avg and stats 15/16, phrase 40/40, highlight 20/20. The fault was the adapter's (the OpenSearch side), not
+the engine's. The adapter now uses Lucene's `snowball` filter with language `Porter`, the same algorithm, and the
+index name covers the analyzer, so an old index is never reused. Both recordings were made again:
+
+- toy v2: only 2 entries changed, both in the `unsupported` family, which is judged on the engine alone. Every
+  `p1` and `info` answer is identical, so S3's verdicts stand.
+- S7: re-recorded. The engine run against it gives exact 143/146, avg and stats 16/16, phrase 40/40, highlight
+  20/20 (every fragment holds a query term), info 24/32.
+
+The three remaining exact failures are an engine defect: `exists` on a text field skips values that analyse to no
+token (stop words, punctuation), where OpenSearch counts every non-null value (4, 9 and 1 such values in those
+requests). It is a strict xfail in the contract until fixed. The info families differ through Lucene's
+`max_expansions` (50) on `fuzzy` and `match_bool_prefix`; they count for no prediction.

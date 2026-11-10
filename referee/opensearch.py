@@ -81,7 +81,10 @@ def index_settings(mapping):
             "filter": {"s3_stop": {"type": "stop", "stopwords": sorted(EN_STOP)},
                        "s3_possessive": {"type": "stemmer", "language": "possessive_english"},
                        "s3_apostrophe": {"type": "pattern_replace", "pattern": "'", "replacement": ""},
-                       "s3_porter": {"type": "porter_stem"}},
+                       # Snowball's Porter, as INTERFACES section 2 names (snowballstemmer "porter"). Lucene's
+                       # porter_stem differs: it leaves words of one or two letters alone (xs, us), Snowball does
+                       # not. Until 2026-11-10 this was porter_stem; S7-9's first run found it.
+                       "s3_porter": {"type": "snowball", "language": "Porter"}},
             "analyzer": {"s3_english": {"type": "custom", "tokenizer": "s3_words",
                                         "filter": ["lowercase", "s3_possessive", "s3_apostrophe", "s3_stop",
                                                    "s3_porter"]}}}},
@@ -90,8 +93,9 @@ def index_settings(mapping):
 
 def build_index(catalogue: pd.DataFrame, mapping: dict, device: str = "cpu", name: str | None = None):
     id_field = mapping.get("_meta", {}).get("engine", {}).get("id_field", "product_id")
-    name = name or "s3ref-" + hashlib.md5(json.dumps([mapping, len(catalogue), os.environ.get("S3_SEARCH_OS_ANALYZER")],
-                                                     sort_keys=True,
+    # The name covers the whole index body (mapping, analyzer, similarity) and the catalogue size, so a changed
+    # analyzer never reuses an index built with the old one.
+    name = name or "s3ref-" + hashlib.md5(json.dumps([index_settings(mapping), len(catalogue)], sort_keys=True,
                                                      default=str).encode()).hexdigest()[:10]
     try:
         n = _call("GET", f"/{name}/_count").get("count")

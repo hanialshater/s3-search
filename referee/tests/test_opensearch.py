@@ -10,6 +10,7 @@ def test_index_body_defines_s3_english(monkeypatch):
     body = opensearch.index_settings(loader.ESCI_MAPPING)
     an = body["settings"]["analysis"]
     assert an["analyzer"]["s3_english"]["filter"][-1] == "s3_porter"
+    assert an["filter"]["s3_porter"] == {"type": "snowball", "language": "Porter"}  # not porter_stem (see the adapter)
     assert set(an["filter"]["s3_stop"]["stopwords"]) == EN_STOP and len(EN_STOP) == 33
     assert body["mappings"]["properties"]["product_title"]["analyzer"] == "s3_english"
     json.dumps(body)
