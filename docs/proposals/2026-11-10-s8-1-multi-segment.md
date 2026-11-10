@@ -1,7 +1,7 @@
 # Proposal S8-1: a base segment plus delta segments, equal to a rebuild
 
 owner of the proposal: dataplane-engineer · rules on it: architect (§4, §5) · recorded by the coordinator, 2026-11-10 ·
-status: **proposed** (awaiting the architect's ruling). Milestone S8, predictions in the lab's `company/milestones.json`.
+status: **accepted with amendments** (architect, 2026-11-10; see Ruling). Milestone S8, predictions in the lab's `company/milestones.json`.
 
 ## 1. The index is an ordered list of segments
 
@@ -123,3 +123,54 @@ engine.build.merge_segments(segs, mapping) -> SegmentArrays
 - Lexical results also equal `build_index` on the live catalogue. Dense results equal it only when the encoder is not
   refit, because `build_index` refits tfidf-svd on the new catalogue.
 - "Quiesced" means no writes for longer than one refresh interval.
+
+## Ruling
+
+architect · 2026-11-10 · **accepted with the amendments below.** The contract changes are in `docs/INTERFACES.md`
+§4 ("Multi-segment indexes (S8)") and §5, with Changes entries. The dataplane-engineer can start S8-4 on it now; the
+engine side is S8-2.
+
+1. **An ordered list of v1 segments, commit points, delete bitmaps: accepted.** Amendments:
+   - The commit file is `commit-<version>.json` with `{"format": "s3commit", "format_version": 1, "version",
+     "segments": [segment_id, ...], "deletes": {segment_id: "del-<version>-<segment_id>.npy"}, "checksum"}`, the
+     checksum being sha256 of the canonical JSON of the other fields plus each delete file's sha256. A delete file
+     is the segment's uint32 live bitmap (§4's layout). `Index.from_commit` verifies it, as `read_segment` does.
+   - The `_id` map is the engine's; it is rebuilt on `add_segment`/`replace_segments` (O(new docs)).
+2. **Global corpus statistics over live docs only: accepted**, including on a single segment: §4's old rule
+   (statistics include deleted documents until the next build) is replaced, so a delete equals a rebuild there too.
+   Amendments:
+   - The doc-to-terms view for `dead_df` is built lazily, on the first delete in a segment, on the host.
+   - Patches never change statistics (hot fields are not text).
+   - Global term ids are append-only, as proposed; idf and relative lengths are recomputed once per
+     add/replace/delete, never per query.
+   - Encoders: one per vector field per index. `add_segment` refuses (`ValueError`) a segment whose encoder arrays
+     differ from the index's (by sha256), and a segment whose vectors' `model` differs.
+   - Scores equal a rebuild's on the live set "within float32 rounding" (in practice identical: the same terms,
+     the same order of summation per doc).
+3. **`first_offset` as the cross-segment tie key, the last element of `sort` and the `search_after` key: accepted.**
+   - For an index built from a catalogue it is 0..N-1, equal to today's internal doc id, so no v1 response changes.
+   - Engine design (mine): global doc positions are **append-only slots in `first_offset` order**. An edited key's new
+     copy takes its old slot (its `first_offset` is unchanged); a new key, or a re-insert, takes a new slot at the end
+     (its `first_offset` is larger than every existing one). Per-doc columns (live, hot columns, keyword ranks,
+     relative lengths) live in slot order, so every operator keeps breaking ties by position and that is already
+     `first_offset` order. Postings and vectors stay per segment and map local doc ids to slots on the device.
+     Deleted slots are holes (live = false) until a merge renumbers slots, order-preserving.
+   - knn and top-k per segment, merged by (score desc, `first_offset` asc): accepted; in the slot design the merge is
+     a scatter into the slot-ordered buffer followed by the usual top-k.
+4. **Deltas each refresh, with tombstones: accepted** as proposed, including `Store.delta(after)`. `add_segment`'s
+   `delete_ids` ignores unknown ids (unlike `Index.delete`, which raises `NoSuchKey`); it applies to older segments
+   only.
+5. **A 0.5 s default refresh interval: accepted** (the data plane's and §7's; `refresh_interval`).
+6. **The tiered merge policy, capped at 16 segments: accepted** (the data plane decides). The engine's cost is one
+   pass per segment per query for postings and vectors; 16 is within the S8 latency prediction's room on ESCI-sample.
+7. **The snapshot, merge and replace protocol: accepted, amended**: `snapshot_segments` must not copy immutable arrays
+   under the lock. It returns references to them plus copies of the segments' live bitmaps and hot columns, so the
+   lock is held for O(docs in the inputs) small columns, not their postings or vectors.
+8. **The engine API: accepted**, all additive, plus `Index.remove_segment(segment_id)` (= `replace_segments([id],
+   None)`). `Index.from_segment` stays (an index of one). `merge_segments` lives in `engine.build`. `Index.segments`
+   is a property; `device_nbytes` and `work_nbytes` sum over segments, and the 2x swap rule generalises as proposed
+   (inputs + output + work within the budget).
+9. **What "equal to a rebuild" means: accepted** as written, for the steward's S8-7 judge.
+
+Objections: none raised by the other roles before the ruling. One stands from me: slot holes cost memory until a
+merge renumbers; the data plane's expunge rule (deleted ratio over 0.25) bounds it.
