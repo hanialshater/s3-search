@@ -188,10 +188,9 @@ def test_devices_agree(ds):
 # ---- synonyms are a mapping setting (S7-6): what a mapping may hold ----------------------------------------------------
 
 _BAD_SYNONYMS = [(42, "not a list"), ([42], "an entry that is not a string"), (["red lamp, light"], "a multi-word entry"),
-                 (["the, lamp"], "an entry that analyses to no token (a stop word)")]
-_BAD_SYNONYMS_DEFECTS = [(["lamp =>"], "a rule with an empty right side (accepted, and makes lamp match nothing)"),
-                         (["=> light"], "a rule with an empty left side"),
-                         ([" , "], "an entry of empty alternatives (OpenSearch rejects the same mapping)")]
+                 (["the, lamp"], "an entry that analyses to no token (a stop word)"),
+                 (["lamp =>"], "a rule with an empty right side"), (["=> light"], "a rule with an empty left side"),
+                 ([" , "], "an entry of empty alternatives"), (["a => b => c"], "a double =>")]
 
 
 def _with_synonyms(ds, syn):
@@ -207,14 +206,19 @@ def test_synonym_mappings_refused(syn, what, ds):
         api.build_index(ds.catalogue, _with_synonyms(ds, syn))
 
 
-@pytest.mark.xfail(strict=True, reason="defect reported 2026-11-10 (steward): accepted instead of InvalidMapping; "
-                                       "remove this mark when the engine refuses it")
-@pytest.mark.parametrize("syn,what", _BAD_SYNONYMS_DEFECTS, ids=[w[:40] for _, w in _BAD_SYNONYMS_DEFECTS])
-def test_synonym_mappings_refused_defects(syn, what, ds):
-    with pytest.raises(api.InvalidMapping):
-        api.build_index(ds.catalogue, _with_synonyms(ds, syn))
-
-
 def test_synonym_mappings_accepted(ds):
     for syn in ([], ["# only a comment"], ["lamp, light"], "lamp, light", ["kettle => mug", "boots, shoe"]):
         api.build_index(ds.catalogue, _with_synonyms(ds, syn))
+
+
+@pytest.mark.xfail(strict=True, reason="defect found by S7-9 (steward, 2026-11-10): exists skips values that analyse "
+                                       "to no token; OpenSearch counts every non-null value. Remove this mark when fixed")
+def test_exists_counts_values_without_tokens(ds):
+    """exists on a text field matches a document whose value analyses to no token (stop words, punctuation)."""
+    cat = ds.catalogue.copy()
+    cat.loc[cat.index[0], "product_description"] = "the and of"
+    cat.loc[cat.index[1], "product_color"] = "-"
+    idx = api.build_index(cat, ds.mapping)
+    for field, pid in (("product_description", cat["product_id"].iat[0]), ("product_color", cat["product_id"].iat[1])):
+        r = idx.search({"query": {"bool": {"filter": [{"exists": {"field": field}}, {"ids": {"values": [pid]}}]}}})
+        assert r["hits"]["total"] == 1, f"exists {field}: a value without tokens is not counted"
