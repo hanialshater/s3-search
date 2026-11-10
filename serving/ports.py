@@ -30,7 +30,7 @@ class Ports:
     # [(change, Rejection)]: one atomic batch with per-record rejection (dataplane.intake.apply_changes)
     apply_changes: Callable[[list[dict], dict, Any], Any] | None = None
     # refresh(managed_index) -> {"segment_id"?, "version"}: make every stored upsert visible by a delta refresh. None
-    # until the data plane's delta segments land (S8-4); then refresh() is a full rebuild and swap. The hook runs under
+    # means refresh() is a full rebuild and swap; default_ports() sets dataplane.updater.serving_refresh (S8-4). The hook runs under
     # the index's admin lock and may use managed_index.index, .root, .segments_dir, ._get_store() and
     # ._swap_in(new_index, segment_id, "refresh").
     refresh: Callable[[Any], dict] | None = None
@@ -83,7 +83,12 @@ def default_ports() -> Ports:
         from dataplane.intake import apply_changes as _apply
         return _apply(changes, mapping, store)
 
-    return Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker, apply_changes)
+    def refresh(managed_index):
+        # S8-4 (dataplane-engineer): a delta segment of the pending upserts, then one tiered merge if due
+        from dataplane.updater import serving_refresh
+        return serving_refresh(managed_index)
+
+    return Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker, apply_changes, refresh)
 
 
 def read_manifest(segment_dir: Path) -> dict:

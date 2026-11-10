@@ -19,8 +19,13 @@ def test_freshness_measures_and_equals_a_rebuild(tmp_path, store, catalogue):
 def test_freshness_catches_a_replica_that_misses_changes(tmp_path, store, catalogue):
     load(store, catalogue)
     r = Replica(store, build(store, None, tmp_path / "segs"), budget=1 << 40)
-    real = r._apply
-    r._apply = lambda cur, recs: real(cur, [x for x in recs if x["offset"] % 7])   # drop some changes
+    real = store.delta
+
+    def lossy(after):                                              # a replica that drops some changes
+        head, recs, docs = real(after)
+        return head, [x for x in recs if x["offset"] % 7], docs
+
+    store.delta = lossy
     rep = freshness.run(store, r, n_changes=300, batch=30, interval=0.002)
     assert rep.equal_to_rebuild is False and rep.mismatches
 

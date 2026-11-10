@@ -9,7 +9,8 @@ The contract (`checks.check_scope`) reads only this table:
 So a construct that starts answering before the steward marks it landed fails `referee fast`, and so does a construct
 marked landed that the engine still refuses. S7's commits cannot drift from the table silently.
 
-Synonyms (S7-6) are a mapping setting, not a request construct; S7-9 checks them.
+Synonyms (S7-6) are a mapping setting, not a request construct: `MAPPING_ITEMS` below marks it, and the contract
+checks it with mappings (`contract/test_contract.py::test_synonym_mappings`, `s7_checks.check_s7_6`).
 """
 from __future__ import annotations
 
@@ -29,26 +30,27 @@ SCOPE = [
     ("match_bool_prefix", "S7-2", True, "match_bool_prefix",
      {"query": {"match_bool_prefix": {"product_title": "red la"}}}),
     # S7-3: exists, ids, post_filter, collapse on a keyword field
-    ("exists", "S7-3", False, "exists", {"query": {"exists": {"field": "product_color"}}}),
-    ("ids", "S7-3", False, "ids", {"query": {"ids": {"values": ["T0001", "T0002"]}}}),
-    ("post_filter", "S7-3", False, "post_filter", {"query": Q, "post_filter": {"term": {"category": "lamp"}}}),
-    ("collapse keyword", "S7-3", False, "collapse", {"query": Q, "collapse": {"field": "category"}}),
+    ("exists", "S7-3", True, "exists", {"query": {"exists": {"field": "product_color"}}}),
+    ("ids", "S7-3", True, "ids", {"query": {"ids": {"values": ["T0001", "T0002"]}}}),
+    ("post_filter", "S7-3", True, "post_filter", {"query": Q, "post_filter": {"term": {"category": "lamp"}}}),
+    ("collapse keyword", "S7-3", True, "collapse", {"query": Q, "collapse": {"field": "category"}}),
+    ("collapse numeric", "S7-3", True, "collapse", {"query": Q, "collapse": {"field": "stock"}}),
     # S7-4: metric and bucket aggregations, one level of sub-aggregations under terms
-    *[(f"agg {a}", "S7-4", False, a, {"query": Q, "size": 0, "aggs": {"x": {a: {"field": "price"}}}})
+    *[(f"agg {a}", "S7-4", True, a, {"query": Q, "size": 0, "aggs": {"x": {a: {"field": "price"}}}})
       for a in ("min", "max", "avg", "sum", "stats", "value_count")],
-    ("agg cardinality", "S7-4", False, "cardinality",
+    ("agg cardinality", "S7-4", True, "cardinality",
      {"query": Q, "size": 0, "aggs": {"x": {"cardinality": {"field": "category"}}}}),
-    ("agg range", "S7-4", False, "range",
+    ("agg range", "S7-4", True, "range",
      {"size": 0, "aggs": {"x": {"range": {"field": "price", "ranges": [{"to": 50}, {"from": 50}]}}}}),
-    ("agg histogram", "S7-4", False, "histogram",
+    ("agg histogram", "S7-4", True, "histogram",
      {"size": 0, "aggs": {"x": {"histogram": {"field": "price", "interval": 50}}}}),
-    ("agg terms sub-aggregation", "S7-4", False, "aggs",
+    ("agg terms sub-aggregation", "S7-4", True, "aggs",
      {"size": 0, "aggs": {"c": {"terms": {"field": "category"}, "aggs": {"p": {"avg": {"field": "price"}}}}}}),
     # S7-5: highlight (plain, text fields), function_score with field_value_factor and weight
-    ("highlight text", "S7-5", False, "highlight", {"query": Q, "highlight": {"fields": {"product_title": {}}}}),
-    ("function_score field_value_factor", "S7-5", False, "function_score",
+    ("highlight text", "S7-5", True, "highlight", {"query": Q, "highlight": {"fields": {"product_title": {}}}}),
+    ("function_score field_value_factor", "S7-5", True, "function_score",
      {"query": {"function_score": {"query": Q, "field_value_factor": {"field": "stock", "missing": 1}}}}),
-    ("function_score weight", "S7-5", False, "function_score",
+    ("function_score weight", "S7-5", True, "function_score",
      {"query": {"function_score": {"query": Q, "functions": [{"filter": {"term": {"category": "lamp"}},
                                                                "weight": 2}]}}}),
     # Outside S7: refused for good
@@ -80,6 +82,10 @@ SCOPE = [
 ]
 
 
+# S7 items that are mapping settings, not request constructs: {item: landed}
+MAPPING_ITEMS = {"S7-6": True}
+
+
 def must_refuse(honor_landed: bool = True):
     """Entries the implementation must refuse: everything outside S7, and S7 items not marked landed. The reference
     index implements none of S7, so it is checked with honor_landed=False (it refuses all)."""
@@ -88,3 +94,8 @@ def must_refuse(honor_landed: bool = True):
 
 def landed():
     return [e for e in SCOPE if e[1] is not None and e[2]]
+
+
+def landed_items():
+    """Every landed S7 item, request constructs and mapping settings."""
+    return sorted({e[1] for e in landed()} | {i for i, ok in MAPPING_ITEMS.items() if ok})

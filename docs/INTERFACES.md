@@ -248,20 +248,35 @@ class StoreError(ValueError); class NotHot(StoreError); class NoSuchKey(StoreErr
   recomputed. Also `list_segments`, `latest_segment`, `gc(out_dir, keep=3, protect=())`, `MergePolicy(max_deleted_ratio,
   max_pending, max_age_s).due(replica.stats())`, `reindex(store, out_dir, replica)` (§7 `_reindex`), and the job
   `python -m dataplane.indexer --store --mapping --out [--ingest FILE]`.
-- **The updater** (`dataplane/updater/`): `Replica(store, segment_dir, device="cpu", budget=None, batch=32)` holds the
-  live `Index` and a reference to swap; `segment_dir` is a segment or a directory of them (the latest is loaded).
-  Loading checks `device_nbytes + work_nbytes <= budget`, then replays the log. `poll()` reads
-  `store.changes(after=index.version)`: `patch` → `Index.patch`, `delete` → `Index.delete`, `upsert` → counted as
-  pending (visible only after the next build and swap). Within a poll the changes are coalesced: the last value of a
-  (field, id) wins, one `Index.patch` call per field, one `Index.delete` call, and an id the index does not hold live
-  (upserted or re-inserted since the segment) is not patched: it waits for the build like its upsert.
+- **The updater** (`dataplane/updater/`; S8): `Replica(store, segment_dir, device="cpu", budget=None, batch=32,
+  refresh_interval=0.5, merge_policy=TieredMergePolicy(), commit_dir=None, commit_every=5.0, keep_commits=3)` holds
+  the live `Index`, a base segment plus delta segments; `segment_dir` is a commit file, a segment, or a directory (its
+  newest commit, else its newest segment). Loading checks `device_nbytes + work_nbytes <= budget`, then refreshes.
+  - `refresh()` (`poll()` is the same step) = `dataplane.updater.delta.apply_delta(index, store, index.version)`: one
+    `Store.delta` read; patches to keys not upserted in the range → `Index.patch` (one call per field, the last value
+    wins); if any key was upserted, its docs at head become one delta segment (`build_segment(..., version=head,
+    vector_models=)`, with the store's encoder) added by `Index.add_segment(delta, version=head, delete_ids=deleted)`,
+    which tombstones the older copies; else deletes → `Index.delete` and `set_version(head)`. Upserts are visible
+    after the refresh, not after a rebuild (`pending_upserts` is 0).
+  - `merge()` = `delta.merge_once`: `TieredMergePolicy.plan(index.segments)`; the budget check
+    (`index.device_nbytes + inputs' device_nbytes + work_nbytes <= budget`, else the merge waits); `snapshot_segments`
+    under the replica's lock, `merge_segments(..., version=V)` outside it, then under the lock the records in
+    `(V, index.version]` for the merged keys are replayed onto the merged arrays (patches into its hot columns;
+    upserted or deleted keys become `delete_ids`) and one `replace_segments`.
+  - `commit()` = `Index.save_commit(commit_dir)` (the delta segments are written with it), then `gc_commits`.
+    **The commit hole (§4) is closed by replay on load:** loading a commit replays the patches logged after its oldest
+    segment's version, each only onto keys whose live copy is in a segment built before that patch; then the log
+    after the commit is refreshed.
+  - `start(interval=None, merges=True)`: a refresher thread every `refresh_interval` and a merger thread (merges when
+    due; commits every `commit_every` s and after each merge, with `commit_dir`). `stop()`.
+  - Serving's `Ports.refresh` hook is `dataplane.updater.serving_refresh(managed_index)`: one `apply_delta` from the
+    oldest pending upsert, then one merge if due.
   `swap(new_segment_dir)` checks `current device_nbytes + new device_nbytes + work_nbytes <= budget` (the double
   buffer, §0; 2x when the two are the same size) and raises `engine.backend.OverBudget` otherwise, loads the second
   `Index`, replays changes after its version (outside the lock, then the rest under it), then swaps one reference;
-  searches in flight finish on the old one. A swap to an older segment is the rollback. `budget=None` is
-  `Backend.memory_budget()` (the §0 rule, computed by the updater until the backends land). Also `start(interval)` /
-  `stop()` (a background poller), `stats()`, `live_ids()`, `on_visible(fn)`. Freshness = time from `apply` returning
-  to `poll` making it visible.
+  searches in flight finish on the old one. A swap to an older commit or segment is the rollback. `budget=None` is
+  `Backend.memory_budget()`. Also `stats()` (with `segments`, `deleted`, `merges`), `live_ids()`, `on_visible(fn)`.
+  Freshness = time from `apply` returning to the refresh making it visible.
 - **The freshness hook** (for B1-4): `dataplane.freshness.run(store, replica, n_changes=10_000, batch=100,
   interval=0.005, queries=None, check_rebuild=True) -> FreshnessReport` writes hot-field patches to random live ids,
   measures each change's apply-to-visible latency (p50, p99, max) and compares every query's response with a fresh
@@ -363,7 +378,9 @@ Layout (`seg-<version>-<8 hex>/`):
   `uint32 [0xFFFFFFFE, 0x00000003]`).
 - **A commit holds deletes, not hot-column patches**: a patch applied after a segment's build lives only in memory,
   so a replica that loads a commit must replay the log from the oldest segment's version (patches are idempotent),
-  or the data plane must rebuild or merge the segment before committing. (Open with the dataplane-engineer.)
+  or the data plane must rebuild or merge the segment before committing. **Chosen (dataplane-engineer, 2026-11-10):
+  replay on load** (§3, "The updater"): a replica loading a commit replays the patches logged after its oldest
+  segment's version, each only onto keys whose live copy is in a segment built before that patch.
 - `Index.save(path)` writes one segment of the live docs (a merge); `Index.n_docs` is the live count.
 
 The engine side (`engine/api.py`):
@@ -588,7 +605,7 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
 | `POST /indexes/{name}/_rollback` | `{"segment_id"}` → `{"segment_id", "version"}`: swap to a kept segment, replay the log after it |
 | `POST /indexes/{name}/_bulk` | OpenSearch NDJSON (`index`, `create`, `update` with a partial `doc` / `doc_as_upsert` / `upsert`, `delete`; `?refresh=false\|true\|wait_for`) → `{"took", "errors", "items": [{op: {"_index", "_id", "status", "result", "_seq_no"} \| {..., "error": {"type", "reason", "s3_reason", "field"}}}]}`; see **Bulk** below |
 | `POST /indexes/{name}/_refresh` | `{}` → `{"refreshed", "segment_id", "version"}`: make every stored upsert visible now |
-| `GET`, `PUT /indexes/{name}/_settings` | `{"index": {"refresh_interval": "1s"}}` (`500ms`, `5s`, `2m`, `-1` = no background refresh); default `S3_SERVING_REFRESH_INTERVAL` = `1s`; stored in `<index>/settings.json` |
+| `GET`, `PUT /indexes/{name}/_settings` | `{"index": {"refresh_interval": "500ms"}}` (`500ms`, `5s`, `2m`, `-1` = no background refresh); default `S3_SERVING_REFRESH_INTERVAL` = `500ms` (the S8-1 ruling); stored in `<index>/settings.json` |
 | `GET /indexes/{name}/_mapping` | → `{name: {"mappings": <the mapping>, "s3_fields": {field: {"type", "searchable", "filterable", "facetable", "sortable", "dense", "hot"[, "dimension"]}}}}`; sub-fields appear as `f.keyword`. Facetable = keyword; filterable and sortable = keyword and numeric/boolean; searchable = text |
 | `POST /indexes/{name}/_rankers` | `{"name", "path"}` → `{"name", "rankers": [...]}`: loads a ranker file (the JSON of `GBDT.to_dict()`; `engine.api` has no save/load of its own, so this is interim) from under the serving data dir into `Index.add_ranker`; kept across swaps. At startup: `S3_SERVING_RANKERS=name=path,...` |
 | `GET /indexes`, `GET /indexes/{name}` | what is loaded: segment id, version, docs, device, cache counters |
@@ -617,8 +634,9 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
   pending; with the full-rebuild backend also at least 4x the last refresh's cost apart); `true` refreshes before
   returning (`"forced_refresh": true`); `wait_for` returns when a refresh covers the write (forces one if the interval
   is `-1` or it takes too long). **The hook:** `serving.ports.Ports.refresh(managed_index) -> {"segment_id", "version"}`;
-  while it is `None` a refresh is a full rebuild from the store and a swap (18.7 s on ESCI-sample); when the data plane's
-  delta segments land (S8-4) it supplies the hook and refresh becomes a delta (it runs under the admin lock and may call
+  the data plane's `default_ports()` sets it to `dataplane.updater.serving_refresh` (a delta segment from the oldest pending
+  upsert, then one tiered merge if due; measured below); with it `None` a refresh is a full rebuild from the store and a swap
+  (18.7 s on ESCI-sample), and refresh becomes a delta (it runs under the admin lock and may call
   `managed_index._swap_in(new_index, segment_id, "refresh")`).
 - **Write metrics:** `s3_index_lag` (store head minus the highest offset fully visible, so upserts waiting for a refresh
   count), `s3_index_pending_upserts`, `s3_refresh_ms`, `s3_bulk_requests_total{refresh}`, `s3_bulk_items_total{op,outcome}`,
