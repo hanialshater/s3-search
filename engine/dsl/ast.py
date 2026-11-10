@@ -117,6 +117,8 @@ class QKnn:
     filter: Any = None
     boost: float = 1.0
     path: str = "query.knn"
+    method: str = "exact"                 # S9-1: exact | cagra | ivf_pq
+    method_parameters: tuple = ()         # S9-1: sorted (name, int) pairs
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,8 @@ class QNeural:
     filter: Any = None
     boost: float = 1.0
     path: str = "query.neural"
+    method: str = "exact"
+    method_parameters: tuple = ()
 
 
 @dataclass(frozen=True)
