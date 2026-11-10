@@ -40,7 +40,7 @@ UNSUPPORTED = [
     ({"query": {"nested": {"path": "x", "query": M}}}, "query.nested"),
     ({"query": {"more_like_this": {"like": "x"}}}, "query.more_like_this"),
     ({"query": {"bool": {"must": [{"wildcard": {"product_title": "sh*"}}]}}}, "query.bool.must[0].wildcard"),
-    ({"query": {"bool": {"filter": {"geo_distance": {}}}}}, "query.bool.filter.geo_distance"),
+    ({"query": {"bool": {"filter": {"geo_polygon": {}}}}}, "query.bool.filter.geo_polygon"),
     # options outside the subset
     ({"query": {"match": {"product_title": {"query": "x", "fuzzy_rewrite": "x"}}}},
      "query.match.product_title.fuzzy_rewrite"),

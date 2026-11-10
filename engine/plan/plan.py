@@ -14,7 +14,7 @@ from ..analysis import analyze, analyze_with_positions
 from ..dsl import ast as A
 from ..dsl.parse import parse, resolve_msm
 from ..errors import InvalidRequest, UnsupportedQuery
-from .nodes import Bool, Dense, Exists, FunctionScore, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
 
 
 class Planner:
@@ -156,8 +156,18 @@ class Planner:
         return FunctionScore(self.node(q.query), tuple(fns), q.score_mode, q.boost_mode, q.max_boost, q.min_score,
                              q.boost, q.path)
 
+    def n_QGeoDistance(self, q):
+        self._field(q.field, f"{q.path}.{q.field}", ("geo",))
+        return GeoDistance(q.field, q.lat, q.lon, q.meters, q.boost, q.path)
+
+    def n_QGeoBox(self, q):
+        from ..geo import encode_lat, encode_lat_ceil, encode_lon, encode_lon_ceil
+        self._field(q.field, f"{q.path}.{q.field}", ("geo",))
+        return GeoBox(q.field, encode_lat_ceil(q.bottom), encode_lat(q.top), encode_lon_ceil(q.left),
+                      encode_lon(q.right), q.left > q.right, q.boost, q.path)
+
     def n_QExists(self, q):
-        self._field(q.field, f"{q.path}.field", ("text", "keyword", "numeric", "vector"))
+        self._field(q.field, f"{q.path}.field", ("text", "keyword", "numeric", "vector", "geo"))
         return Exists(q.field, q.boost, q.path)
 
     def n_QIds(self, q):
@@ -300,6 +310,11 @@ class Planner:
                         tuple(self.agg(x) for x in a.sub))
 
     def sort_key(self, s: A.Sort) -> SortKey:
+        if s.geo is not None:
+            from ..geo import UNITS
+            f, lat, lon, unit = s.geo
+            self._field(f, f"{s.path}.{f}", ("geo",))
+            return SortKey("_geo_distance", s.order == "desc", True, (f, lat, lon, UNITS[unit]))
         if s.field not in ("_score", "_doc"):
             self._field(s.field, s.path, ("keyword", "numeric"))
         order = s.order or ("desc" if s.field == "_score" else "asc")

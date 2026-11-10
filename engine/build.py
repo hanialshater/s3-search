@@ -177,6 +177,15 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
     for f, dt in m.numeric.items():
         series = catalogue[f] if f in catalogue.columns else pd.Series([None] * N, dtype=float)
         seg.numerics[f] = numeric_column(series, dt, pack_bits)
+    from .geo import BadGeo, encode_column, lat_col, lon_col
+    for f in m.geo:                                       # S9-4: Lucene's encoding, as hidden int32 columns
+        col = catalogue[f].tolist() if f in catalogue.columns else [None] * N
+        try:
+            lat_e, lon_e, miss = encode_column(col)
+        except BadGeo as e:
+            raise InvalidMapping(f"properties.{f}", f"a value is not a geo_point: {e}") from None
+        seg.numerics[lat_col(f)] = NumericColumn(values=lat_e, missing=pack_bits(miss))
+        seg.numerics[lon_col(f)] = NumericColumn(values=lon_e, missing=pack_bits(miss))
     vector_fields = {}
     for f, spec in m.vector.items():
         model = None
@@ -223,7 +232,8 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
         "version": int(version), "segment_id": f"seg-{int(version)}-{ident.hexdigest()[:8]}",
         "created": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "analyzer": ANALYZER_VERSION,
         "mapping": m.raw, "mapping_sha256": hashlib.sha256(raw.encode()).hexdigest(), "id_field": id_col,
-        "text_fields": list(m.text), "keyword_fields": list(m.keyword), "numeric_fields": dict(m.numeric),
+        "text_fields": list(m.text), "keyword_fields": list(m.keyword), "numeric_fields": {f: str(np.asarray(c.values).dtype) for f, c in seg.numerics.items()},
+        "geo_fields": list(m.geo),
         "vector_fields": vector_fields, "hot": list(m.hot), "bm25": {"k1": m.k1, "b": m.b},
     }
     return seg

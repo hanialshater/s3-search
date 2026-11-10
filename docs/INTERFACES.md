@@ -131,6 +131,10 @@ names.
   stopwords, Porter stemmer via `snowballstemmer`, which S1 adds to `requirements.txt`). Code:
   `engine.analysis.analyze(text: str, analyzer: str = "s3_english") -> list[str]`. The conformance suite defines the
   same analyzer in the OpenSearch index settings.
+- **geo_point** (S9-4): `{"type": "geo_point"}` (no options). Values `{"lat", "lon"}`, `[lon, lat]` or `"lat,lon"`
+  (a geohash or an out-of-range point is `InvalidMapping`). Stored with Lucene's encoding as two int32 columns
+  (`num/<field>#lat.npy`, `num/<field>#lon.npy`, hidden from requests), and compared by their decoded values, as
+  OpenSearch does.
 - **Synonyms** (`_meta.engine.synonyms`, S7-6): Solr-style lines, applied at query time: `"a, b, c"` makes them
   equivalent, `"a, b => c, d"` replaces a or b by c or d, `#` starts a comment; entries are analysed with the
   index's analyzer and must be one token each (multi-word synonyms are `InvalidMapping`). In `match`,
@@ -467,6 +471,9 @@ Index.from_segment(path, device) -> Index
 | `query.prefix` (S7-2) | `{field: "v"}` or `{field: {"value", "boost"}}` | term-level; text fields: every indexed term of the field starting with it; keyword fields: every value starting with it; constant score `1.0 * boost` |
 | `query.match_bool_prefix` (S7-2) | `{field: "text"}` or `{field: {"query", "operator", "minimum_should_match", "max_expansions": 50, "boost"}}` | text fields; analysed terms but the last are BM25 clauses, the last is a prefix clause (its first `max_expansions` terms in term order, constant 1.0); combined like `match` |
 | `query.exists` (S7-3) | `{"field", "boost"}` | text: a stored value, even one that analyses to no token; keyword: a stored value (an empty string included; over `ignore_above` counts as none); numeric: not missing; knn_vector: a non-zero vector; constant score |
+| `query.geo_distance` (S9-4) | `{"distance": "12km" or metres, field: point, "distance_type": "arc", "boost"}` | haversine on OpenSearch's mean earth radius (6,371,008.7714 m) from the point to the doc's decoded location, `<=` the distance; units mi, yd, ft, in, km, m, cm, mm, nmi/NM; `plane`, `validation_method` refused; constant score |
+| `query.geo_bounding_box` (S9-4) | `{field: {"top_left", "bottom_right"} or {"top_right", "bottom_left"} or {"top", "left", "bottom", "right"}}` | Lucene's box: encoded bounds (bottom and left rounded up, top and right down), inclusive; left > right crosses the dateline; top < bottom is `InvalidRequest`; `wkt` refused; constant score |
+| `_geo_distance` sort (S9-4) | `{"_geo_distance": {field: point, "order": "asc", "unit": "m", "distance_type": "arc"}}` | the distance in `unit`; a doc without a location sorts as +infinity (last ascending, first descending, as OpenSearch) and its sort value is `None`; one point only; `mode` refused |
 | `query.ids` (S7-3) | `{"values": [...], "boost"}` | the docs with these `_id`s; constant score |
 | `post_filter` (S7-3) | a query | filters the hits and `hits.total` after aggregations are computed (multi-select facets) |
 | `collapse` (S7-3) | `{"field"}`: keyword or numeric | the top hit per value in sort order (missing values form one group); from/size count groups; `hits.total` counts docs; each hit gains `"fields": {field: [value]}`; with `search_after` refused (`UnsupportedQuery`), with `rescore` `InvalidRequest` |
@@ -856,3 +863,5 @@ status:
 - 2026-11-10, architect (S8-2c): copy-on-write states and a writer lock replace the Index RLock (section 4,
   "Concurrency", with the visibility rule); a multi-segment index scores all segments' postings in one pass
   (`ops.bm25f_multi`). Why: under 200 changes/s, searches waited on the RLock for whole refreshes.
+- 2026-11-10, architect (S9-4): section 2 gains `geo_point`; section 5 gains `geo_distance`, `geo_bounding_box` and
+  the `_geo_distance` sort; the backend gains `sin`, `cos`, `arcsin`. Additive.

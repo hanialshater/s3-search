@@ -72,6 +72,15 @@ class TorchBackend:
     def amin(self, a):
         return a.min()
 
+    def sin(self, a):
+        return torch.sin(a)
+
+    def cos(self, a):
+        return torch.cos(a)
+
+    def arcsin(self, a):
+        return torch.asin(a)
+
     def isnan(self, a):
         return torch.isnan(a)
 

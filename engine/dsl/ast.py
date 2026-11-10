@@ -130,6 +130,27 @@ class QNeural:
 
 
 @dataclass(frozen=True)
+class QGeoDistance:
+    field: str
+    lat: float
+    lon: float
+    meters: float
+    boost: float = 1.0
+    path: str = "query.geo_distance"
+
+
+@dataclass(frozen=True)
+class QGeoBox:
+    field: str
+    top: float
+    left: float
+    bottom: float
+    right: float
+    boost: float = 1.0
+    path: str = "query.geo_bounding_box"
+
+
+@dataclass(frozen=True)
 class QExists:
     field: str
     boost: float = 1.0
@@ -176,7 +197,7 @@ class QHybrid:
     path: str = "query.hybrid"
 
 
-Query = Union[QFunctionScore, QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
+Query = Union[QGeoDistance, QGeoBox, QFunctionScore, QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
 
 
 @dataclass(frozen=True)
@@ -200,6 +221,7 @@ class Sort:
     order: str | None = None              # None: the field's default (desc for _score, asc otherwise)
     missing: str = "_last"
     path: str = "sort"
+    geo: tuple | None = None              # S9-4, _geo_distance: (field, lat, lon, unit)
 
 
 @dataclass(frozen=True)

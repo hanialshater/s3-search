@@ -383,6 +383,8 @@ class IndexState:
         kind = self.mapping.kind(field)
         if kind == "numeric":
             return ~self.missing[field]
+        if kind == "geo":
+            return ~self.missing[f"{field}#lat"]
         if field not in self._exists:
             if kind in ("text", "keyword") and all(field in p.present for p in self.parts):
                 m = self._gather(lambda p: p.present[field], "bool")      # the stored value (segments since S7-9)

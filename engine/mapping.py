@@ -27,6 +27,8 @@ class Mapping:
     source: bool = True                    # _meta.engine.source (S7-5): keep text fields' raw text, for highlight
     synonyms: dict = field(default_factory=dict)   # S7-6: analysed token -> tuple of alternatives (query time)
 
+    geo: dict = field(default_factory=dict)        # S9-4: geo_point fields
+
     def kind(self, name: str) -> str | None:
         if name in self.text:
             return "text"
@@ -36,6 +38,8 @@ class Mapping:
             return "numeric"
         if name in self.vector:
             return "vector"
+        if name in self.geo:
+            return "geo"
         return None
 
 
@@ -52,6 +56,7 @@ def parse_mapping(raw: dict) -> Mapping:
         raise InvalidMapping("properties", "required: a dict of fields")
     eng = (raw.get("_meta") or {}).get("engine") or {}
     text, keyword, numeric, vector = [], {}, {}, {}
+    geo_fields = {}
     for name, spec in props.items():
         path = f"properties.{name}"
         if not isinstance(spec, dict) or "type" not in spec:
@@ -70,6 +75,11 @@ def parse_mapping(raw: dict) -> Mapping:
             keyword[name] = {"source": name, "ignore_above": int(spec.get("ignore_above", 2 ** 31))}
         elif t in NUMERIC_TYPES:
             numeric[name] = NUMERIC_TYPES[t]
+        elif t == "geo_point":
+            for k in spec:
+                if k != "type":
+                    raise InvalidMapping(f"{path}.{k}", "geo_point options are not supported")
+            geo_fields[name] = {}
         elif t == "knn_vector":
             dim = spec.get("dimension")
             if not isinstance(dim, int) or dim <= 0:
@@ -97,7 +107,7 @@ def parse_mapping(raw: dict) -> Mapping:
                    vector=vector, hot=hot, k1=float(bm25.get("k1", 1.2)), b=float(bm25.get("b", 0.75)),
                    embeddings=embeddings, dynamic=str(raw.get("dynamic", "true")).lower(),
                    positions=bool(eng.get("positions", True)), source=bool(eng.get("source", True)),
-                   synonyms=synonyms)
+                   synonyms=synonyms, geo=geo_fields)
 
 
 def parse_synonyms(lines) -> dict:

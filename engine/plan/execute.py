@@ -13,7 +13,7 @@ import numpy as np
 
 from ..errors import InvalidRequest, UnsupportedQuery
 from .. import ops
-from .nodes import Bool, Dense, Exists, FunctionScore, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
+from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
 
 INF = float("inf")
 
@@ -156,6 +156,22 @@ class Executor:
             out = (b.full(N, node.boost, "float32"), b.full(N, True, "bool"))
         elif isinstance(node, FunctionScore):
             out = self._function_score(node, ctx)
+        elif isinstance(node, GeoDistance):
+            from ..geo import haversine_m, lat_col, lon_col
+            f = node.field
+            d = haversine_m(b, st.numerics[lat_col(f)], st.numerics[lon_col(f)], node.lat, node.lon)
+            m = ~st.missing[lat_col(f)] & (d <= node.meters)
+            out = (b.where(m, node.boost, 0.0), m)
+        elif isinstance(node, GeoBox):
+            from ..geo import lat_col, lon_col
+            f = node.field
+            la, lo = st.numerics[lat_col(f)], st.numerics[lon_col(f)]
+            m = ~st.missing[lat_col(f)] & (la >= node.lat_lo) & (la <= node.lat_hi)
+            if node.crosses:
+                m = m & ((lo >= node.lon_lo) | (lo <= node.lon_hi))
+            else:
+                m = m & (lo >= node.lon_lo) & (lo <= node.lon_hi)
+            out = (b.where(m, node.boost, 0.0), m)
         elif isinstance(node, Exists):
             m = st.exists_mask(node.field)
             out = (b.where(m, node.boost, 0.0), m)
@@ -442,6 +458,12 @@ class Executor:
             if k.field == "_doc":
                 keys.append((b.astype(b.arange(st.N), "float64"), k.descending))
                 continue
+            if k.geo is not None:                       # distance in the unit; missing: +inf (as OpenSearch)
+                from ..geo import haversine_m, lat_col, lon_col
+                f, lat, lon, unit = k.geo
+                d = haversine_m(b, st.numerics[lat_col(f)], st.numerics[lon_col(f)], lat, lon) / unit
+                keys.append((b.where(st.missing[lat_col(f)], INF, d), k.descending))
+                continue
             sentinel = (-INF if k.descending else INF) if k.missing_last else (INF if k.descending else -INF)
             if k.field in st.keywords:
                 kw = st.keywords[k.field]
@@ -462,6 +484,9 @@ class Executor:
         for k, v in zip(plan.sort, vals[:-1]):
             if k.field in ("_score", "_doc"):
                 out.append(float(v))
+                continue
+            if k.geo is not None:
+                out.append(INF if v is None else float(v))
                 continue
             sentinel = (-INF if k.descending else INF) if k.missing_last else (INF if k.descending else -INF)
             if v is None:
@@ -488,6 +513,8 @@ class Executor:
                 out.append(float(v))
             elif k.field == "_doc":
                 out.append(int(v))
+            elif k.geo is not None:
+                out.append(None if math.isinf(v) else float(v))
             elif math.isinf(v):
                 out.append(None)
             elif k.field in st.keywords:

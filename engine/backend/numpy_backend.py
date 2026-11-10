@@ -74,6 +74,15 @@ class NumpyBackend:
         """The minimum of all elements (a 0-d array)."""
         return np.asarray(a.min())
 
+    def sin(self, a):
+        return np.sin(a)
+
+    def cos(self, a):
+        return np.cos(a)
+
+    def arcsin(self, a):
+        return np.arcsin(a)
+
     def isnan(self, a):
         return np.isnan(a)
 

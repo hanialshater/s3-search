@@ -89,7 +89,7 @@ def test_invalid_requests(index, req):
 
 def test_invalid_mapping(catalogue):
     with pytest.raises(InvalidMapping):
-        build_index(catalogue, {"properties": {"x": {"type": "geo_point"}}})
+        build_index(catalogue, {"properties": {"x": {"type": "geo_shape"}}})
     with pytest.raises(InvalidMapping):
         build_index(catalogue, {"_meta": {"engine": {"hot": ["category"]}},
                                 "properties": {"category": {"type": "keyword"}}})

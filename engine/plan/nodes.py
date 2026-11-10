@@ -70,6 +70,29 @@ class Range:
 
 
 @dataclass(frozen=True)
+class GeoDistance:
+    field: str
+    lat: float
+    lon: float
+    meters: float
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
+class GeoBox:
+    """Lucene's encoded bounds (S9-4): lat_lo/lat_hi and lon_lo/lon_hi inclusive; ``crosses`` the dateline."""
+    field: str
+    lat_lo: int
+    lat_hi: int
+    lon_lo: int
+    lon_hi: int
+    crosses: bool = False
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
 class FunctionScore:
     """S7-5: functions are (filter node or None, (field, factor, modifier, missing) or None, weight or None)."""
     query: Any
@@ -121,7 +144,7 @@ class Hybrid:
     path: str = "query"
 
 
-Node = Union[FunctionScore, Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
+Node = Union[GeoDistance, GeoBox, FunctionScore, Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
 
 
 @dataclass(frozen=True)
@@ -143,6 +166,7 @@ class SortKey:
     field: str               # "_score", "_doc" or a field name
     descending: bool
     missing_last: bool = True
+    geo: tuple | None = None   # S9-4, _geo_distance: (field, lat, lon, unit metres)
 
 
 @dataclass(frozen=True)
