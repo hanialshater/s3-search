@@ -74,26 +74,37 @@ def _rev():
 
 
 def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=64, latency_queries=500,
-        price_per_hour=None, split="fit", engine="engine", index=None, subsets=None, runs_out=None) -> dict:
+        price_per_hour=None, split="fit", engine="engine", index=None, subsets=None, runs_out=None,
+        progress=None) -> dict:
     """Runs one benchmark. `queries` is a DataFrame[query_id, query]; `judgments` {query_id: {product_id: label}}.
     `subsets` ({name: set of query ids}) are scored from the same runs, e.g. the founder's held-out draw.
-    `runs_out` (a dict), when given, receives the ranked ids per query that the quality numbers were computed from."""
+    `runs_out` (a dict), when given, receives the ranked ids per query that the quality numbers were computed from.
+    `progress` (a callable taking one line of text), when given, is told each step as it starts and ends."""
+    say = progress or (lambda msg: None)
     template = template or DEFAULT_TEMPLATE
     wall0 = time.perf_counter()
     if index is None:
         t = time.perf_counter()
+        emb = "with an encoder" if (ds.mapping.get("_meta", {}).get("engine", {}).get("embeddings")) else "lexical"
+        say(f"index build: {len(ds.catalogue):,} products on {device} ({emb}; an encoder fits inside the build)")
         index = api.build_index(ds.catalogue, ds.mapping, device=device)
         build_s = time.perf_counter() - t
+        say(f"index build: done in {build_s:.1f} s")
     else:
         build_s = None
     qids, texts = [int(q) for q in queries["query_id"]], [str(t) for t in queries["query"]]
 
     # Quality: k hits per query, batched.
     runs = {}
+    say(f"scoring: {len(texts):,} queries at k={k}, batches of {batch}")
+    t_q, step = time.perf_counter(), max(1, (len(texts) // batch) // 10) * batch
     for i in range(0, len(texts), batch):
         reqs = [{**fill(template, t), "size": k} for t in texts[i:i + batch]]
         for q, resp in zip(qids[i:i + batch], api_search_batch(index, reqs)):
             runs[q] = [h["_id"] for h in resp["hits"]["hits"]]
+        if i and i % step == 0:
+            say(f"scoring: {i:,} of {len(texts):,} queries, {time.perf_counter() - t_q:.1f} s")
+    say(f"scoring: done in {time.perf_counter() - t_q:.1f} s")
     if runs_out is not None:
         runs_out.update(runs)
     recall_ks = tuple(sorted({x for x in (k, 100, 1000) if x <= k}))
@@ -103,6 +114,8 @@ def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=6
 
     # Latency: page 1 at batch 1.
     page1 = [{**fill(template, t), "size": 10} for t in texts]
+    say(f"latency: {min(latency_queries, len(page1)):,} page-1 queries at batch 1")
+    t_l = time.perf_counter()
     for r in page1[:5]:
         index.search(r)  # warm-up, not timed
     lat, stages = [], {}
@@ -113,7 +126,9 @@ def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=6
         for s, v in resp.get("took_ms", {}).items():
             stages.setdefault(s, []).append(float(v))
 
+    say(f"latency: done in {time.perf_counter() - t_l:.1f} s")
     # Throughput: page 1 through search_batch.
+    say(f"throughput: {len(page1):,} page-1 queries in batches of {batch}")
     t = time.perf_counter()
     for i in range(0, len(page1), batch):
         api_search_batch(index, page1[i:i + batch])
