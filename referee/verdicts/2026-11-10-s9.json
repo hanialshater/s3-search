@@ -1,0 +1,121 @@
+{
+ "judge": "evaluation-steward",
+ "date": "2026-11-10",
+ "label": "CPU, development only (2 cores)",
+ "commit_judged": "5e47ba1 (the branch head with d8ad2ea, the optional GPU encoder and trees, merged)",
+ "note": "p4, p5 and p6's comparison clauses were first run on the commit before d8ad2ea (all the same results); on the coordinator's word they were run again on 5e47ba1, and these are those runs",
+ "suite": "s9-v1 (referee/conformance_s9.py, committed 060f493 before the recording a7b5c85)",
+ "verdicts": {
+  "S9 prediction 4": {
+   "text": "geo_distance, geo_bounding_box and _geo_distance sort, replayed against OpenSearch 2.19 on ESCI-sample with synthetic geo_point locations, return identical hits and counts in at least 98% of requests (sort distances within 1e-6 relative), on cpu and torch-cpu",
+   "verdict": "held",
+   "command": "taskset -c 0,1 python -m referee.conformance_s9 --device=cpu; and with /tmp/claude-0/venv-torch/bin/python --device=torch-cpu",
+   "cpu": {
+    "passed": 100,
+    "n": 100,
+    "rate": 1.0
+   },
+   "torch-cpu": {
+    "passed": 100,
+    "n": 100,
+    "rate": 1.0
+   },
+   "by_family": {
+    "geo_distance": {
+     "cpu": "40/40",
+     "torch-cpu": "40/40"
+    },
+    "geo_bounding_box": {
+     "cpu": "30/30",
+     "torch-cpu": "30/30"
+    },
+    "geo_sort": {
+     "cpu": "30/30",
+     "torch-cpu": "30/30"
+    }
+   },
+   "distances": "every _geo_distance sort value within 1e-6 relative (the rule; no failure)"
+  },
+  "S9 prediction 5": {
+   "text": "nested queries (with score_mode) and nested aggregations, replayed against OpenSearch 2.19 on ESCI-sample with synthetic nested offers, return identical hits, counts and values in at least 98% of requests",
+   "verdict": "held",
+   "cpu": {
+    "passed": 90,
+    "n": 90,
+    "rate": 1.0
+   },
+   "torch-cpu": {
+    "passed": 90,
+    "n": 90,
+    "rate": 1.0
+   },
+   "by_family": {
+    "nested_query": {
+     "cpu": "40/40",
+     "torch-cpu": "40/40"
+    },
+    "nested_in_bool": {
+     "cpu": "20/20",
+     "torch-cpu": "20/20"
+    },
+    "nested_aggs": {
+     "cpu": "30/30",
+     "torch-cpu": "30/30"
+    }
+   }
+  },
+  "S9 prediction 6": {
+   "text": "Nothing already supported changes: bench nDCG@10 0.4644 and Exact recall@100 0.7551 to 4 decimals, conformance v2 exact 160/160, S7's suite exact 146/146, S8's quiesced equality, and referee fast under 60 s on 2 cores",
+   "verdict": "held",
+   "clauses": {
+    "bench nDCG@10 0.4644 and Exact recall@100 0.7551 to 4 decimals": {
+     "measured": [
+      0.4643594185392334,
+      0.7550547837544519
+     ],
+     "held": true
+    },
+    "conformance v2 exact 160/160": {
+     "measured": "160/160",
+     "held": true
+    },
+    "S7's suite exact 146/146": {
+     "measured": "146/146",
+     "held": true
+    },
+    "S8's quiesced equality": {
+     "measured": {
+      "version": 46002,
+      "same_version": true,
+      "fit_queries": 2000,
+      "differ": 0
+     },
+     "held": true,
+     "run": "referee.stream, 30 s at 200 changes/s, behind the quiet gate",
+     "load": {
+      "start": {
+       "load1_at_start": 0.48779296875,
+       "waited_s": 290.02639675,
+       "max_load1_to_start": 0.5
+      },
+      "run": {
+       "load1_mean": 0.8751929012345679,
+       "load1_max": 1.25244140625,
+       "samples": 81,
+       "limit": 2.75,
+       "overloaded": false
+      }
+     }
+    },
+    "referee fast under 60 s on 2 cores": {
+     "measured_s": 9.0,
+     "held": true
+    }
+   }
+  },
+  "S9 predictions 1 to 3 (GPU)": {
+   "verdict": "not judged yet",
+   "why": "the GPU halves are judged by referee/gpu_judges.py in the founder's Colab run (the notebook's S9 cell); prediction 1's CPU half is judged once S9-1 lands here"
+  }
+ }
+}
