@@ -14,10 +14,10 @@ def all_hits(index, req):
 
 
 @pytest.mark.parametrize("field,want", [
-    ("product_bullet_point", lambda c: c["product_bullet_point"].map(lambda s: len(analyze(s)) > 0)),
+    ("product_bullet_point", lambda c: c["product_bullet_point"].notna()),
     ("product_brand.keyword", lambda c: c["product_brand"].notna()),
     ("price", lambda c: c["price"].notna()),
-    ("product_title", lambda c: c["product_title"].map(lambda s: len(analyze(s)) > 0)),
+    ("product_title", lambda c: c["product_title"].notna()),
 ])
 def test_exists(index, catalogue, field, want):
     r = all_hits(index, {"query": {"exists": {"field": field}}, "sort": ["_doc"]})
@@ -80,3 +80,29 @@ def test_collapse(index, catalogue, req, field, col):
     for frm, size in ((0, 2), (1, 2), (2, 10)):
         p = index.search({**req, "collapse": {"field": field}, "from": frm, "size": size})
         assert ids_of(p) == [i for i, _ in want[frm:frm + size]]
+
+
+def test_exists_follows_the_stored_value(catalogue, mapping):
+    """A value that analyses to no token (stop words, punctuation, an empty string) still exists, as OpenSearch
+    counts it; a missing value does not; a keyword over ignore_above is not indexed, so it does not exist."""
+    import copy
+    from engine.api import build_index
+    cat = catalogue.copy()
+    cat.loc[0, "product_description"] = "the and of"
+    cat.loc[1, "product_description"] = "-"
+    cat.loc[2, "product_description"] = ""
+    cat.loc[3, "product_description"] = None
+    cat.loc[4, "product_color"] = "-"
+    cat.loc[5, "product_color"] = "x" * 300
+    m = copy.deepcopy(mapping)
+    ix = build_index(cat, m)
+    for field, want in (("product_description", cat["product_description"].notna()),
+                        ("product_color", cat["product_color"].notna()),
+                        ("product_color.keyword", cat["product_color"].map(lambda v: isinstance(v, str) and len(v) <= 256))):
+        r = ix.search({"query": {"exists": {"field": field}}, "size": 500, "sort": ["_doc"]})
+        assert ids_of(r) == cat.loc[want, "product_id"].tolist(), field
+    seg_dir = ix.save(__import__("tempfile").mkdtemp() + "/s")                 # survives a save and a reload
+    from engine.api import Index
+    back = Index.from_segment(seg_dir)
+    r = back.search({"query": {"exists": {"field": "product_description"}}, "size": 0})
+    assert r["hits"]["total"] == int(cat["product_description"].notna().sum())
