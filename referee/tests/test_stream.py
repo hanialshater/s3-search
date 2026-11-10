@@ -180,3 +180,23 @@ def test_load_guard(monkeypatch):
     assert s.summary()["overloaded"] is (3.5 > loadguard.cpus() + loadguard.OVERLOAD_MARGIN)
     monkeypatch.setattr(loadguard, "load1", lambda: 0.1)
     assert loadguard.wait_for_quiet(wait_s=0.0)["load1_at_start"] == 0.1
+
+
+def test_open_loop_counts_queueing():
+    """The open loop times each query from its scheduled arrival, so waiting behind a slow query counts: a replica
+    that takes 15 ms per query at 100 arrivals/s must show latencies well beyond 15 ms."""
+    class Slow:
+        version = 0
+
+        def search(self, r):
+            time.sleep(0.015)
+            return {"hits": {"total": 0, "hits": []}}
+    st = stream._State([], 0)
+    stop, rows = threading.Event(), []
+    th = threading.Thread(target=stream._querier, args=(Slow(), st, [{"query": {"match_all": {}}}], stop, rows, 100.0))
+    th.start()
+    time.sleep(0.8)
+    stop.set()
+    th.join()
+    ms = sorted(r["ms"] for r in rows)
+    assert len(ms) > 20 and ms[int(0.9 * len(ms))] > 30

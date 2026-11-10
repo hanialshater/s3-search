@@ -6,9 +6,10 @@ coordinator asks. Every number is CPU, development only.
 What it measures, for S8's pre-registered predictions (the lab's `company/milestones.json`, S8):
 
 1. **The stream** (prediction 1). ESCI-sample's first `BASE` products are ingested and built into a base segment; a
-   `Replica(store, segment, "cpu").start(interval)` runs the data plane's own poller. A writer applies `rate` changes
-   a second to the store (`store.apply`, batches every 50 ms): new products (the rest of ESCI-sample), full-text
-   edits (another product's text, with a unique marker word in the title) and deletes, in the `MIX` proportions.
+   `Replica(store, segment, "cpu").start(interval)` runs the data plane's own poller. A writer **process** applies
+   `rate` changes a second to the store (`store.apply`, batches every 50 ms): new products (the rest of
+   ESCI-sample), full-text edits (another product's text, with a unique marker word in the title) and deletes of
+   base products (each used at most once), in the `MIX` proportions.
    - **Visibility** is timed from `store.apply` returning to the moment a probe query sees the change: a new id is
      found by `terms` on `product_id`, an edit by its marker in `product_title`, a delete by its id's absence. The
      probe runs every 10 ms, so the resolution is about 10 ms plus a probe's time. p50, p99 and max over every change.
@@ -16,8 +17,10 @@ What it measures, for S8's pre-registered predictions (the lab's `company/milest
      head, and every change is visible), `dataplane.indexer.build(store, ...)` at the same version and
      `Index.from_segment` answer every fit query (size 100) like the replica: totals and ids in order exactly, scores
      within 1e-4.
-2. **Query latency under the stream** (prediction 3). One client sends fit queries at batch 1, back to back: first
-   for `IDLE_S` seconds with no writes (idle), then during the stream. p50, p99 and the rise of p99 over idle.
+2. **Query latency under the stream** (prediction 3). An **open loop**: fit queries at batch 1 with Poisson
+   arrivals at `qps` (100/s), each timed from its scheduled arrival; first for `IDLE_S` seconds with no writes
+   (idle), then during the stream. p50, p99 and the rise of p99 over idle. Why this design (fixed before any judged
+   run, with what the steward had seen) is written above `_State` below.
    - **No failed or partial query across merge swaps.** A monitor samples `len(index.segments)` every 20 ms; a drop is
      a merge swap. Every tenth query is a `match_all` (size 0) whose total must equal the live count at the replica's
      version (known from the writer's own changes) whenever the version did not move during the call; a merge keeps
@@ -107,73 +110,115 @@ def require_s8_updater(store, replica, sample_doc: dict, wait_s: float = 5.0):
 
 
 # ---- the stream ------------------------------------------------------------------------------------------------------
+#
+# The query design (fixed 2026-11-10, before any judged S8 run). Prediction 3 says "query p99 at batch 1" without
+# saying how queries are driven; its intent is a serving replica under realistic traffic, so:
+# - the writer is a separate process (`_writer_proc`), as in a deployment, where writes reach the store through
+#   intake or `_bulk` while the replica's process only polls the store. It applies `rate` changes a second in
+#   batches every 50 ms and reports each batch (offsets, `time.monotonic()` after `store.apply`) over a queue;
+#   CLOCK_MONOTONIC is system-wide on Linux, so visibility is timed across the two processes;
+# - queries are an open loop: Poisson arrivals at `qps` (default 100/s), each sent at batch 1 at its scheduled time
+#   (at once if the client is behind), and timed from the scheduled time, so a query that queues behind a slow one
+#   counts its wait. A closed back-to-back loop measures something else: one client saturating the replica (and,
+#   in one process, starving the writer of Python's lock), not traffic.
+# - edit and delete targets are base products, each used at most once, so the writer needs nothing back from probes.
+# Disclosed: before writing this, the steward saw the dataplane-engineer's development numbers (refresh 22-29 ms;
+# visibility p99 534-721 ms; query p99 4-6x idle, mostly lock waits) and the note that the loop design moves p99.
 
 class _State:
     def __init__(self, base_ids, base_head):
         self.lock = threading.Lock()
-        self.live = set(base_ids)            # ids live in the store (our writes only)
-        self.free = list(base_ids)           # live ids with no change pending: candidates for edits and deletes
         self.pending_new, self.pending_edit, self.pending_del = {}, {}, {}   # id -> t_applied (edit: (marker, t))
         self.visible_ms = {"new": [], "edit": [], "delete": []}
         self.live_at = [(base_head, len(base_ids))]   # (offset, live count after it), ascending
         self.errors = []
+        self.writer_done = threading.Event()
+        self.write_s = None
 
     def live_count(self, version):
         i = np.searchsorted([o for o, _ in self.live_at], version, side="right") - 1
         return self.live_at[max(i, 0)][1]
 
 
-def _writer(store, st, pool, texts, rate, duration_s, stop, rng):
-    tick = 0.05
-    per = rate * tick
-    carry, n_new, n_mark, t_end = 0.0, 0, 0, time.perf_counter() + duration_s
+def _plan_changes(pool, texts, targets, rate, duration_s, seed):
+    """Every batch the writer will apply: [[(kind, change, marker)], ...], one batch per 50 ms tick."""
+    rng = np.random.default_rng(seed)
     kinds, probs = list(MIX), np.array(list(MIX.values()))
-    while time.perf_counter() < t_end and not stop.is_set():
-        t_tick = time.perf_counter()
+    per, carry, n_new, n_mark, t_i = rate * 0.05, 0.0, 0, 0, 0
+    batches = []
+    for _ in range(int(round(duration_s / 0.05))):
         carry += per
         k = int(carry)
         carry -= k
-        changes, meta = [], []
+        batch = []
+        for kind in rng.choice(kinds, size=k, p=probs / probs.sum()):
+            if kind == "new" and n_new < len(pool):
+                doc = _doc(pool[n_new])
+                n_new += 1
+                batch.append(("new", {"op": "upsert", "_id": doc["product_id"], "doc": doc}, None))
+            elif kind in ("edit", "delete") and t_i < len(targets):
+                pid = targets[t_i]
+                t_i += 1
+                if kind == "edit":
+                    src = _doc(texts[int(rng.integers(len(texts)))])
+                    mk = marker(n_mark)
+                    n_mark += 1
+                    doc = dict(src, product_id=pid, product_title=f"{mk} {src.get('product_title') or ''}")
+                    batch.append(("edit", {"op": "upsert", "_id": pid, "doc": doc}, mk))
+                else:
+                    batch.append(("delete", {"op": "delete", "_id": pid}, None))
+        batches.append(batch)
+    return batches
+
+
+def _writer_proc(store_path, mapping, batches, queue):
+    """The writer process: applies each batch on its 50 ms tick, reports (first offset, t_applied, meta)."""
+    from dataplane.kv import Store
+    store = Store(store_path, mapping)
+    t_start = time.monotonic()
+    for i, batch in enumerate(batches):
+        due = t_start + 0.05 * i
+        delay = due - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        if batch:
+            first, _ = store.apply([c for _, c, _ in batch])
+            queue.put((first, time.monotonic(), [(k, c["_id"], m) for k, c, m in batch]))
+    queue.put(("done", time.monotonic() - t_start, None))
+
+
+def _writer_thread(store, batches, queue):
+    t_start = time.monotonic()
+    for i, batch in enumerate(batches):
+        delay = t_start + 0.05 * i - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        if batch:
+            first, _ = store.apply([c for _, c, _ in batch])
+            queue.put((first, time.monotonic(), [(k, c["_id"], m) for k, c, m in batch]))
+    queue.put(("done", time.monotonic() - t_start, None))
+
+
+def _drain(queue, st):
+    """Moves the writer's reports into the state: pending changes, and the live count after each offset."""
+    while True:
+        first, t, meta = queue.get()
+        if first == "done":
+            st.write_s = t
+            st.writer_done.set()
+            return
         with st.lock:
-            for kind in rng.choice(kinds, size=k, p=probs / probs.sum()):
-                if kind == "new" and n_new < len(pool):
-                    doc = _doc(pool[n_new])
-                    n_new += 1
-                    changes.append({"op": "upsert", "_id": doc["product_id"], "doc": doc})
-                    meta.append(("new", doc["product_id"], None))
-                elif kind in ("edit", "delete") and len(st.free) > 100:
-                    j = int(rng.integers(len(st.free)))
-                    pid = st.free[j]
-                    st.free[j] = st.free[-1]
-                    st.free.pop()
-                    if kind == "edit":
-                        src = _doc(texts[int(rng.integers(len(texts)))])
-                        mk = marker(n_mark)
-                        n_mark += 1
-                        doc = dict(src, product_id=pid, product_title=f"{mk} {src.get('product_title') or ''}")
-                        changes.append({"op": "upsert", "_id": pid, "doc": doc})
-                        meta.append(("edit", pid, mk))
-                    else:
-                        changes.append({"op": "delete", "_id": pid})
-                        meta.append(("delete", pid, None))
-        if changes:
-            first, last = store.apply(changes)
-            t_applied = time.perf_counter()
-            with st.lock:
-                count = st.live_at[-1][1]
-                for i, (kind, pid, mk) in enumerate(meta):
-                    if kind == "new":
-                        st.pending_new[pid] = t_applied
-                        st.live.add(pid)
-                        count += 1
-                    elif kind == "edit":
-                        st.pending_edit[pid] = (mk, t_applied)
-                    else:
-                        st.pending_del[pid] = t_applied
-                        st.live.discard(pid)
-                        count -= 1
-                    st.live_at.append((first + i, count))
-        time.sleep(max(0.0, tick - (time.perf_counter() - t_tick)))
+            count = st.live_at[-1][1]
+            for i, (kind, pid, mk) in enumerate(meta):
+                if kind == "new":
+                    st.pending_new[pid] = t
+                    count += 1
+                elif kind == "edit":
+                    st.pending_edit[pid] = (mk, t)
+                else:
+                    st.pending_del[pid] = t
+                    count -= 1
+                st.live_at.append((first + i, count))
 
 
 def _probe_once(replica, st):
@@ -196,15 +241,13 @@ def _probe_once(replica, st):
         r = replica.search({"query": {"bool": {"filter": [{"terms": {"product_id": ids}}]}}, "size": len(ids)})
         still = {h["_id"] for h in r["hits"]["hits"]}
         seen += [("delete", pid) for pid in ids if pid not in still]
-    now = time.perf_counter()
+    now = time.monotonic()
     with st.lock:
         for kind, pid in seen:
             if kind == "new" and pid in st.pending_new:
                 st.visible_ms["new"].append((now - st.pending_new.pop(pid)) * 1e3)
-                st.free.append(pid)
             elif kind == "edit" and pid in st.pending_edit:
                 st.visible_ms["edit"].append((now - st.pending_edit.pop(pid)[1]) * 1e3)
-                st.free.append(pid)
             elif kind == "delete" and pid in st.pending_del:
                 st.visible_ms["delete"].append((now - st.pending_del.pop(pid)) * 1e3)
 
@@ -218,21 +261,27 @@ def _prober(replica, st, stop):
         time.sleep(0.01)
 
 
-def _querier(replica, st, reqs, stop, out, witness_every=10):
-    i = 0
+def _querier(replica, st, reqs, stop, out, qps=100.0, seed=SEED, witness_every=10):
+    """The open loop: Poisson arrivals at qps, batch 1, latency from the scheduled arrival."""
+    rng = np.random.default_rng(seed)
+    i, due = 0, time.monotonic()
     while not stop.is_set():
+        due += float(rng.exponential(1.0 / qps))
+        delay = due - time.monotonic()
+        if delay > 0:
+            if stop.wait(delay):
+                break
         witness = i % witness_every == witness_every - 1
         req = {"query": {"match_all": {}}, "size": 0} if witness else reqs[i % len(reqs)]
         v0 = replica.version
-        t0 = time.perf_counter()
         try:
             r = replica.search(req)
             err = None
         except Exception as e:  # noqa: BLE001
             r, err = None, f"{type(e).__name__}: {str(e)[:200]}"
-        dt = time.perf_counter() - t0
+        done = time.monotonic()
         v1 = replica.version
-        row = {"t0": t0, "ms": dt * 1e3, "witness": witness, "error": err, "wrong_total": None}
+        row = {"t0": due, "ms": (done - due) * 1e3, "witness": witness, "error": err, "wrong_total": None}
         if witness and r is not None and v0 == v1:
             with st.lock:
                 exp = st.live_count(v0)
@@ -245,49 +294,65 @@ def _querier(replica, st, reqs, stop, out, witness_every=10):
 def _monitor(replica, stop, out):
     while not stop.is_set():
         try:
-            out.append((time.perf_counter(), len(replica.index.segments), replica.version))
+            out.append((time.monotonic(), len(replica.index.segments), replica.version))
         except Exception:  # noqa: BLE001
             pass
         time.sleep(0.02)
 
 
 def run_stream(store, replica, mapping, base_ids, base_head, pool, texts, fit_reqs, rate=200, duration_s=60.0,
-               idle_s=IDLE_S, settle_timeout_s=60.0, seed=SEED, build=None, out_dir=None):
-    """The stream, the idle and stream latencies, merge-swap witnesses, and quiesced equality with a rebuild."""
+               idle_s=IDLE_S, settle_timeout_s=60.0, seed=SEED, build=None, out_dir=None, qps=100.0,
+               writer="process"):
+    """The stream, the idle and stream latencies, merge-swap witnesses, and quiesced equality with a rebuild.
+    writer: "process" (the judged design) or "thread" (in-process, for self-tests and comparison only)."""
+    import multiprocessing as mp
+    import queue as _queue
+
     import engine.api as api
     from dataplane import indexer
-    rng = np.random.default_rng(seed)
     st = _State(base_ids, base_head)
     page1 = [{**r, "size": 10} for r in fit_reqs]
-    res = {"rate": rate, "duration_s": duration_s, "mix": MIX}
+    targets = list(np.random.default_rng(seed + 1).permutation(np.asarray(base_ids, dtype=object)))
+    batches = _plan_changes(pool, texts, targets, rate, duration_s, seed)
+    res = {"rate": rate, "duration_s": duration_s, "mix": MIX, "qps": qps, "writer": writer,
+           "query_design": "open loop, Poisson arrivals, batch 1, latency from the scheduled arrival"}
 
     stop_q = threading.Event()
     idle_rows = []
-    th = threading.Thread(target=_querier, args=(replica, st, page1, stop_q, idle_rows), daemon=True)
+    th = threading.Thread(target=_querier, args=(replica, st, page1, stop_q, idle_rows, qps, seed), daemon=True)
     th.start()
     time.sleep(idle_s)
     stop_q.set()
     th.join()
 
-    stop_all, stop_w = threading.Event(), threading.Event()
+    stop_all = threading.Event()
     rows, segs = [], []
-    threads = [threading.Thread(target=_querier, args=(replica, st, page1, stop_all, rows), daemon=True),
+    threads = [threading.Thread(target=_querier, args=(replica, st, page1, stop_all, rows, qps, seed + 2), daemon=True),
                threading.Thread(target=_prober, args=(replica, st, stop_all), daemon=True),
                threading.Thread(target=_monitor, args=(replica, stop_all, segs), daemon=True)]
     for t in threads:
         t.start()
-    t_w = time.perf_counter()
-    _writer(store, st, pool, texts, rate, duration_s, stop_w, rng)
-    write_s = time.perf_counter() - t_w
-    stop_writes_at = time.perf_counter()
+    if writer == "process":
+        q = mp.get_context("spawn").Queue()
+        proc = mp.get_context("spawn").Process(target=_writer_proc, args=(str(store.path), mapping, batches, q))
+        proc.start()
+    else:
+        q = _queue.Queue()
+        proc = threading.Thread(target=_writer_thread, args=(store, batches, q), daemon=True)
+        proc.start()
+    drain = threading.Thread(target=_drain, args=(q, st), daemon=True)
+    drain.start()
+    st.writer_done.wait(duration_s * 3 + 60)
+    proc.join()
+    stop_writes_at = time.monotonic()
     # Settle: the replica reaches the store's head and every change is visible.
-    while time.perf_counter() - stop_writes_at < settle_timeout_s:
+    while time.monotonic() - stop_writes_at < settle_timeout_s:
         with st.lock:
             pending = len(st.pending_new) + len(st.pending_edit) + len(st.pending_del)
         if not pending and replica.version == store.head():
             break
         time.sleep(0.05)
-    settle_s = time.perf_counter() - stop_writes_at
+    settle_s = time.monotonic() - stop_writes_at
     stop_all.set()
     for t in threads:
         t.join()
@@ -295,6 +360,7 @@ def run_stream(store, replica, mapping, base_ids, base_head, pool, texts, fit_re
         never = {"new": len(st.pending_new), "edit": len(st.pending_edit), "delete": len(st.pending_del)}
     vis_all = [x for v in st.visible_ms.values() for x in v]
     n_changes = len(st.live_at) - 1
+    write_s = st.write_s
     res["writes"] = {"changes": n_changes, "applied_per_s": n_changes / write_s if write_s else None,
                      "by_kind_visible": {k: len(v) for k, v in st.visible_ms.items()}, "never_visible": never,
                      "settle_s": settle_s}
@@ -303,7 +369,7 @@ def run_stream(store, replica, mapping, base_ids, base_head, pool, texts, fit_re
                             "resolution": "probe every 10 ms"}
 
     # Latency, failures, witnesses, merge swaps.
-    drops = [(segs[i - 1][0], segs[i][0]) for i in range(1, len(segs)) if segs[i][1] < segs[i - 1][1]]
+    drops = [(segs[i - 1][0], segs[i][0]) for i in range(1, len(segs)) if segs[i][1] < segs[i - 1][1]]  # monotonic
     in_swap = lambda r: any(a <= r["t0"] + r["ms"] / 1e3 and r["t0"] <= b for a, b in drops)  # noqa: E731
     lat = lambda rs: [r["ms"] for r in rs if not r["witness"] and not r["error"]]  # noqa: E731
     idle_p99, stream_p99 = _pct(lat(idle_rows), 99), _pct(lat(rows), 99)
@@ -518,6 +584,9 @@ def main(argv=None) -> int:
     ap.add_argument("--duration", type=float, default=60.0)
     ap.add_argument("--rate", type=float, default=200.0)
     ap.add_argument("--interval", type=float, default=0.05, help="the replica's poll interval (Replica.start)")
+    ap.add_argument("--qps", type=float, default=100.0, help="the open loop's query rate (Poisson arrivals)")
+    ap.add_argument("--writer", default="process", choices=("process", "thread"),
+                    help="process: the judged design; thread: in-process, for comparison only")
     ap.add_argument("--parts", default="stream,bulk,intake")
     ap.add_argument("--out", default="results/judge-s8.json")
     ap.add_argument("--self-test", action="store_true", help="run the judge's full self-tests on toy, then stop")
@@ -550,7 +619,8 @@ def main(argv=None) -> int:
         try:
             res["capability_probe_s"] = require_s8_updater(store, replica, _doc(texts[0]))
             res["stream"] = run_stream(store, replica, ds.mapping, base_ids, store.head(), pool, texts, fit_reqs,
-                                       rate=a.rate, duration_s=a.duration, out_dir=work / "rebuild")
+                                       rate=a.rate, duration_s=a.duration, out_dir=work / "rebuild", qps=a.qps,
+                                       writer=a.writer)
         except UpdaterAbsent as e:
             res["stream"] = {"not_judged": f"UpdaterAbsent: {e}"}
         finally:
