@@ -91,8 +91,30 @@ def _collapse_ignored(r):
     return {k: v for k, v in r.items() if k != "collapse"}
 
 
+class _DropsEmptyBuckets:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def search(self, r):
+        out = self.inner.search(r)
+        for a in (out.get("aggregations") or {}).values():
+            if isinstance(a, dict) and "buckets" in a and a["buckets"] and "from" not in a["buckets"][0] \
+                    and "to" not in a["buckets"][0]:
+                a["buckets"] = [b for b in a["buckets"] if b["doc_count"]]
+        return out
+
+
+def _avg_of_price(r):
+    aggs = r.get("aggs")
+    if aggs and any("avg" in v for v in aggs.values()):
+        r = {**r, "aggs": {k: ({"avg": {"field": "price"}} if "avg" in v else v) for k, v in aggs.items()}}
+    return r
+
+
 def test_correctness_checks_catch_planted_errors(index, ds):
     from referee import s7_checks
+    assert s7_checks.check_s7_4(_DropsEmptyBuckets(index), ds), "a histogram without its empty buckets must be caught"
+    assert s7_checks.check_s7_4(_Rewrites(index, _avg_of_price), ds), "an avg over the wrong field must be caught"
     assert s7_checks.check_s7_3(_Rewrites(index, _post_filter_into_query), ds), "facets after post_filter must be caught"
     assert s7_checks.check_s7_3(_Rewrites(index, _collapse_ignored), ds), "an ignored collapse must be caught"
     assert s7_checks.check_s7_1(_Rewrites(index, _phrase_as_match), ds), "a bag-of-words phrase must be caught"

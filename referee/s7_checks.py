@@ -203,7 +203,110 @@ def checks_fields():
     return checks.FIELDS5
 
 
-CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3}
+def check_s7_4(index, ds):
+    """Metric and bucket aggregations against brute force, OpenSearch's definitions: float fields aggregate their
+    float32 values; min, max, sum, value_count, cardinality and every bucket key, bound and count exact; avg and
+    stats to 1e-6 relative; an empty set gives null (sum 0); range: from inclusive, to exclusive, sorted by from,
+    keys "a-b" with "*" for an open end; histogram: key floor(v / interval) * interval, empty buckets between the
+    lowest and highest key; one level of sub-aggregations under terms, per bucket. Range buckets come sorted by
+    (from, to) as OpenSearch's range aggregator sorts them, not in request order."""
+    import math
+
+    import numpy as np
+    import pandas as pd
+    from referee import reference
+    c = ds.catalogue.reset_index(drop=True)
+    ids = list(c["product_id"])
+    ref = reference.build_index(ds.catalogue, ds.mapping)
+    f32 = {"price": [None if pd.isna(v) else float(np.float32(v)) for v in c["price"]],
+           "stock": [None if pd.isna(v) else int(v) for v in c["stock"]]}
+    problems = []
+
+    def rows_of(q):
+        hit = {h["_id"] for h in ref.search({"query": q, "size": ALL})["hits"]["hits"]}
+        return [i for i, p in enumerate(ids) if p in hit]
+
+    def rel(a, b, tol):
+        if a is None or b is None:
+            return a is b
+        return abs(a - b) <= tol * max(1e-300, abs(b))
+
+    def metrics(vals):
+        v = [x for x in vals if x is not None]
+        s = float(math.fsum(v)) if v else 0.0
+        return {"min": min(v) if v else None, "max": max(v) if v else None, "sum": s,
+                "avg": (s / len(v)) if v else None, "count": len(v)}
+
+    queries = [{"match": {"product_title": "lamp"}}, {"match_all": {}}, {"term": {"category": "no-such"}},
+               {"bool": {"filter": [{"range": {"price": {"lt": 120}}}]}}]
+    for q in queries:
+        rows = rows_of(q)
+        for field in ("price", "stock"):
+            m = metrics([f32[field][i] for i in rows])
+            aggs = {k: {k: {"field": field}} for k in ("min", "max", "sum", "avg", "value_count", "stats")}
+            r = index.search({"query": q, "size": 0, "aggs": aggs})["aggregations"]
+            for k, exp, tol in (("min", m["min"], 0), ("max", m["max"], 0), ("value_count", m["count"], 0),
+                                ("avg", m["avg"], 1e-6)):
+                if not rel(r[k]["value"], exp, tol):
+                    problems.append(f"{k} {field} under {q}: {r[k]['value']} != {exp}")
+            if not rel(r["sum"]["value"], m["sum"], 1e-12):
+                problems.append(f"sum {field} under {q}: {r['sum']['value']} != {m['sum']}")
+            st = r["stats"]
+            for k in ("count", "min", "max", "avg", "sum"):
+                if not rel(st.get(k), m[k], 1e-6 if k in ("avg", "sum") else 0):
+                    problems.append(f"stats.{k} {field} under {q}: {st.get(k)} != {m[k]}")
+        for field, col in (("category", "category"), ("product_brand.keyword", "product_brand")):
+            vals = [c[col].iat[i] for i in rows if pd.notna(c[col].iat[i])]
+            r = index.search({"query": q, "size": 0, "aggs": {"vc": {"value_count": {"field": field}},
+                                                                 "cd": {"cardinality": {"field": field}}}})["aggregations"]
+            if r["vc"]["value"] != len(vals) or r["cd"]["value"] != len(set(vals)):
+                problems.append(f"value_count/cardinality {field} under {q}: {r['vc']['value']}, {r['cd']['value']} "
+                                f"!= {len(vals)}, {len(set(vals))}")
+        ranges = [{"to": 50}, {"from": 50, "to": 100}, {"from": 100}, {"from": 75.5, "to": 80}]
+        r = index.search({"query": q, "size": 0, "aggs": {"r": {"range": {"field": "price", "ranges": ranges}}}})
+        got = r["aggregations"]["r"]["buckets"]
+        exp = []
+        for rg in ranges:
+            lo, hi = rg.get("from"), rg.get("to")
+            n = sum(1 for i in rows if f32["price"][i] is not None and (lo is None or f32["price"][i] >= lo)
+                    and (hi is None or f32["price"][i] < hi))
+            key = f"{'*' if lo is None else float(lo)}-{'*' if hi is None else float(hi)}"
+            b = {"key": key, "doc_count": n}
+            if lo is not None:
+                b["from"] = float(lo)
+            if hi is not None:
+                b["to"] = float(hi)
+            exp.append(b)
+        exp.sort(key=lambda b: (b.get("from", -math.inf), b.get("to", math.inf)))
+        if [{k: v for k, v in g.items() if k in ("key", "doc_count", "from", "to")} for g in got] != exp:
+            problems.append(f"range under {q}: {got} != {exp}")
+        for field, interval in (("price", 50), ("price", 7.5), ("stock", 10)):
+            vals = [f32[field][i] for i in rows if f32[field][i] is not None]
+            keys = [math.floor(v / interval) * interval for v in vals]
+            exp = []
+            if keys:
+                k = min(keys)
+                while k <= max(keys) + 1e-9:
+                    exp.append({"key": float(k), "doc_count": sum(1 for x in keys if abs(x - k) < 1e-9)})
+                    k = k + interval
+            r = index.search({"query": q, "size": 0, "aggs": {"h": {"histogram": {"field": field,
+                                                                                 "interval": interval}}}})
+            got = [{"key": float(b["key"]), "doc_count": b["doc_count"]} for b in r["aggregations"]["h"]["buckets"]]
+            if len(got) != len(exp) or any(abs(g["key"] - e["key"]) > 1e-9 or g["doc_count"] != e["doc_count"]
+                                           for g, e in zip(got, exp)):
+                problems.append(f"histogram {field}/{interval} under {q}: {got[:4]} != {exp[:4]}")
+        r = index.search({"query": q, "size": 0, "aggs": {"t": {"terms": {"field": "category", "size": 3},
+                                                               "aggs": {"a": {"avg": {"field": "stock"}},
+                                                                        "mx": {"max": {"field": "price"}}}}}})
+        for b in r["aggregations"]["t"]["buckets"]:
+            br = [i for i in rows if c["category"].iat[i] == b["key"]]
+            ms, mp = metrics([f32["stock"][i] for i in br]), metrics([f32["price"][i] for i in br])
+            if b["doc_count"] != len(br) or not rel(b["a"]["value"], ms["avg"], 1e-6) or b["mx"]["value"] != mp["max"]:
+                problems.append(f"terms sub-aggregations, bucket {b['key']} under {q}: {b}")
+    return problems
+
+
+CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3, "S7-4": check_s7_4}
 
 
 def check_landed_correct(index, ds):
