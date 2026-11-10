@@ -74,9 +74,10 @@ def _rev():
 
 
 def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=64, latency_queries=500,
-        price_per_hour=None, split="fit", engine="engine", index=None, subsets=None) -> dict:
+        price_per_hour=None, split="fit", engine="engine", index=None, subsets=None, runs_out=None) -> dict:
     """Runs one benchmark. `queries` is a DataFrame[query_id, query]; `judgments` {query_id: {product_id: label}}.
-    `subsets` ({name: set of query ids}) are scored from the same runs, e.g. the founder's held-out draw."""
+    `subsets` ({name: set of query ids}) are scored from the same runs, e.g. the founder's held-out draw.
+    `runs_out` (a dict), when given, receives the ranked ids per query that the quality numbers were computed from."""
     template = template or DEFAULT_TEMPLATE
     wall0 = time.perf_counter()
     if index is None:
@@ -93,6 +94,8 @@ def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=6
         reqs = [{**fill(template, t), "size": k} for t in texts[i:i + batch]]
         for q, resp in zip(qids[i:i + batch], api_search_batch(index, reqs)):
             runs[q] = [h["_id"] for h in resp["hits"]["hits"]]
+    if runs_out is not None:
+        runs_out.update(runs)
     recall_ks = tuple(sorted({x for x in (k, 100, 1000) if x <= k}))
     quality = score_run(runs, judgments, k_ndcg=10, recall_ks=recall_ks)["mean"]
     quality_subsets = {name: score_run(runs, {q: j for q, j in judgments.items() if q in ids}, k_ndcg=10,
