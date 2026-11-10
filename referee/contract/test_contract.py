@@ -43,8 +43,46 @@ def test_errors_are_named(index):
 
 
 def test_landed_constructs_are_answered(index):
-    """Everything referee/scope.py marks landed (S7) is answered; its correctness is S7-9's conformance."""
+    """Everything referee/scope.py marks landed (S7) is answered."""
     checks.check_landed_are_answered(index, api)
+
+
+def test_landed_constructs_are_correct(index, ds):
+    """Every landed S7 item's match sets equal brute force (referee/s7_checks.py)."""
+    from referee import s7_checks
+    s7_checks.check_landed_correct(index, ds)
+
+
+class _Rewrites:
+    """A planted error: rewrites one construct into a looser one before the engine sees it."""
+
+    def __init__(self, inner, fn):
+        self.inner, self.fn = inner, fn
+
+    def search(self, r):
+        return self.inner.search(self.fn(r))
+
+
+def _phrase_as_match(r):
+    q = r.get("query", {})
+    if "match_phrase" in q:
+        (f, v), = q["match_phrase"].items()
+        return {**r, "query": {"match": {f: {"query": v["query"] if isinstance(v, dict) else v, "operator": "and"}}}}
+    return r
+
+
+def _fuzzy_as_term(r):
+    q = r.get("query", {})
+    if "fuzzy" in q:
+        (f, v), = q["fuzzy"].items()
+        return {**r, "query": {"match": {f: v}}}
+    return r
+
+
+def test_correctness_checks_catch_planted_errors(index, ds):
+    from referee import s7_checks
+    assert s7_checks.check_s7_1(_Rewrites(index, _phrase_as_match), ds), "a bag-of-words phrase must be caught"
+    assert s7_checks.check_s7_2(_Rewrites(index, _fuzzy_as_term), ds), "fuzzy answered as an exact term must be caught"
 
 
 @pytest.mark.parametrize("check", checks.ALL_INDEX_CHECKS, ids=lambda f: f.__name__)

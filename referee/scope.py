@@ -22,11 +22,11 @@ SCOPE = [
     ("match_phrase slop", "S7-1", True, "match_phrase",
      {"query": {"match_phrase": {"product_title": {"query": "red lamp", "slop": 1}}}}),
     # S7-2: typo tolerance and autocomplete
-    ("fuzzy", "S7-2", False, "fuzzy", {"query": {"fuzzy": {"product_title": "lamq"}}}),
-    ("match fuzziness", "S7-2", False, "fuzziness",
+    ("fuzzy", "S7-2", True, "fuzzy", {"query": {"fuzzy": {"product_title": "lamq"}}}),
+    ("match fuzziness", "S7-2", True, "fuzziness",
      {"query": {"match": {"product_title": {"query": "lamq", "fuzziness": "AUTO"}}}}),
-    ("prefix", "S7-2", False, "prefix", {"query": {"prefix": {"product_title": "lam"}}}),
-    ("match_bool_prefix", "S7-2", False, "match_bool_prefix",
+    ("prefix", "S7-2", True, "prefix", {"query": {"prefix": {"product_title": "lam"}}}),
+    ("match_bool_prefix", "S7-2", True, "match_bool_prefix",
      {"query": {"match_bool_prefix": {"product_title": "red la"}}}),
     # S7-3: exists, ids, post_filter, collapse on a keyword field
     ("exists", "S7-3", False, "exists", {"query": {"exists": {"field": "product_color"}}}),

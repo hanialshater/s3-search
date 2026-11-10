@@ -23,6 +23,22 @@ def _stem(w: str) -> str:
     return stem(w)
 
 
+def analyze_positions(text) -> list:
+    """[(token, position)]: every word takes a position; a stop word is dropped but leaves its gap (Lucene's stop
+    filter with position increments). For phrase checks."""
+    if text is None:
+        return []
+    out = []
+    for pos, w in enumerate(WORD.findall(str(text).lower())):
+        if w.endswith("'s"):
+            w = w[:-2]
+        w = w.replace("'", "")
+        if not w or w in EN_STOP:
+            continue
+        out.append((_stem(w), pos))
+    return out
+
+
 def analyze(text) -> list:
     if text is None:
         return []
