@@ -188,3 +188,35 @@ def test_nested_across_segments_merges_and_saves(ncat, device, tmp_path):
     final2 = final[final["product_id"] != "P0002"]
     for r in REQS:
         same(ix.search(r), Index(build_segment(final2, m), device).search(r))
+
+
+def test_commit_reload_after_nested_edits_and_deletes(tmp_path, device):
+    """§4: a commit's live bitmaps cover parents; children's live bits are re-derived from their parents on load,
+    so a commit taken after an edit (the old parent copy tombstoned with its children) reloads equal to the index."""
+    m = {"_meta": {"engine": {"id_field": "product_id"}},
+         "properties": {"product_id": {"type": "keyword"}, "title": {"type": "text"},
+                        "offers": {"type": "nested", "properties": {"seller": {"type": "keyword"},
+                                                                    "price": {"type": "float"}}}}}
+    base = pd.DataFrame({"product_id": ["a", "b", "c"], "title": ["red lamp", "blue lamp", "green lamp"],
+                         "offers": [[{"seller": "s1", "price": 3.0}, {"seller": "s2", "price": 5.0}],
+                                    [{"seller": "s3", "price": 7.0}], [{"seller": "s1", "price": 9.0}]],
+                         "_first_offset": [1, 2, 3]})
+    ix = Index(build_segment(base, m, version=2), device)
+    delta = build_segment(pd.DataFrame({"product_id": ["a", "d"], "title": ["red lamp", "white lamp"],
+                                        "offers": [[{"seller": "s9", "price": 4.0}], [{"seller": "s2", "price": 1.0}]],
+                                        "_first_offset": [1, 4]}), m, version=3)
+    ix.add_segment(delta, version=3)                    # edits a (its old children die), adds d
+    ix.delete(["c"])
+    ix.set_version(4)
+    reqs = [{"size": 0, "aggs": {"o": {"nested": {"path": "offers"},
+                                       "aggs": {"s": {"terms": {"field": "offers.seller"}},
+                                                "p": {"sum": {"field": "offers.price"}}}}}},
+            {"query": {"nested": {"path": "offers", "query": {"term": {"offers.seller": "s1"}}}}},
+            {"query": {"nested": {"path": "offers", "score_mode": "max",
+                                  "query": {"range": {"offers.price": {"gte": 0}}}}}, "size": 10}]
+    want = [ix.search(r) for r in reqs]
+    assert want[0]["aggregations"]["o"]["doc_count"] == 3 and want[1]["hits"]["total"] == 0
+    back = Index.from_commit(ix.save_commit(tmp_path), device)
+    for r, w in zip(reqs, want):
+        g = back.search(r)
+        assert g["hits"] == w["hits"] and g.get("aggregations") == w.get("aggregations")

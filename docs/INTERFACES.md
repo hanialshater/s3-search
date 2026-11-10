@@ -382,6 +382,10 @@ Layout (`seg-<version>-<8 hex>/`):
 - An index is an ordered list of segments, with a commit point `commit-<version>.json` (`{"format": "s3commit",
   "format_version": 1, "version", "segments": [...], "deletes": {segment_id: "del-<version>-<segment_id>.npy"},
   "checksum"}`); a delete file is a uint32 live bitmap. Each `_id` is live in at most one segment.
+- **Nested children in a commit (S9-5):** a delete file covers the segment's parent docs only. A child's liveness is
+  never stored in a commit; it is re-derived on load: a child is live exactly when its parent copy is live (and its
+  own segment's `live`, if any, is set). So a commit taken after an edit or a delete reloads with the old copy's
+  children dead, and each child `_id` is live in at most one segment, as each parent `_id` is.
 - **Statistics are global and over live documents only** (this replaces "statistics include deleted documents until
   the next build", also for one segment): N = live docs; `df` and `df_field` summed over segments minus the deleted
   docs' terms; `avg_len_f` = int64 sum of live `field_len_f` / N in float64, then float32; idf in float64 then float32.
@@ -907,3 +911,6 @@ status:
   types (the accepted point forms, WKT included; nested children validated by the nested mapping) and four rejection
   reasons (`bad_geo`, `geo_out_of_range`, `bad_nested`, `too_many_nested`). Additive. Why: the engine supported
   both (S9-4, S9-5) but intake refused them, so no geo or nested index could be created through serving.
+- 2026-11-10, architect (S9-5 fix, found by the dataplane-engineer end to end): section 4 states the rule for
+  nested children in a commit: delete files cover parents only, and children's live bits are re-derived from their
+  parents on load (`Index.from_commit` revived the children of a parent copy tombstoned by an edit). No format change.
