@@ -515,6 +515,11 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
 | `GET /indexes`, `GET /indexes/{name}` | what is loaded: segment id, version, docs, device, cache counters |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | liveness; ready once every configured index has a segment loaded (503 while loading or draining); Prometheus text (below) |
 
+- **RPC.** `python -m serving --rpc-port N` (`S3_SERVING_RPC_PORT`) also listens for length-prefixed JSON frames
+  (`serving/rpc.py`, `docs/decisions/2026-11-10-rpc-and-operator-watches.md`): request `{"id", "method", "path", "body",
+  "headers"}`, response `{"id", "status", "body", "headers"}`, with the same method and path as the HTTP route and the
+  same `App.handle`, so responses equal HTTP's (checked on the 200 conformance requests). Client: `serving.rpc.RpcClient`.
+  The `SearchIndex` Service also exposes port 9090 as `rpc`.
 - **Batching.** `_search` requests are queued per index; a worker sends up to `max_batch` of them (default 32) to one
   `Index.search_batch`, waiting at most `max_wait_ms` (default 2.0) after the first arrives. `_msearch` is one
   `search_batch` itself. If a batch raises, its requests are retried singly so a bad request fails alone.
@@ -653,3 +658,4 @@ status:
   a boundary disagreement with OpenSearch (and with a pandas mask) on float fields. No request that S1 answered is
   answered differently except a float field's exact-boundary term or range, and a fractional term on an integer field
   (now refused, before an empty answer).
+- 2026-11-10, platform-engineer: RPC serving (S7-7), additive: `rpc` listener, client, Service port 9090.

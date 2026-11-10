@@ -2,6 +2,7 @@
 
 Environment (all optional):
   S3_SEARCH_DEVICE        cpu | torch-cpu | cuda          (also read by the engine's backend; default cpu)
+  S3_SERVING_RPC_PORT     length-prefixed JSON RPC listener (serving/rpc.py); 0 or unset: off
   S3_SERVING_DATA_DIR     where indexes live: <data_dir>/<name>/{mapping.json, store.sqlite, segments/seg-*}
   S3_SERVING_PRELOAD      "name" or "name:segment_id", comma separated: loaded at start (a replica pod sets one)
   S3_SERVING_RANKERS      "name=path,..." ranker JSON files (relative to the data dir) added to every preloaded index
@@ -21,6 +22,7 @@ class ServingConfig:
     device: str | None = None
     host: str = "0.0.0.0"
     port: int = 8080
+    rpc_port: int = 0                 # 0: no RPC listener
     max_batch: int = 32
     max_wait_ms: float = 2.0
     max_queue: int = 4096
@@ -42,6 +44,7 @@ class ServingConfig:
         cfg.data_dir = e.get("S3_SERVING_DATA_DIR", cfg.data_dir)
         cfg.device = e.get("S3_SEARCH_DEVICE") or None
         cfg.port = int(e.get("S3_SERVING_PORT", cfg.port))
+        cfg.rpc_port = int(e.get("S3_SERVING_RPC_PORT", cfg.rpc_port))
         cfg.max_batch = int(e.get("S3_SERVING_MAX_BATCH", cfg.max_batch))
         cfg.max_wait_ms = float(e.get("S3_SERVING_MAX_WAIT_MS", cfg.max_wait_ms))
         cfg.cache_size = int(e.get("S3_SERVING_CACHE", cfg.cache_size))

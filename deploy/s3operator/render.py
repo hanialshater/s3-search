@@ -24,6 +24,7 @@ GPU = "nvidia.com/gpu"
 DEVICES = ("cpu", "torch-cpu", "cuda")
 SEGMENT_ID = re.compile(r"^seg-[0-9]+-[0-9a-f]{8}$")
 HTTP_PORT = 8080
+RPC_PORT = 9090
 RUN_AS = 10001
 MANAGER = "s3-operator"
 
@@ -192,6 +193,7 @@ def render_deployment(si: dict, segment_id: str) -> dict:
            {"name": "S3_SERVING_DATA_DIR", "value": "/data"},
            {"name": "S3_SERVING_PRELOAD", "value": f"{n}:{segment_id}"},
            {"name": "S3_SERVING_PORT", "value": str(HTTP_PORT)},
+           {"name": "S3_SERVING_RPC_PORT", "value": str(RPC_PORT)},
            {"name": "S3_SERVING_DRAIN_SECONDS", "value": str(DRAIN_SECONDS)}]
     for key, var in (("maxBatch", "S3_SERVING_MAX_BATCH"), ("maxWaitMs", "S3_SERVING_MAX_WAIT_MS"),
                      ("cacheSize", "S3_SERVING_CACHE")):
@@ -201,7 +203,7 @@ def render_deployment(si: dict, segment_id: str) -> dict:
     container = {
         "name": "replica", "image": s["image"], "imagePullPolicy": s.get("imagePullPolicy", "IfNotPresent"),
         "command": ["python", "-m", "serving"],
-        "ports": [{"name": "http", "containerPort": HTTP_PORT}], "env": env,
+        "ports": [{"name": "http", "containerPort": HTTP_PORT}, {"name": "rpc", "containerPort": RPC_PORT}], "env": env,
         "resources": _resources(s, gpu), "volumeMounts": mounts, "securityContext": _security(False),
         "startupProbe": {"httpGet": {**http, "path": "/healthz"}, "periodSeconds": 2, "failureThreshold": 150},
         "readinessProbe": {"httpGet": {**http, "path": "/readyz"}, "periodSeconds": 2, "failureThreshold": 2,
@@ -225,4 +227,5 @@ def render_deployment(si: dict, segment_id: str) -> dict:
 def render_service(si: dict) -> dict:
     return {"apiVersion": "v1", "kind": "Service", "metadata": _meta(si, names(si)["service"], "replica"),
             "spec": {"type": "ClusterIP", "selector": selector(si),
-                     "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}}
+                     "ports": [{"name": "http", "port": 80, "targetPort": "http"},
+                      {"name": "rpc", "port": RPC_PORT, "targetPort": "rpc"}]}}

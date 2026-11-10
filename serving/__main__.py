@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 
 from .app import create_app, make_server, serve_forever
@@ -30,12 +31,19 @@ def _serve(args: argparse.Namespace) -> int:
         cfg.device = args.device
     if args.port:
         cfg.port = args.port
+    if args.rpc_port is not None:
+        cfg.rpc_port = args.rpc_port
     if args.preload:
         cfg.preload = parse_preload(args.preload)
     app = create_app(cfg)
-    server = make_server(app)  # listen first: /healthz answers while a big segment loads, /readyz says no
-    import threading
-
+    server = make_server(app)
+    extra = ()
+    if cfg.rpc_port:
+        from .rpc import make_rpc_server
+        rpc = make_rpc_server(app, cfg.host, cfg.rpc_port)
+        threading.Thread(target=rpc.serve_forever, name="rpc", daemon=True).start()
+        extra = (rpc,)
+        logging.info("rpc on %s:%s", cfg.host, cfg.rpc_port)  # listen first: /healthz answers while a big segment loads, /readyz says no
     def load() -> None:
         try:
             app.preload()
@@ -45,7 +53,7 @@ def _serve(args: argparse.Namespace) -> int:
 
     threading.Thread(target=load, name="preload", daemon=True).start()
     logging.info("serving on %s:%s device=%s data_dir=%s", cfg.host, cfg.port, cfg.resolved_device(), cfg.data_dir)
-    serve_forever(app, server)
+    serve_forever(app, server, extra)
     return 0
 
 
@@ -74,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data-dir")
     ap.add_argument("--device")
     ap.add_argument("--port", type=int)
+    ap.add_argument("--rpc-port", type=int, dest="rpc_port")
     ap.add_argument("--preload", help="name[:segment_id][,...]")
     sub = ap.add_subparsers(dest="cmd")
     b = sub.add_parser("build", help="the indexer Job: ingest a source and build a segment")
