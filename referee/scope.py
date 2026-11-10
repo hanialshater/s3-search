@@ -9,7 +9,8 @@ The contract (`checks.check_scope`) reads only this table:
 So a construct that starts answering before the steward marks it landed fails `referee fast`, and so does a construct
 marked landed that the engine still refuses. S7's commits cannot drift from the table silently.
 
-Synonyms (S7-6) are a mapping setting, not a request construct; S7-9 checks them.
+Synonyms (S7-6) are a mapping setting, not a request construct: `MAPPING_ITEMS` below marks it, and the contract
+checks it with mappings (`contract/test_contract.py::test_synonym_mappings`, `s7_checks.check_s7_6`).
 """
 from __future__ import annotations
 
@@ -81,6 +82,10 @@ SCOPE = [
 ]
 
 
+# S7 items that are mapping settings, not request constructs: {item: landed}
+MAPPING_ITEMS = {"S7-6": True}
+
+
 def must_refuse(honor_landed: bool = True):
     """Entries the implementation must refuse: everything outside S7, and S7 items not marked landed. The reference
     index implements none of S7, so it is checked with honor_landed=False (it refuses all)."""
@@ -89,3 +94,8 @@ def must_refuse(honor_landed: bool = True):
 
 def landed():
     return [e for e in SCOPE if e[1] is not None and e[2]]
+
+
+def landed_items():
+    """Every landed S7 item, request constructs and mapping settings."""
+    return sorted({e[1] for e in landed()} | {i for i, ok in MAPPING_ITEMS.items() if ok})

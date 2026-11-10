@@ -28,7 +28,7 @@ class _Tally:
     """Counts outcomes, so the last line of `referee fast` says whether it passed and names what failed."""
 
     def __init__(self):
-        self.counts = {"passed": 0, "failed": 0, "skipped": 0, "error": 0}
+        self.counts = {"passed": 0, "failed": 0, "skipped": 0, "xfailed": 0, "error": 0}
         self.failed = []
 
     def pytest_runtest_logreport(self, report):
@@ -38,7 +38,7 @@ class _Tally:
                 self.counts[key] += 1
                 self.failed.append(report.nodeid)
             elif report.skipped:
-                self.counts["skipped"] += 1
+                self.counts["xfailed" if hasattr(report, "wasxfail") else "skipped"] += 1
             elif report.passed:
                 self.counts["passed"] += 1
 

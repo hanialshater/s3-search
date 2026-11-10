@@ -25,6 +25,7 @@ class Mapping:
     dynamic: str = "true"
     positions: bool = True                 # _meta.engine.positions (S7-1): index term positions for phrases
     source: bool = True                    # _meta.engine.source (S7-5): keep text fields' raw text, for highlight
+    synonyms: dict = field(default_factory=dict)   # S7-6: analysed token -> tuple of alternatives (query time)
 
     def kind(self, name: str) -> str | None:
         if name in self.text:
@@ -91,7 +92,46 @@ def parse_mapping(raw: dict) -> Mapping:
         for src in spec.get("inputs", []):
             if src not in props:
                 raise InvalidMapping(f"_meta.engine.embeddings.{v}.inputs", f"{src!r} is not a field")
+    synonyms = parse_synonyms(eng.get("synonyms", []))
     return Mapping(raw=raw, id_field=eng.get("id_field", "_id"), text=text, keyword=keyword, numeric=numeric,
                    vector=vector, hot=hot, k1=float(bm25.get("k1", 1.2)), b=float(bm25.get("b", 0.75)),
                    embeddings=embeddings, dynamic=str(raw.get("dynamic", "true")).lower(),
-                   positions=bool(eng.get("positions", True)), source=bool(eng.get("source", True)))
+                   positions=bool(eng.get("positions", True)), source=bool(eng.get("source", True)),
+                   synonyms=synonyms)
+
+
+def parse_synonyms(lines) -> dict:
+    """Solr-style synonym lines (S7-6), analysed with the index's analyzer: ``"a, b, c"`` makes the three
+    equivalent (each expands to all); ``"a, b => c, d"`` replaces a or b by c or d. ``#`` starts a comment. Each
+    entry must analyse to one token (multi-word synonyms are not supported). Returns token -> tuple of
+    alternatives (sorted; for an equivalence the token itself is among them)."""
+    from .analysis import analyze
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    if not isinstance(lines, list):
+        raise InvalidMapping("_meta.engine.synonyms", "a list of Solr-style lines")
+    out: dict[str, set] = {}
+
+    def one(word, i):
+        toks = analyze(word)
+        if len(toks) != 1:
+            raise InvalidMapping(f"_meta.engine.synonyms[{i}]",
+                                 f"{word.strip()!r} analyses to {len(toks)} tokens; only one-word synonyms")
+        return toks[0]
+    for i, line in enumerate(lines):
+        if not isinstance(line, str):
+            raise InvalidMapping(f"_meta.engine.synonyms[{i}]", "a string")
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=>" in line:
+            lhs, rhs = line.split("=>", 1)
+            targets = {one(w, i) for w in rhs.split(",") if w.strip()}
+            for w in lhs.split(","):
+                if w.strip():
+                    out.setdefault(one(w, i), set()).update(targets)
+        else:
+            group = {one(w, i) for w in line.split(",") if w.strip()}
+            for t in group:
+                out.setdefault(t, set()).update(group)
+    return {t: tuple(sorted(alts)) for t, alts in out.items()}
