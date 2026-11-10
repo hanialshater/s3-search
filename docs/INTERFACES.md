@@ -131,6 +131,13 @@ names.
   stopwords, Porter stemmer via `snowballstemmer`, which S1 adds to `requirements.txt`). Code:
   `engine.analysis.analyze(text: str, analyzer: str = "s3_english") -> list[str]`. The conformance suite defines the
   same analyzer in the OpenSearch index settings.
+- **Synonyms** (`_meta.engine.synonyms`, S7-6): Solr-style lines, applied at query time: `"a, b, c"` makes them
+  equivalent, `"a, b => c, d"` replaces a or b by c or d, `#` starts a comment; entries are analysed with the
+  index's analyzer and must be one token each (multi-word synonyms are `InvalidMapping`). In `match`,
+  `multi_match` and `match_bool_prefix` a term with synonyms is one clause of all its alternatives, scored as
+  Lucene's SynonymQuery (term frequencies add before saturation; the lowest idf of the alternatives); in
+  `match_phrase` a slot matches any alternative; highlight marks the alternatives. `fuzzy`, `prefix` and terms with
+  fuzziness are not expanded by synonyms.
 - **Positions** (`_meta.engine.positions`, default `true`; S7-1): index each term's positions, for phrases. Every
   word takes a position, stopwords included (dropped, leaving a gap, as Lucene's stop filter does), so
   `"red the lamp"` is red@0, lamp@2 (`engine.analysis.analyze_with_positions`).
@@ -802,3 +809,6 @@ status:
 - 2026-11-10, architect (S7-5): section 4 gains the optional source text (`src/<field>.parquet`, listed in the
   manifest's `source_fields`); section 2 gains `_meta.engine.source`; section 5 gains `highlight` (plain) and
   `function_score` with `field_value_factor` and `weight`. Additive. Why: S7.
+- 2026-11-10, architect (S7-6): section 2 gains `_meta.engine.synonyms` (query-time, one-word, Solr lines); the
+  planner turns a term with synonyms into a "synonym" clause of `LexicalGroups` (section 6). A mapping without
+  synonyms plans exactly as before. Additive. Why: S7.
