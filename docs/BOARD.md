@@ -85,7 +85,7 @@ Added by the coordinator, 2026-11-10, on the founder's ask for good feature cove
 | S7-5 | `highlight` (plain, on text fields) and `function_score` with `field_value_factor` and `weight` | architect | claimed | architect, 2026-11-10 |
 | S7-6 | Synonyms in the analyzer, defined in the mapping (query-time) | architect | claimed | architect, 2026-11-10 |
 | S7-7 | RPC serving next to HTTP; the operator on watches and a leader-election Lease | platform-engineer | in review | platform-engineer 2026-11-10 |
-| S7-8 | Demo: autocomplete, highlights, multi-select facets with `post_filter`, sort control, collapse by brand | tools-engineer | open | |
+| S7-8 | Demo: autocomplete, highlights, multi-select facets with `post_filter`, sort control, collapse by brand | tools-engineer | claimed | tools-engineer, 2026-11-10 |
 | S7-9 | Conformance families for S7's features, recorded against OpenSearch | evaluation-steward | open | |
 
 ## S8 · Fast writes (dataplane-engineer, architect, platform-engineer, evaluation-steward)
