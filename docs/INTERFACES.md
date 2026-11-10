@@ -435,6 +435,10 @@ Index.from_segment(path, device) -> Index
 | `match` / `multi_match` `fuzziness` (S7-2) | `fuzziness`, `prefix_length`, `max_expansions`, `transpositions` | each analysed query term becomes a clause of its expansions in the queried fields' dictionary; `operator` and `minimum_should_match` count clauses; fuzziness that resolves to 0 everywhere is a plain match; `cross_fields` with fuzziness is `InvalidRequest` (as OpenSearch) |
 | `query.prefix` (S7-2) | `{field: "v"}` or `{field: {"value", "boost"}}` | term-level; text fields: every indexed term of the field starting with it; keyword fields: every value starting with it; constant score `1.0 * boost` |
 | `query.match_bool_prefix` (S7-2) | `{field: "text"}` or `{field: {"query", "operator", "minimum_should_match", "max_expansions": 50, "boost"}}` | text fields; analysed terms but the last are BM25 clauses, the last is a prefix clause (its first `max_expansions` terms in term order, constant 1.0); combined like `match` |
+| `query.exists` (S7-3) | `{"field", "boost"}` | text: at least one token; keyword: a value (empty or over `ignore_above` counts as none); numeric: not missing; knn_vector: a non-zero vector; constant score |
+| `query.ids` (S7-3) | `{"values": [...], "boost"}` | the docs with these `_id`s; constant score |
+| `post_filter` (S7-3) | a query | filters the hits and `hits.total` after aggregations are computed (multi-select facets) |
+| `collapse` (S7-3) | `{"field"}`: keyword or numeric | the top hit per value in sort order (missing values form one group); from/size count groups; `hits.total` counts docs; each hit gains `"fields": {field: [value]}`; with `search_after` refused (`UnsupportedQuery`), with `rescore` `InvalidRequest` |
 | `query.neural` (S3) | `{field: {"query_text", "k"}}` | encoded by the field's encoder |
 | `query.hybrid` + `rank.rrf` (S1-5, extension) | `{"hybrid": {"queries": [...]}}`, `"rank": {"rrf": {"rank_constant": 60, "window_size": 20000}}` | RRF fusion; `_score` is the RRF score |
 | `rescore` (S1-5, extension) | `{"window_size": 1000, "s3_ranker": {"model": "<name>"}}` | the learned ranker over the top window |
@@ -783,3 +787,6 @@ status:
   `save_commit`; `engine.build.merge_segments` merges arrays (postings, positions, vectors) without re-analysis;
   `engine/commit.py` reads and writes the data plane's commit format with its checksum definition. Section 4 records
   the checksum's bytes, the shared test vector, and that commits do not carry hot-column patches.
+- 2026-11-10, architect (S7-3): section 5 gains `exists`, `ids`, `post_filter` and `collapse`; a collapsed hit
+  carries `fields`. The last `sort` value is now the doc's `first_offset` in every response (S8 ruling), and
+  `search_after` compares it. Additive. Why: S7 (multi-select facets, one hit per brand).

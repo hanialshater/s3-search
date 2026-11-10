@@ -12,13 +12,14 @@ import math
 import re
 
 from ..errors import InvalidRequest, UnsupportedQuery
-from .ast import (Agg, Fuzzy, QBool, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
+from .ast import (Agg, Fuzzy, QBool, QExists, QIds, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
 
 MAX_WINDOW = 10_000
 TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_after", "explain", "_source",
+            "post_filter", "collapse",
             "track_total_hits", "rank", "rescore"}
 QUERY_TYPES = ("match", "multi_match", "bool", "term", "terms", "range", "knn", "match_all", "hybrid", "neural",
-               "match_phrase", "fuzzy", "prefix", "match_bool_prefix")
+               "match_phrase", "fuzzy", "prefix", "match_bool_prefix", "exists", "ids")
 MULTI_MATCH_TYPES = ("best_fields", "most_fields", "cross_fields")
 
 
@@ -141,8 +142,15 @@ class Parser:
             raise InvalidRequest("explain", "a bool")
         if not isinstance(req.get("track_total_hits", True), (bool, int)):
             raise InvalidRequest("track_total_hits", "a bool or an int (totals are always exact)")
+        post = self.query(req["post_filter"], "post_filter") if "post_filter" in req else None
+        collapse = None
+        if "collapse" in req:
+            _keys(req["collapse"], {"field"}, "collapse")
+            if not isinstance(req["collapse"].get("field"), str):
+                raise InvalidRequest("collapse.field", "required: a field name")
+            collapse = req["collapse"]["field"]
         return Request(query=query, aggs=aggs, sort=sort, from_=from_, size=size, search_after=after,
-                       explain=explain, rrf=rrf, rescore=rescore)
+                       explain=explain, rrf=rrf, rescore=rescore, post_filter=post, collapse=collapse)
 
     # ---- queries
     def query(self, q, path):
@@ -152,6 +160,20 @@ class Parser:
         if kind not in QUERY_TYPES:
             raise UnsupportedQuery(f"{path}.{kind}", f"query type {kind!r} is not supported")
         return getattr(self, "q_" + kind)(body, f"{path}.{kind}")
+
+    def q_exists(self, body, path):
+        _keys(body, {"field", "boost"}, path)
+        if not isinstance(body.get("field"), str):
+            raise InvalidRequest(f"{path}.field", "required: a field name")
+        return QExists(body["field"], _num(body.get("boost", 1.0), f"{path}.boost"), path)
+
+    def q_ids(self, body, path):
+        _keys(body, {"values", "boost"}, path)
+        vals = body.get("values")
+        if not isinstance(vals, list):
+            raise InvalidRequest(f"{path}.values", "a list of ids")
+        return QIds(tuple(str(_scalar(v, f"{path}.values[{i}]")) for i, v in enumerate(vals)),
+                    _num(body.get("boost", 1.0), f"{path}.boost"), path)
 
     def q_match_all(self, body, path):
         _keys(body, {"boost"}, path)

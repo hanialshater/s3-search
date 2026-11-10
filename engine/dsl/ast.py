@@ -130,6 +130,20 @@ class QNeural:
 
 
 @dataclass(frozen=True)
+class QExists:
+    field: str
+    boost: float = 1.0
+    path: str = "query.exists"
+
+
+@dataclass(frozen=True)
+class QIds:
+    values: tuple
+    boost: float = 1.0
+    path: str = "query.ids"
+
+
+@dataclass(frozen=True)
 class QMatchAll:
     boost: float = 1.0
     path: str = "query.match_all"
@@ -141,7 +155,7 @@ class QHybrid:
     path: str = "query.hybrid"
 
 
-Query = Union[QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
+Query = Union[QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
 
 
 @dataclass(frozen=True)
@@ -171,3 +185,5 @@ class Request:
     explain: bool = False
     rrf: tuple | None = None              # (rank_constant, window_size) from rank.rrf
     rescore: tuple | None = None          # (window_size, model) from rescore.s3_ranker
+    post_filter: Any = None               # a query (S7-3): filters hits after aggregations
+    collapse: str | None = None           # a field (S7-3): the top hit per value

@@ -13,7 +13,7 @@ import numpy as np
 
 from ..errors import InvalidRequest, UnsupportedQuery
 from .. import ops
-from .nodes import Bool, Dense, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
+from .nodes import Bool, Dense, Exists, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
 
 INF = float("inf")
 
@@ -56,7 +56,8 @@ class Executor:
         lex = defaultdict(list)
         dense = defaultdict(list)
         for p in plans:
-            for n in walk(p.root):
+            roots = [p.root] + ([p.post_filter] if p.post_filter is not None else [])
+            for n in (m for r in roots for m in walk(r)):
                 if isinstance(n, Lexical):
                     lex[(n.fields, n.idf)].append(n)
                 elif isinstance(n, Dense):
@@ -128,6 +129,15 @@ class Executor:
             out = self._groups(node)
         elif isinstance(node, MatchAll):
             out = (b.full(N, node.boost, "float32"), b.full(N, True, "bool"))
+        elif isinstance(node, Exists):
+            m = st.exists_mask(node.field)
+            out = (b.where(m, node.boost, 0.0), m)
+        elif isinstance(node, Ids):
+            m = b.full(N, False, "bool")
+            slots = [st.pos[i] for i in node.values if i in st.pos]
+            if slots:
+                m[b.asarray(np.asarray(slots, np.int64), "int64")] = True
+            out = (b.where(m, node.boost, 0.0), m)
         elif isinstance(node, Term):
             m = self._term(node)
             out = (b.where(m, node.boost, 0.0), m)
@@ -396,7 +406,10 @@ class Executor:
             match = match & st.live
             score = b.where(match, score, 0.0)
             t.lap("filter" if not isinstance(plan.root, Hybrid) else "fuse")
-            total = int(b.count_nonzero(match))
+            hits_mask = match
+            if plan.post_filter is not None:             # aggregations see the query's matches, hits these
+                hits_mask = match & self.eval(plan.post_filter, {"explain": None})[1]
+            total = int(b.count_nonzero(hits_mask))
             tier = None
             if plan.rescore is not None:
                 score, tier = self._rescore(plan, score, match, ctx, t)
@@ -414,11 +427,20 @@ class Executor:
                 t.lap("facet")
             keys = self._keys(plan, score, tier)
             after = self._after_to_keys(plan, plan.search_after, tier is not None) if plan.search_after else None
-            ids, rows, extra = ops.page(b, keys, match, plan.from_, plan.size, after, extra=[score])
+            group = None
+            if plan.collapse is not None:
+                group, group_keys = self._facet_codes(plan.collapse)
+            extra_cols = [score, st.first_offset_dev] + ([group] if group is not None else [])
+            ids, rows, extra = ops.page(b, keys, hits_mask, plan.from_, plan.size, after, extra=extra_cols,
+                                        tiekey=st.first_offset_dev, collapse=group)
             score_h = [e[0] for e in extra]
-            hits = [{"_id": str(st.ids[d]), "_score": float(s),
-                     "sort": self._sort_values(plan, r, d, tier is not None)}
-                    for d, s, r in zip(ids, score_h, rows)]
+            hits = [{"_id": str(st.ids[d]), "_score": float(e[0]),
+                     "sort": self._sort_values(plan, r, int(e[1]), tier is not None)}
+                    for d, e, r in zip(ids, extra, rows)]
+            if group is not None:                        # OpenSearch: the collapse key in "fields"
+                for h, e in zip(hits, extra):
+                    c = int(e[2])
+                    h["fields"] = {plan.collapse: [None if c == 0 else group_keys[c]]}
             t.lap("page")
             resp = {"hits": {"total": total, "hits": hits}, **resp}
             if plan.explain:
