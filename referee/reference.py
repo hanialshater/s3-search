@@ -222,6 +222,8 @@ class ReferenceIndex:
                     spec = spec["value"]
                 m = self._eq(p, field, [spec])
             elif kind == "terms":
+                if not isinstance(spec, list):  # a terms lookup ({"index", "id", "path"}) is outside the subset
+                    raise UnsupportedQuery(f"{p}.{field}", "terms takes a list of values (no terms lookup)")
                 m = self._eq(p, field, list(spec))
             else:
                 _only(p + "." + field, spec, {"gte", "gt", "lte", "lt", "boost"})
@@ -392,6 +394,8 @@ class ReferenceIndex:
         return tuple(out) + (int(after[-1]),)
 
     def _agg(self, path, a, m):
+        if isinstance(a, dict) and "aggs" in a or isinstance(a, dict) and "aggregations" in a:
+            raise UnsupportedQuery(f"{path}.aggs", "sub-aggregations are outside the subset")
         if not isinstance(a, dict) or len(a) != 1:
             raise InvalidRequest(path, "an aggregation is an object with exactly one key")
         if list(a) != ["terms"]:

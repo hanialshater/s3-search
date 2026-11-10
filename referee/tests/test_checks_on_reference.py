@@ -1,4 +1,6 @@
 """The contract checks pass on the referee's reference index, so a failure on the engine is the engine's."""
+import json
+
 import pytest
 
 from referee import checks, loader, reference
@@ -23,7 +25,38 @@ def test_lexical_scores(ref, ds):
 
 
 def test_errors(ref):
-    checks.check_errors(ref, reference)
+    """The reference implements none of S7, so it refuses every construct in referee/scope.py."""
+    checks.check_errors(ref, reference, honor_landed=False)
+
+
+def test_scope_table_catches_drift(ds):
+    """A construct answered before it is marked landed fails the check, and so does one marked landed but refused."""
+    import copy
+    from referee import scope
+
+    class AnswersPhraseAndFuzzy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def search(self, r):
+            q = json.dumps(r)
+            if "match_phrase" in q or "fuzzy" in q:
+                return {"hits": {"total": 0, "hits": []}}
+            return self.inner.search(r)
+
+    with pytest.raises(AssertionError, match="fuzzy"):        # fuzzy answered, S7-2 not marked landed
+        checks.check_errors(AnswersPhraseAndFuzzy(checks.reference_for(ds)), reference)
+    saved = copy.deepcopy(scope.SCOPE)
+    try:                                                      # marked landed, but the implementation refuses it
+        scope.SCOPE[:] = [(n, i, True if i == "S7-3" else l, f, r) for n, i, l, f, r in scope.SCOPE]
+        with pytest.raises(AssertionError, match="marked landed"):
+            checks.check_landed_are_answered(checks.reference_for(ds), reference)
+    finally:
+        scope.SCOPE[:] = saved
+    names = [e[0] for e in scope.SCOPE]
+    assert len(names) == len(set(names))
+    assert {"query_string", "wildcard", "regexp", "nested", "dis_max", "constant_score", "terms lookup", "suggest",
+            "pit", "profile", "highlight keyword field"} <= {e[0] for e in scope.SCOPE if e[1] is None}
 
 
 @pytest.mark.parametrize("check", checks.ALL_INDEX_CHECKS, ids=lambda f: f.__name__)
