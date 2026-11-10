@@ -24,6 +24,35 @@ ROOT = Path(__file__).resolve().parent.parent
 CATEGORIES = ["apparel", "home", "electronics", "toys", "sports", "beauty"]
 
 
+# The same kinds of synthetic data as the steward's s9-v1 suite (referee/conformance_s9.py): 70% of products around
+# 20 city centres (Gaussian, about 30 km), 30% uniform over inhabited latitudes; 0 to 5 nested offers per product from
+# 40 sellers. Deterministic: fixed seed. Coordinates are multiples of Lucene's quantum so they are stored losslessly.
+CITIES = [(40.71, -74.01), (34.05, -118.24), (41.88, -87.63), (29.76, -95.37), (47.61, -122.33), (25.76, -80.19),
+          (51.51, -0.13), (48.86, 2.35), (52.52, 13.40), (40.42, -3.70), (41.90, 12.50), (35.68, 139.69),
+          (37.57, 126.98), (1.35, 103.82), (-33.87, 151.21), (-23.55, -46.63), (19.43, -99.13), (28.61, 77.21),
+          (30.04, 31.24), (-26.20, 28.05)]
+SELLERS = [f"seller-{i:02d}" for i in range(40)]
+GEO_SEED = 20261110
+
+
+def _locations_and_offers(n: int):
+    import numpy as np
+    lat_q, lon_q = 180.0 / 2 ** 32, 360.0 / 2 ** 32
+    rng = np.random.default_rng(GEO_SEED)
+    locs, offers = [], []
+    for _ in range(n):
+        if rng.random() < 0.7:
+            lat0, lon0 = CITIES[int(rng.integers(len(CITIES)))]
+            lat, lon = lat0 + rng.normal(0, 0.27), lon0 + rng.normal(0, 0.35)
+        else:
+            lat, lon = rng.uniform(-50, 65), rng.uniform(-179.9, 179.9)
+        lat, lon = float(np.clip(lat, -89.9, 89.9)), float(np.clip(lon, -179.99, 179.99))
+        locs.append({"lat": float(np.floor(lat / lat_q) * lat_q), "lon": float(np.floor(lon / lon_q) * lon_q)})
+        offers.append([{"seller": SELLERS[int(rng.integers(len(SELLERS)))], "price": round(float(rng.uniform(1, 500)), 2),
+                        "stock": int(rng.integers(0, 50))} for _ in range(int(rng.integers(0, 6)))])
+    return locs, offers
+
+
 def free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -32,7 +61,7 @@ def free_port() -> int:
     return port
 
 
-def catalogue(n: int | None = None, fields: bool = False):
+def catalogue(n: int | None = None, fields: bool = False, geo: bool = False):
     """(catalogue DataFrame, mapping) from the named dataset esci-sample, the first ``n`` products, optionally with the
     synthetic numeric and category columns."""
     import numpy as np
@@ -50,16 +79,21 @@ def catalogue(n: int | None = None, fields: bool = False):
         mapping["properties"].update({"price": {"type": "float"}, "stock": {"type": "integer"},
                                       "category": {"type": "keyword"}})
         mapping["_meta"]["engine"]["hot"] = ["price", "stock"]
+    if geo:  # synthetic locations and nested offers (S9-7); serving's intake must accept geo_point and nested
+        cat["location"], cat["offers"] = _locations_and_offers(len(cat))
+        mapping["properties"]["location"] = {"type": "geo_point"}
+        mapping["properties"]["offers"] = {"type": "nested", "properties": {
+            "seller": {"type": "keyword"}, "price": {"type": "float"}, "stock": {"type": "integer"}}}
     return cat, mapping
 
 
 class Stack:
-    def __init__(self, n_products: int | None = 4000, fields: bool = False, name: str = "esci-sample",
+    def __init__(self, n_products: int | None = 4000, fields: bool = False, geo: bool = False, name: str = "esci-sample",
                  port: int | None = None, cores: str | None = None):
         self.name, self.port = name, port or free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.work = Path(tempfile.mkdtemp(prefix="tools-stack-"))
-        cat, mapping = catalogue(n_products, fields)
+        cat, mapping = catalogue(n_products, fields, geo)
         cat.to_parquet(self.work / "catalogue.parquet", index=False)
         cmd = [sys.executable, "-m", "serving", "--data-dir", str(self.work / "serving"), "--port", str(self.port),
                "--device", "cpu"]
@@ -109,9 +143,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m tools.stack", description=__doc__.split("\n\n")[0])
     ap.add_argument("--products", type=int, default=None, help="first N products (default: all of esci-sample)")
     ap.add_argument("--fields", action="store_true", help="add synthetic price, stock, category")
+    ap.add_argument("--geo", action="store_true", help="add synthetic location (geo_point) and offers (nested)")
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args(argv)
-    with Stack(args.products, args.fields, port=args.port) as st:
+    with Stack(args.products, args.fields, args.geo, port=args.port) as st:
         print(st.base, flush=True)
         try:
             st.proc.wait()

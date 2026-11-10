@@ -106,7 +106,7 @@ let PAGE;
   await settle(() => page.click("#prev"));
   check(JSON.stringify(await page.$$eval("#results > li", (l) => l.map((x) => x.dataset.id))) === JSON.stringify(p1), "previous returns page 1");
 
-  if (mode === "fields") {
+  if (mode === "fields" || mode === "geo") {
     // ---- sort control from the mapping's sortable fields
     await settle(() => page.selectOption("#sort", "price:asc"));
     let ps = await prices();
@@ -137,6 +137,24 @@ let PAGE;
     await page.waitForFunction((n) => [...document.querySelectorAll("fieldset[data-field=price] .histogram .bar")].reduce((a, x) => a + +x.dataset.count, 0) === n, catTotal);
     const catCounts = await page.$$eval('.opts[data-field="category"] .count', (l) => l.map((x) => +x.textContent));
     check(catCounts.length >= 3, "the category facet lists the other categories");
+  }
+
+  if (mode === "geo") {
+    // ---- S9-7: geo filter, sort by distance, nested facets (needs serving to accept geo_point and nested)
+    check(!!(await page.$("#geo-box")) && !!(await page.$("fieldset.nested")), "geo box and nested facets shown");
+    await settle(() => page.click("#clear"));
+    await page.selectOption("#geo-place", "2");   // London
+    await settle(() => page.check("#geo-on"));
+    check(JSON.stringify(lastReq().post_filter).includes("geo_distance"), "geo_distance in post_filter");
+    const near = await summaryTotal();
+    await settle(() => page.selectOption("#sort", "geo"));
+    check(lastReq().sort[0]._geo_distance, "sorted by distance");
+    const km = (await metas()).map((t) => +t.match(/(\d+(\.\d+)?) km away/)[1]);
+    check(km.length > 0 && km.every((d, i) => i === 0 || d >= km[i - 1]) && km.every((d) => d <= 50.0001), "nearest first, within 50 km: " + km);
+    await settle(() => page.check('fieldset.nested input[type=checkbox] >> nth=0'));
+    check(JSON.stringify(lastReq().post_filter).includes('"nested"'), "nested query in post_filter");
+    check((await summaryTotal()) <= near, "the nested selection narrows the geo results");
+    await settle(() => page.click("#clear"));
   }
 
   check(!(await page.$("#error:not([hidden])")), "an error is showing");

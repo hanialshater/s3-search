@@ -75,13 +75,14 @@ def main(argv=None) -> int:
     ap.add_argument("--real", action="store_true", help="start a real serving replica over ESCI-sample instead of --api")
     ap.add_argument("--products", type=int, default=None, help="with --real: the first N products (default all)")
     ap.add_argument("--fields", action="store_true", help="with --real: add synthetic price, stock and category")
+    ap.add_argument("--geo", action="store_true", help="with --real: add synthetic locations (geo_point) and nested offers")
     ap.add_argument("--serving-cmd", help="a command that starts the serving API; stopped when this exits")
     args = ap.parse_args(argv)
 
     api, proc, stack = args.api, None, None
     if args.real:
         from tools.stack import Stack
-        stack = Stack(args.products, args.fields)
+        stack = Stack(args.products, args.fields, args.geo)
         api = stack.base
         print(f"real serving replica at {api}")
     elif args.serving_cmd:

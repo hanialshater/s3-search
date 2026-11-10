@@ -121,4 +121,4 @@ encoder stay the reference and the fallback.
 | S9-4 | Geo: the `geo_point` type, `geo_distance`, `geo_bounding_box`, `_geo_distance` sort | architect | claimed | architect, 2026-11-10 |
 | S9-5 | Nested documents: the `nested` type, the `nested` query with `score_mode`, the `nested` aggregation | architect | claimed | architect, 2026-11-10 |
 | S9-6 | Conformance families for geo and nested against OpenSearch 2.19; the Colab judges for S9-1 to S9-3 | evaluation-steward | open | |
-| S9-7 | Demo: a geo filter and nested facets | tools-engineer | open | |
+| S9-7 | Demo: a geo filter and nested facets | tools-engineer | claimed | tools-engineer, 2026-11-10 |
