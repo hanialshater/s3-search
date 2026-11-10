@@ -113,9 +113,28 @@
     }
    }
   },
-  "S9 predictions 1 to 3 (GPU)": {
+  "S9 prediction 1, CPU half": {
+   "text": "Without cuVS (the CPU container), a knn request asking for an approximate method returns exactly the exact-knn answer, and says in the response which method ran; with cuVS in Colab on ESCI-US vectors, CAGRA recall@10 against exact knn is at least 0.95 at its default search parameters, filtered CAGRA (about 10% of documents passing) at least 0.90, and IVF-PQ at least 0.90",
+   "verdict": "held (the CPU half); the GPU half (recall bars) waits for the Colab run",
+   "commit_judged": "c758c35 (S9-1 at 6d1f7f4 merged)",
+   "command": "taskset -c 0,1 python -m referee.judge_s9p1_cpu --device=cpu; and with the torch venv --device=torch-cpu",
+   "cpu": {
+    "toy_contract_check_problems": 0,
+    "requests": 1600,
+    "differ_from_exact": 0,
+    "method_not_named": 0
+   },
+   "torch-cpu": {
+    "toy_contract_check_problems": 0,
+    "requests": 1600,
+    "differ_from_exact": 0,
+    "method_not_named": 0
+   },
+   "what_was_checked": "knn on toy (cagra and ivf_pq, with and without method_parameters, filters, k 1/10/37, the list form, bad parameters refused) and 1,600 neural requests on ESCI-sample (200 fit queries, k 10 and 100, unfiltered and filtered): every answer equals exact knn (ids in order, scores 1e-6) and the response says knn.embedding = {requested: <method>, ran: exact}"
+  },
+  "S9 predictions 1 (GPU half), 2 and 3": {
    "verdict": "not judged yet",
-   "why": "the GPU halves are judged by referee/gpu_judges.py in the founder's Colab run (the notebook's S9 cell); prediction 1's CPU half is judged once S9-1 lands here"
+   "why": "judged by referee/gpu_judges.py in the founder's Colab run (the notebook's S9 cell, the only score of record)"
   }
  }
 }
