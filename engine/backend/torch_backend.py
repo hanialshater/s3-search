@@ -69,6 +69,9 @@ class TorchBackend:
     def log1p(self, a):
         return torch.log1p(a)
 
+    def amin(self, a):
+        return a.min()
+
     def isnan(self, a):
         return torch.isnan(a)
 

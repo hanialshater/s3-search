@@ -361,23 +361,57 @@ class Parser:
         return QHybrid(tuple(self.query(q, f"{path}.queries[{i}]") for i, q in enumerate(qs)), path)
 
     # ---- aggregations, sort, rescore
-    def aggs(self, body, path):
+    AGG_KEYS = {"terms": {"field", "size"}, "min": {"field"}, "max": {"field"}, "avg": {"field"}, "sum": {"field"},
+                "stats": {"field"}, "value_count": {"field"}, "cardinality": {"field"},
+                "range": {"field", "ranges"}, "histogram": {"field", "interval", "offset", "min_doc_count"}}
+
+    def aggs(self, body, path, depth=0):
         _obj(body, path)
         out = []
         for name, spec in body.items():
             p = f"{path}.{name}"
             _obj(spec, p)
-            for k in spec:
-                if k != "terms":
-                    raise UnsupportedQuery(f"{p}.{k}", "only terms aggregations, not nested"
-                                           if k in ("aggs", "aggregations") else f"aggregation {k!r} is not supported")
-            if "terms" not in spec:
-                raise InvalidRequest(p, "an aggregation needs a type (terms)")
-            t = spec["terms"]
-            _keys(t, {"field", "size"}, f"{p}.terms")
+            kinds = [k for k in spec if k not in ("aggs", "aggregations")]
+            for k in kinds:
+                if k not in self.AGG_KEYS:
+                    raise UnsupportedQuery(f"{p}.{k}", f"aggregation {k!r} is not supported")
+            if len(kinds) != 1:
+                raise InvalidRequest(p, "an aggregation has exactly one type")
+            kind = kinds[0]
+            subkey = "aggs" if "aggs" in spec else "aggregations" if "aggregations" in spec else None
+            if subkey is not None and (kind != "terms" or depth > 0):
+                raise UnsupportedQuery(f"{p}.{subkey}", "sub-aggregations only under terms, one level")
+            t = spec[kind]
+            _keys(t, self.AGG_KEYS[kind], f"{p}.{kind}")
             if not isinstance(t.get("field"), str):
-                raise InvalidRequest(f"{p}.terms.field", "required: a field name")
-            out.append(Agg(name, t["field"], _int(t.get("size", 10), f"{p}.terms.size", 1), p))
+                raise InvalidRequest(f"{p}.{kind}.field", "required: a field name")
+            params = {}
+            if kind == "terms":
+                params["size"] = _int(t.get("size", 10), f"{p}.terms.size", 1)
+            elif kind == "range":
+                rs = t.get("ranges")
+                if not isinstance(rs, list) or not rs:
+                    raise InvalidRequest(f"{p}.range.ranges", "a non-empty list of {from, to, key}")
+                ranges = []
+                for i, r in enumerate(rs):
+                    _keys(r, {"from", "to", "key"}, f"{p}.range.ranges[{i}]")
+                    lo = None if r.get("from") is None else _num(r["from"], f"{p}.range.ranges[{i}].from")
+                    hi = None if r.get("to") is None else _num(r["to"], f"{p}.range.ranges[{i}].to")
+                    key = r.get("key")
+                    if key is not None and not isinstance(key, str):
+                        raise InvalidRequest(f"{p}.range.ranges[{i}].key", "a string")
+                    ranges.append((lo, hi, key))
+                params["ranges"] = tuple(ranges)
+            elif kind == "histogram":
+                if "interval" not in t:
+                    raise InvalidRequest(f"{p}.histogram.interval", "required")
+                iv = _num(t["interval"], f"{p}.histogram.interval")
+                if iv <= 0:
+                    raise InvalidRequest(f"{p}.histogram.interval", "must be > 0")
+                params.update(interval=iv, offset=_num(t.get("offset", 0.0), f"{p}.histogram.offset"),
+                              min_doc_count=_int(t.get("min_doc_count", 0), f"{p}.histogram.min_doc_count"))
+            sub = self.aggs(spec[subkey], f"{p}.{subkey}", depth + 1) if subkey else ()
+            out.append(Agg(name, t["field"], kind, tuple(sorted(params.items())), sub, p))
         return tuple(out)
 
     def sort(self, body, path):

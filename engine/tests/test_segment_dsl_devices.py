@@ -65,7 +65,7 @@ def test_save_keeps_patches_and_deletes(segment, tmp_path):
     ({"query": {"regexp": {"product_title": "sho.*"}}}, "query.regexp"),
     ({"query": {"bool": {"must": [{"wildcard": {"product_title": "sh*"}}]}}}, "query.bool.must[0].wildcard"),
     ({"query": {"match_all": {}}, "suggest": {}}, "suggest"),
-    ({"aggs": {"x": {"avg": {"field": "price"}}}}, "aggs.x.avg"),
+    ({"aggs": {"x": {"geo_bounds": {"field": "price"}}}}, "aggs.x.geo_bounds"),
     ({"query": {"multi_match": {"query": "x", "type": "phrase"}}}, "query.multi_match.type"),
     ({"query": {"match": {"product_title": {"query": "x", "lenient": True}}}}, "query.match.product_title.lenient"),
 ])
