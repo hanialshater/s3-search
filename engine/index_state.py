@@ -26,12 +26,47 @@ BATCH = 64            # the executor's lexical batch; it sets the working set th
 
 
 class KeywordState:
-    def __init__(self, b: Backend, codes: np.ndarray, values: list[str]):
+    """A keyword field's global dictionary (values[0] == "", the rest sorted: code order is value order) and its
+    codes per slot (host and device)."""
+
+    def __init__(self, b: Backend, codes: np.ndarray, values: list[str], codes_dev=None):
         self.codes_host = np.asarray(codes, np.int32)
-        self.codes = b.asarray(self.codes_host, "int64")
+        self.codes = codes_dev if codes_dev is not None else b.asarray(self.codes_host, "int64")
         self.values = list(values)
-        self.code_of = {v: i for i, v in enumerate(self.values)}
+        self._sorted = np.array(self.values[1:], dtype=object)
+        self._code_of = None
         self._toks = None
+
+    @property
+    def code_of(self) -> dict:
+        if self._code_of is None:
+            self._code_of = {v: i for i, v in enumerate(self.values)}
+        return self._code_of
+
+    def lookup(self, vals) -> np.ndarray:
+        """Codes of ``vals`` (-1 for a value not in the dictionary), by binary search: no dictionary rebuild."""
+        vals = np.array([str(v) for v in vals], dtype=object)
+        if not len(vals) or not len(self._sorted):
+            return np.full(len(vals), -1, np.int64)
+        pos = np.searchsorted(self._sorted, vals)
+        ok = pos < len(self._sorted)
+        ok[ok] = self._sorted[pos[ok]] == vals[ok]
+        return np.where(ok, pos + 1, -1).astype(np.int64)
+
+    def insert(self, b, new_values) -> np.ndarray:
+        """Add values (not yet present) to the sorted dictionary; returns old code -> new code, and remaps the
+        codes in place."""
+        new = np.array(sorted(set(new_values)), dtype=object)
+        at = np.searchsorted(self._sorted, new)
+        self._sorted = np.insert(self._sorted, at, new)
+        self.values = [""] + self._sorted.tolist()
+        old = np.arange(1, len(self._sorted) - len(new) + 1)
+        remap = np.concatenate([[0], old + np.searchsorted(at, old - 1, side="right")]).astype(np.int64)
+        self.codes_host = remap[self.codes_host.astype(np.int64)].astype(np.int32)
+        self.codes = b.asarray(remap, "int64")[self.codes]
+        self._code_of = None
+        self._toks = None
+        return remap
 
     @property
     def n(self) -> int:
@@ -114,6 +149,22 @@ class Part:
         self.live_local = self.live_slot = np.zeros(0, np.int64)
         self.identity = False
         self.gid = np.zeros(0, np.int64)
+        self.gid_dev = None
+        self._doc_post = None
+        self.doc_postings(np.zeros(0, np.int64))           # build the doc -> postings view now, at load (S8-2b)
+
+    def doc_postings(self, locs: np.ndarray) -> np.ndarray:
+        """The postings (indices) of local docs ``locs``, through a doc -> postings view built on first use."""
+        if self._doc_post is None:
+            order = np.argsort(self.host_doc_ids, kind="stable")
+            ptr = np.zeros(self.n + 1, np.int64)
+            ptr[1:] = np.cumsum(np.bincount(self.host_doc_ids, minlength=self.n))
+            self._doc_post = (ptr, order)
+        ptr, order = self._doc_post
+        locs = np.asarray(locs, np.int64)
+        n = ptr[locs + 1] - ptr[locs]
+        idx = np.arange(int(n.sum()), dtype=np.int64) + np.repeat(ptr[locs] - (np.cumsum(n) - n), n)
+        return order[idx]
 
     def positions(self):
         """``(pos_ptr int64[P+1], positions int32[T])`` on the device, moved there on first use (a phrase)."""
@@ -247,6 +298,9 @@ class IndexState:
                 df_field[:, f] += np.bincount(g[tfl[:, f]], minlength=G)
             field_len[slots_k] = p.host_field_len[li[slots_k]]
         self.host_df, self.host_df_field = df, df_field
+        self.field_len_sum = field_len.sum(axis=0, dtype=np.int64)
+        self.host_live = np.ones(N, bool)
+        self.max_fo = int(fo.max()) if N else -1
         self.host_idf = _idf(N, df)
         self.host_idf_field = _idf(N, df_field) if F else np.zeros((G, 0), np.float32)
         avg = ((field_len.sum(axis=0, dtype=np.int64) / N).astype(np.float32) if N else np.zeros(F, np.float32))
@@ -259,6 +313,7 @@ class IndexState:
             p.N, p.rel_len = N, self.rel_len
             p.host_idf, p.host_idf_field = self.host_idf[p.gid], self.host_idf_field[p.gid]
             p.idf, p.idf_field = b.asarray(p.host_idf, "float32"), b.asarray(p.host_idf_field, "float32")
+            p.gid_dev = b.asarray(p.gid, "int64")
             p.identity = len(self.parts) == 1 and p.n == N
             if p.identity:
                 p.doc_ids, p.post_live = p.doc_ids_local, None
@@ -377,10 +432,234 @@ class IndexState:
         return n
 
     def delete(self, ids) -> None:
-        """Ids must be known (the caller checks); already-deleted ids are a no-op. Statistics are live-only, so a
-        delete relays out the index (equal to a rebuild)."""
-        if self.tombstone(ids):
+        """Ids must be known (the caller checks); already-deleted ids are a no-op. Statistics are live-only and
+        updated incrementally (equal to a rebuild)."""
+        self.delete_incremental(ids)
+
+    # ---- incremental changes (S8-2b): no full relayout per refresh
+    def _kill(self, slots) -> None:
+        """Tombstone the live docs in ``slots`` (an int array): their parts' live bits, the postings mask, the
+        global statistics (their terms and lengths subtracted), the slot's live bit and the _id map."""
+        slots = np.asarray(sorted(set(int(s) for s in slots)), np.int64)
+        if not len(slots):
+            return
+        b, F = self.b, len(self.text_fields)
+        G = len(self.vocab_list)
+        for k in np.unique(self.slot_part[slots]):
+            p = self.parts[int(k)]
+            sel = slots[self.slot_part[slots] == k]
+            locs = self.slot_local[sel]
+            posts = p.doc_postings(locs)
+            g = p.gid[p.term_of_posting[posts]]
+            self.host_df -= np.bincount(g, minlength=G)
+            tfl = p.host_tf[posts] > 0
+            for f in range(F):
+                self.host_df_field[:, f] -= np.bincount(g[tfl[:, f]], minlength=G)
+            self.field_len_sum -= p.host_field_len[locs].sum(axis=0, dtype=np.int64)
+            p.local_live[locs] = False
+            p.slot_of_local[locs] = -1
+            if p.post_live is None:
+                p.post_live = b.full(len(p.host_doc_ids), True, "bool")
+            if len(posts):
+                p.post_live[b.asarray(posts, "int64")] = False
+            p.identity = False
+            p.live_local = np.flatnonzero(p.slot_of_local >= 0)
+            p.live_slot = p.slot_of_local[p.live_local]
+        self.host_live[slots] = False
+        self.live[b.asarray(slots, "int64")] = False
+        for s in slots.tolist():
+            self.pos.pop(self.ids[s], None)
+        self.n_live -= len(slots)
+
+    def _append_terms(self, p: "Part") -> None:
+        """Global term ids are append-only: the new segment's unseen terms get the next ids."""
+        new = [w for w in p.vocab_list if w not in self.vocab]
+        if new:
+            base = len(self.vocab_list)
+            if self.vocab is self.parts[0].vocab or isinstance(self.vocab_list, list) and \
+                    self.vocab_list is self.parts[0].vocab_list:
+                self.vocab, self.vocab_list = dict(self.vocab), list(self.vocab_list)
+            for i, w in enumerate(new):
+                self.vocab[w] = base + i
+            self.vocab_list.extend(new)
+            F = len(self.text_fields)
+            self.host_df = np.concatenate([self.host_df, np.zeros(len(new))])
+            self.host_df_field = np.concatenate([self.host_df_field, np.zeros((len(new), F))])
+        p.gid = np.fromiter((self.vocab[w] for w in p.vocab_list), np.int64, len(p.vocab_list))
+        p.gid_dev = self.b.asarray(p.gid, "int64")
+
+    def _place(self, p: "Part", reuse: dict, append: bool) -> bool:
+        """Give the live docs of a new part their slots: ``reuse`` (_id -> slot) for edited keys and merged docs,
+        new slots at the end for the rest (``append``), or dead when not ``append``. Returns False when appending
+        would break first_offset order (the caller then relays out in full)."""
+        b, F = self.b, len(self.text_fields)
+        live = np.flatnonzero(p.local_live)
+        ids = p.ids
+        reuse_loc = np.array([i for i in live.tolist() if ids[i] in reuse], np.int64)
+        rest = np.array([i for i in live.tolist() if ids[i] not in reuse], np.int64)
+        if len(rest) and not append:
+            p.local_live[rest] = False
+            rest = rest[:0]
+        if len(rest):
+            fo = p.first_offset[rest]
+            if (np.diff(fo) <= 0).any() or fo[0] <= self.max_fo:
+                return False
+        k = len(self.parts)
+        self._append_terms(p)
+        self.parts.append(p)
+        self.known.update(p.local_of)
+        reuse_slot = np.array([reuse[ids[i]] for i in reuse_loc.tolist()], np.int64)
+        N0, a = self.N, len(rest)
+        app_slot = np.arange(N0, N0 + a, dtype=np.int64)
+        # grow the slot-ordered columns
+        if a:
+            self.N = N0 + a
+            self.slot_part = np.concatenate([self.slot_part, np.full(a, k, np.int64)])
+            self.slot_local = np.concatenate([self.slot_local, rest])
+            self.first_offset = np.concatenate([self.first_offset, p.first_offset[rest]])
+            self.first_offset_dev = b.concatenate([self.first_offset_dev, b.asarray(p.first_offset[rest], "int64")])
+            self.max_fo = int(p.first_offset[rest][-1])
+            self.ids = np.concatenate([self.ids, np.asarray(ids[rest], dtype=object)])
+            self.host_live = np.concatenate([self.host_live, np.ones(a, bool)])
+            self.live = b.concatenate([self.live, b.full(a, True, "bool")])
+            self.host_field_len = np.concatenate([self.host_field_len, p.host_field_len[rest]])
+            for f in self.numerics:
+                self.numerics[f] = b.concatenate([self.numerics[f], p.numerics[f][b.asarray(rest, "int64")]])
+                self.missing[f] = b.concatenate([self.missing[f], p.missing[f][b.asarray(rest, "int64")]])
+        if len(reuse_loc):
+            self.slot_part[reuse_slot] = k
+            self.slot_local[reuse_slot] = reuse_loc
+            self.host_live[reuse_slot] = True
+            rs, rl = b.asarray(reuse_slot, "int64"), b.asarray(reuse_loc, "int64")
+            self.live[rs] = True
+            self.host_field_len[reuse_slot] = p.host_field_len[reuse_loc]
+            for f in self.numerics:
+                self.numerics[f][rs] = p.numerics[f][rl]
+                self.missing[f][rs] = p.missing[f][rl]
+        slot_of = np.full(p.n, -1, np.int64)
+        slot_of[reuse_loc] = reuse_slot
+        slot_of[rest] = app_slot
+        p.slot_of_local = slot_of
+        mapped = b.asarray(slot_of, "int64")[p.doc_ids_local] if len(p.host_doc_ids) else p.doc_ids_local
+        p.post_live = mapped >= 0
+        p.doc_ids = b.where(p.post_live, mapped, 0)
+        p.live_local = np.flatnonzero(slot_of >= 0)
+        p.live_slot = slot_of[p.live_local]
+        p.identity = False
+        for i, s in zip(p.ids[p.live_local].tolist(), p.live_slot.tolist()):
+            self.pos[i] = s
+        # statistics: the new live docs' terms and lengths
+        G = len(self.vocab_list)
+        post_live = p.local_live[p.host_doc_ids] if len(p.host_doc_ids) else np.zeros(0, bool)
+        g = p.gid[p.term_of_posting[post_live]]
+        self.host_df += np.bincount(g, minlength=G)
+        tfl = p.host_tf[post_live] > 0
+        for f in range(F):
+            self.host_df_field[:, f] += np.bincount(g[tfl[:, f]], minlength=G)
+        self.field_len_sum += p.host_field_len[p.live_local].sum(axis=0, dtype=np.int64)
+        self.n_live += len(p.live_local)
+        # keyword dictionaries: the delta's values map into the global dictionary by binary search; values never
+        # seen before are inserted in order and the old codes remapped (code order stays value order)
+        for f, kw in self.keywords.items():
+            vals = p.keyword_values[f]
+            local = kw.lookup(vals)
+            local[0] = 0
+            if (local[1:] < 0).any():
+                kw.insert(b, [v for v, c in zip(vals[1:], local[1:]) if c < 0])
+                local = kw.lookup(vals)
+                local[0] = 0
+            if a:
+                add = local[p.keyword_codes[f][rest]]
+                kw.codes_host = np.concatenate([kw.codes_host, add.astype(np.int32)])
+                kw.codes = b.concatenate([kw.codes, b.asarray(add, "int64")])
+            if len(reuse_loc):
+                c = local[p.keyword_codes[f][reuse_loc]]
+                kw.codes_host[reuse_slot] = c
+                kw.codes[b.asarray(reuse_slot, "int64")] = b.asarray(c, "int64")
+        return True
+
+    def _finish(self) -> None:
+        """After incremental changes: idf, relative lengths and the parts' views of them, and the caches."""
+        b = self.b
+        N = self.n_live
+        self.host_idf = _idf(N, self.host_df)
+        self.host_idf_field = _idf(N, self.host_df_field) if len(self.text_fields) else self.host_idf_field
+        self.idf = b.asarray(self.host_idf, "float32")
+        self.idf_field = b.asarray(self.host_idf_field, "float32")
+        avg = (self.field_len_sum / N).astype(np.float32) if N else np.zeros(len(self.text_fields), np.float32)
+        self.host_rel_len = (self.host_field_len / np.where(avg > 0, avg, 1.0)).astype(np.float32)
+        self.rel_len = b.asarray(self.host_rel_len, "float32")
+        for p in self.parts:
+            p.N, p.rel_len = self.N, self.rel_len
+            p.idf, p.idf_field = self.idf[p.gid_dev], self.idf_field[p.gid_dev]
+            p.host_idf, p.host_idf_field = self.host_idf[p.gid], self.host_idf_field[p.gid]
+        self.vectors = {f: True for f in self.parts[0].vectors if all(f in p.vectors for p in self.parts)}
+        self.device_nbytes = sum(p.device_nbytes for p in self.parts)
+        self.work_nbytes = BATCH * max(self.N, 1) * 4 * 2
+        self._static = None
+        self._value_codes = {}
+        self._dictionary = None
+        self._exists = {}
+        if self.N - self.n_live > max(1024, self.N // 2):   # too many holes: compact (renumbers slots in order)
             self._relayout()
+
+    def add_part(self, p: "Part", delete_ids=()) -> None:
+        """S8-2b: add a segment incrementally. Edited keys (same first_offset) keep their slot; new keys take new
+        slots at the end; tombstones subtract their docs from the statistics."""
+        self.check_part(p)
+        for f, e in p.seg.encoders.items():
+            self.encoders.setdefault(f, TfidfSvdEncoder.from_arrays(e))
+        reuse = {}
+        for i in np.flatnonzero(p.local_live).tolist():
+            s = self.pos.get(p.ids[i])
+            if s is not None and self.first_offset[s] == p.first_offset[i]:
+                reuse[p.ids[i]] = s
+        self._kill([self.pos[i] for i in set(delete_ids) | set(p.ids.tolist()) if i in self.pos])
+        if not self._place(p, reuse, append=True):
+            if p not in self.parts:
+                self.parts.append(p)
+            self._relayout()
+            return
+        self._finish()
+
+    def replace_parts(self, old: list, p: "Part | None", delete_ids=()) -> None:
+        """S8-2b: replace segments by their merge (or drop them): the merged docs keep their slots; the
+        statistics change only by docs that were in one and not the other."""
+        captured = {}
+        for q in old:
+            for loc, s in zip(q.live_local.tolist(), q.live_slot.tolist()):
+                captured[q.ids[loc]] = s
+        if p is not None:
+            for i in delete_ids:
+                loc = p.local_of.get(i)
+                if loc is not None:
+                    p.local_live[loc] = False
+            reuse = {i: s for i, s in captured.items()
+                     if i in p.local_of and p.local_live[p.local_of[i]] and
+                     self.first_offset[s] == p.first_offset[p.local_of[i]]}
+        self._kill(list(captured.values()))
+        keep = [q for q in self.parts if q not in old]
+        remap = np.full(len(self.parts) + 1, -1, np.int64)
+        for new_k, q in enumerate(keep):
+            remap[self.parts.index(q)] = new_k
+        live_parts = self.slot_part[self.host_live]
+        assert (remap[live_parts] >= 0).all()
+        self.slot_part = np.where(self.host_live, remap[self.slot_part], 0)
+        self.parts = keep
+        if p is not None:
+            self.check_part(p)
+            if not self._place(p, reuse, append=False):
+                self._relayout()
+                return
+        if not self.parts:
+            raise ValueError("an index needs at least one segment")
+        self._finish()
+
+    def delete_incremental(self, ids) -> None:
+        slots = [self.pos[i] for i in ids if i in self.pos]
+        if slots:
+            self._kill(slots)
+            self._finish()
 
     def value_codes(self, field: str):
         """For a numeric field: ``(codes int64[N] on the device, 0 = missing; keys list)``, codes in ascending value
@@ -404,7 +683,7 @@ class IndexState:
             mf = self.match_fields()
             if mf:
                 kw = self.keywords[mf[0]]
-                cnt = np.bincount(kw.codes_host, minlength=kw.n).astype(np.float32)
+                cnt = np.bincount(kw.codes_host[self.host_live], minlength=kw.n).astype(np.float32)
                 cnt[0] = 0
                 cols.append(np.log1p(cnt[kw.codes_host])[:, None])
             self._static = self.b.asarray(np.concatenate(cols, axis=1).astype(np.float32), "float32")
