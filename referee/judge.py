@@ -154,13 +154,119 @@ def judge_s2(out_path):
     return res
 
 
+# ---- a real serving replica over HTTP -------------------------------------------------------------------------------
+
+class Server:
+    """`python -m serving` in a subprocess on 2 cores, and a small JSON client for it."""
+
+    def __init__(self, data_dir, port=None):
+        import socket
+        import subprocess
+        import os
+        if port is None:
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+        self.port, self.base = port, f"http://127.0.0.1:{port}"
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "S3_SEARCH_DEVICE": "cpu"}
+        self.proc = subprocess.Popen(["taskset", "-c", "0,1", sys.executable, "-m", "serving", "--data-dir",
+                                      str(data_dir), "--port", str(port), "--device", "cpu"],
+                                     cwd=Path(__file__).resolve().parent.parent, env=env,
+                                     stdout=subprocess.DEVNULL, stderr=open(Path(data_dir) / "serving.log", "w"))
+        for _ in range(200):
+            try:
+                self.call("GET", "/healthz")
+                return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("serving did not start")
+
+    def call(self, method, path, body=None, timeout=600):
+        import urllib.request
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"null")
+
+    def msearch(self, name, reqs, batch=64):
+        out = []
+        for i in range(0, len(reqs), batch):
+            out += self.call("POST", f"/indexes/{name}/_msearch", reqs[i:i + batch])
+        return out
+
+    def close(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(10)
+        except Exception:
+            self.proc.kill()
+
+
+def _key(resp):
+    return (resp["hits"]["total"], [(h["_id"], h["_score"]) for h in resp["hits"]["hits"]])
+
+
+def judge_s4b(out_path):
+    res = {"kind": "judge-s4b", "label": "CPU, development only", "dataset": "esci-sample"}
+    ds = loader.load_dataset("esci-sample")
+    work = Path(tempfile.mkdtemp(prefix="judge-s4b-"))
+    src = work / "esci-sample.parquet"
+    ds.catalogue.to_parquet(src, index=False)
+    reqs = fit_requests(ds, size=100)
+    srv = Server(work / "serving")
+    try:
+        t = time.perf_counter()
+        created = srv.call("PUT", "/indexes/esci", {"mapping": ds.mapping, "source": {"path": str(src)}})
+        res["create"] = {"s": time.perf_counter() - t, "response": created}
+        v1 = created["segment_id"]
+        r1 = [_key(r) for r in srv.msearch("esci", reqs)]
+        # A change only a segment carries: new text for 300 products (upserts are pending until a reindex).
+        rng = np.random.default_rng(HOT_SEED + 1)
+        rows = ds.catalogue.iloc[np.sort(rng.choice(len(ds.catalogue), 300, replace=False))]
+        changes = []
+        for rec in rows.to_dict("records"):
+            doc = {k: (None if (isinstance(v, float) and v != v) else v) for k, v in rec.items()}
+            doc["product_title"] = "zzrollback " + str(doc.get("product_title") or "")
+            doc["product_description"] = None
+            changes.append({"op": "upsert", "_id": doc["product_id"], "doc": doc})
+        res["docs"] = {k: v for k, v in srv.call("POST", "/indexes/esci/_docs", changes).items() if k != "rejected"}
+        t = time.perf_counter()
+        re2 = srv.call("POST", "/indexes/esci/_reindex", {})
+        res["reindex"] = {"s": time.perf_counter() - t, "response": re2}
+        r2 = [_key(r) for r in srv.msearch("esci", reqs)]
+        n_changed = sum(a != b for a, b in zip(r1, r2))
+        res["versions_before"] = srv.call("GET", "/indexes/esci/versions")
+        t = time.perf_counter()
+        rb = srv.call("POST", "/indexes/esci/_rollback", {"segment_id": v1})
+        rollback_s = time.perf_counter() - t
+        r3 = [_key(r) for r in srv.msearch("esci", reqs)]
+        differ = [i for i, (a, b) in enumerate(zip(r1, r3)) if a != b]
+        res["versions_after"] = srv.call("GET", "/indexes/esci/versions")
+        res["S4-b"] = {"rollback_s": rollback_s, "response": rb, "v1": v1, "v2": re2.get("segment_id"),
+                       "fit_queries": len(reqs), "changed_by_v2": n_changed, "differ_after_rollback_vs_v1": len(differ),
+                       "examples": [reqs[i] for i in differ[:3]],
+                       "verdict": "held" if rollback_s < 10 and not differ and n_changed > 0 and rb["segment_id"] == v1
+                       else "wrong"}
+    finally:
+        srv.close()
+    s = res["S4-b"]
+    print(f"S4-b: rollback {s['rollback_s']:.2f} s over HTTP; v2 changed {s['changed_by_v2']} of {s['fit_queries']} "
+          f"fit queries; after rollback {s['differ_after_rollback_vs_v1']} differ from v1 -> {s['verdict']}", flush=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps(res, indent=1, default=str) + "\n")
+    return res
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee.judge")
     ap.add_argument("what", choices=("s2", "s4b", "s5a", "s5b"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
     out = a.out or f"results/judge-{a.what}.json"
-    {"s2": judge_s2}[a.what](out)
+    {"s2": judge_s2, "s4b": judge_s4b}[a.what](out)
     return 0
 
 
