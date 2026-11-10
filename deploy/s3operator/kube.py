@@ -36,6 +36,7 @@ PVC = Res("v1", "persistentvolumeclaims", "PersistentVolumeClaim")
 CONFIGMAP = Res("v1", "configmaps", "ConfigMap")
 POD = Res("v1", "pods", "Pod")
 SEARCHINDEX = Res(API_VERSION, "searchindexes", "SearchIndex")
+LEASE = Res("coordination.k8s.io/v1", "leases", "Lease")
 
 
 class ApiError(Exception):
@@ -93,6 +94,39 @@ class Kube:
         out = self.request("GET", res.collection(namespace),
                            params={"labelSelector": label_selector} if label_selector else None)
         return out.get("items", [])
+
+    def list_with_version(self, res: Res, namespace: str | None = None,
+                          label_selector: str | None = None) -> tuple[list[dict], str]:
+        out = self.request("GET", res.collection(namespace),
+                           params={"labelSelector": label_selector} if label_selector else None)
+        return out.get("items", []), out.get("metadata", {}).get("resourceVersion", "")
+
+    def watch(self, res: Res, namespace: str | None, resource_version: str, label_selector: str | None = None,
+              timeout_seconds: int = 300):
+        """Yield watch events ``{"type", "object"}`` until the server closes the stream (after ``timeout_seconds``).
+        Raises ApiError(410) when ``resource_version`` is too old: the caller lists again."""
+        params = {"watch": "1", "resourceVersion": resource_version, "timeoutSeconds": str(timeout_seconds),
+                  "allowWatchBookmarks": "true"}
+        if label_selector:
+            params["labelSelector"] = label_selector
+        url = self.server + res.collection(namespace) + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url)
+        req.add_header("Accept", "application/json")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            resp = urllib.request.urlopen(req, context=self._ctx, timeout=timeout_seconds + 10)
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, e.read().decode(errors="replace")) from None
+        with resp:
+            for line in resp:
+                if not line.strip():
+                    continue
+                ev = json.loads(line)
+                if ev.get("type") == "ERROR":
+                    obj = ev.get("object") or {}
+                    raise ApiError(obj.get("code", 500), obj.get("message", "watch error"))
+                yield ev
 
     def apply(self, res: Res, obj: dict) -> dict:
         """Create or update to exactly ``obj`` for the fields we set (server-side apply, field manager s3-operator)."""
