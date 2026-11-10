@@ -401,6 +401,10 @@ Index.from_segment(path, device) -> Index
 | `query.knn` | `{field: {"vector": [...], "k": int, "filter": query}}` | exact; `_score = (1 + cos) / 2` (OpenSearch `cosinesimil`); `filter` is a pre-filter |
 | `query.match_all` | `{}` | score 1.0 |
 | `query.match_phrase` (S7-1) | `{field: "text"}` or `{field: {"query", "slop": 0, "boost"}}` | text fields with positions; Lucene's rule: some choice of one position per term with `max(v) - min(v) <= slop`, `v = position - query offset` (stopwords keep their offsets); score = BM25 with the phrase frequency as tf and the sum of the terms' field idf (with slop > 0 the frequency is `sum 1 / (1 + matchLength)` over matching starts, an approximation of Lucene's); on a keyword or numeric field it is a `term` |
+| `query.fuzzy` (S7-2) | `{field: "v"}` or `{field: {"value", "fuzziness": "AUTO", "prefix_length": 0, "max_expansions": 50, "transpositions": true, "boost"}}` | term-level (the value is not analysed); expanded in the field's terms dictionary (`engine/dictionary.py`): Levenshtein, adjacent transpositions count 1, at most 2 edits, `AUTO` = 0 / 1 / 2 edits for 1-2 / 3-5 / 6+ characters (`AUTO:low,high` too), the `max_expansions` most similar terms (ties by term order); text fields: the BM25 scores of the expansions present add (Lucene blends their df; ours does not); keyword fields: a term over the expanded values (constant score); numeric fields refused |
+| `match` / `multi_match` `fuzziness` (S7-2) | `fuzziness`, `prefix_length`, `max_expansions`, `transpositions` | each analysed query term becomes a clause of its expansions in the queried fields' dictionary; `operator` and `minimum_should_match` count clauses; fuzziness that resolves to 0 everywhere is a plain match; `cross_fields` with fuzziness is `InvalidRequest` (as OpenSearch) |
+| `query.prefix` (S7-2) | `{field: "v"}` or `{field: {"value", "boost"}}` | term-level; text fields: every indexed term of the field starting with it; keyword fields: every value starting with it; constant score `1.0 * boost` |
+| `query.match_bool_prefix` (S7-2) | `{field: "text"}` or `{field: {"query", "operator", "minimum_should_match", "max_expansions": 50, "boost"}}` | text fields; analysed terms but the last are BM25 clauses, the last is a prefix clause (its first `max_expansions` terms in term order, constant 1.0); combined like `match` |
 | `query.neural` (S3) | `{field: {"query_text", "k"}}` | encoded by the field's encoder |
 | `query.hybrid` + `rank.rrf` (S1-5, extension) | `{"hybrid": {"queries": [...]}}`, `"rank": {"rrf": {"rank_constant": 60, "window_size": 20000}}` | RRF fusion; `_score` is the RRF score |
 | `rescore` (S1-5, extension) | `{"window_size": 1000, "s3_ranker": {"model": "<name>"}}` | the learned ranker over the top window |
@@ -487,6 +491,8 @@ equal shapes into one batch).
 ```python
 Node = Lexical | Dense | Term | Range | MatchAll | Bool | Hybrid
 Lexical(fields: tuple[tuple[str, float], ...], terms: tuple[str, ...], operator: str, msm: int, idf: "global"|"field", boost: float)
+LexicalGroups(fields, groups: tuple[tuple[str, ...], ...], modes: tuple["sum"|"synonym"|"const", ...], msm, idf, boost)  # S7-2
+Phrase(field, slots: tuple[tuple[str, ...], ...], offsets: tuple[int, ...], slop: int, boost)                           # S7-1
 Dense(field: str, vector: tuple[float, ...] | None, text: str | None, k: int, filter: Node | None, boost: float)
 Term(field: str, values: tuple)            Range(field: str, lo, hi, lo_inc: bool, hi_inc: bool)
 MatchAll(boost: float)                    Bool(must, should, filter, must_not: tuple[Node, ...], msm: int, boost: float)
@@ -531,6 +537,9 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
 | `POST /indexes/{name}/_reindex` | `{}` → `{"segment_id", "version"}`: build from the store, swap |
 | `GET /indexes/{name}/versions` | → `[{"segment_id", "version", "created", "live": bool}]` |
 | `POST /indexes/{name}/_rollback` | `{"segment_id"}` → `{"segment_id", "version"}`: swap to a kept segment, replay the log after it |
+| `POST /indexes/{name}/_bulk` | OpenSearch NDJSON (`index`, `create`, `update` with a partial `doc` / `doc_as_upsert` / `upsert`, `delete`; `?refresh=false\|true\|wait_for`) → `{"took", "errors", "items": [{op: {"_index", "_id", "status", "result", "_seq_no"} \| {..., "error": {"type", "reason", "s3_reason", "field"}}}]}`; see **Bulk** below |
+| `POST /indexes/{name}/_refresh` | `{}` → `{"refreshed", "segment_id", "version"}`: make every stored upsert visible now |
+| `GET`, `PUT /indexes/{name}/_settings` | `{"index": {"refresh_interval": "1s"}}` (`500ms`, `5s`, `2m`, `-1` = no background refresh); default `S3_SERVING_REFRESH_INTERVAL` = `1s`; stored in `<index>/settings.json` |
 | `GET /indexes/{name}/_mapping` | → `{name: {"mappings": <the mapping>, "s3_fields": {field: {"type", "searchable", "filterable", "facetable", "sortable", "dense", "hot"[, "dimension"]}}}}`; sub-fields appear as `f.keyword`. Facetable = keyword; filterable and sortable = keyword and numeric/boolean; searchable = text |
 | `POST /indexes/{name}/_rankers` | `{"name", "path"}` → `{"name", "rankers": [...]}`: loads a ranker file (the JSON of `GBDT.to_dict()`; `engine.api` has no save/load of its own, so this is interim) from under the serving data dir into `Index.add_ranker`; kept across swaps. At startup: `S3_SERVING_RANKERS=name=path,...` |
 | `GET /indexes`, `GET /indexes/{name}` | what is loaded: segment id, version, docs, device, cache counters |
@@ -541,6 +550,30 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
   "headers"}`, response `{"id", "status", "body", "headers"}`, with the same method and path as the HTTP route and the
   same `App.handle`, so responses equal HTTP's (checked on the 200 conformance requests). Client: `serving.rpc.RpcClient`.
   The `SearchIndex` Service also exposes port 9090 as `rpc`.
+- **Bulk** (`serving/bulk.py`). The body is streamed (Content-Length or chunked), grouped into chunks of `bulk_chunk`
+  actions (default 2000), and each chunk is planned, applied to the store as one atomic batch through
+  `dataplane.intake.apply_changes` (bad records are rejected one by one) and replayed onto the live index before the next
+  chunk is read: memory is one chunk plus the item list. Every action has an item, in order. Semantics as OpenSearch:
+  `index` 201 created / 200 updated; `create` 409 `version_conflict_engine_exception` if the id exists; `update` merges a
+  partial `doc` (hot fields only: an in-place patch; else the merged document is stored whole), 404
+  `document_missing_exception` unless `doc_as_upsert`/`upsert`, `noop` for an empty doc; `delete` 200 `deleted` / 404
+  `not_found`; a missing `_id` on `index`/`create` is generated. A data-plane rejection becomes status 400 (404 for
+  `no_such_key`) with `error.type` from the reason (`bad_type`, `dims_mismatch`, `too_long` → `mapper_parsing_exception`;
+  `unknown_field` → `strict_dynamic_mapping_exception`; `not_hot` → `illegal_argument_exception`; `missing_id`,
+  `malformed`, `bad_op` → `action_request_validation_exception`), `error.s3_reason` the named reason and `error.field`.
+  Unsupported: `script`, versioning, routing, pipelines. An unparseable action line ends the request with 400 and the
+  items already applied; a store failure marks its chunk 5xx and stops. Not available over RPC.
+- **Refresh.** A write is durable and its patches and deletes visible at once; an upsert becomes visible at the next
+  refresh. `refresh=false` leaves it to the background refresher (every `refresh_interval`, only when something is
+  pending; with the full-rebuild backend also at least 4x the last refresh's cost apart); `true` refreshes before
+  returning (`"forced_refresh": true`); `wait_for` returns when a refresh covers the write (forces one if the interval
+  is `-1` or it takes too long). **The hook:** `serving.ports.Ports.refresh(managed_index) -> {"segment_id", "version"}`;
+  while it is `None` a refresh is a full rebuild from the store and a swap (18.7 s on ESCI-sample); when the data plane's
+  delta segments land (S8-4) it supplies the hook and refresh becomes a delta (it runs under the admin lock and may call
+  `managed_index._swap_in(new_index, segment_id, "refresh")`).
+- **Write metrics:** `s3_index_lag` (store head minus the highest offset fully visible, so upserts waiting for a refresh
+  count), `s3_index_pending_upserts`, `s3_refresh_ms`, `s3_bulk_requests_total{refresh}`, `s3_bulk_items_total{op,outcome}`,
+  `s3_bulk_rejected_total{reason}`, `s3_bulk_items_per_second` (last request), `s3_bulk_ms`.
 - **Batching.** `_search` requests are queued per index; a worker sends up to `max_batch` of them (default 32) to one
   `Index.search_batch`, waiting at most `max_wait_ms` (default 2.0) after the first arrives. `_msearch` is one
   `search_batch` itself. If a batch raises, its requests are retried singly so a bad request fails alone.
@@ -694,3 +727,8 @@ status:
 - 2026-11-10, architect (S7-1): section 4 gains optional positions (`text/pos_ptr.npy`, `text/positions.npy`; older
   segments load without them); section 2 gains `_meta.engine.positions` and the position rule; section 5 gains
   `match_phrase` with `slop`. Additive. Why: the founder's feature coverage (S7).
+- 2026-11-10, platform-engineer: `_bulk`, `_refresh`, `_settings` (refresh_interval), `?refresh=` on `_bulk` and `_docs`, write metrics and the `Ports.refresh` / `Ports.apply_changes` hooks (S8-6), additive. Needs from the dataplane-engineer: `Ports.refresh` implemented on delta segments (S8-4).
+- 2026-11-10, architect (S7-2): section 5 gains `fuzzy`, fuzziness on `match` and `multi_match`, `prefix` and
+  `match_bool_prefix`, expanded in the terms dictionary with OpenSearch's defaults; section 6 gains the
+  `LexicalGroups` plan node (clauses of alternative terms: "sum", "synonym", "const"), scored by the new
+  `bm25f_groups` operator on the backend. Additive. Why: S7 (typo tolerance and autocomplete).

@@ -12,13 +12,13 @@ import math
 import re
 
 from ..errors import InvalidRequest, UnsupportedQuery
-from .ast import (Agg, QBool, QMatchPhrase, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
+from .ast import (Agg, Fuzzy, QBool, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
 
 MAX_WINDOW = 10_000
 TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_after", "explain", "_source",
             "track_total_hits", "rank", "rescore"}
 QUERY_TYPES = ("match", "multi_match", "bool", "term", "terms", "range", "knn", "match_all", "hybrid", "neural",
-               "match_phrase")
+               "match_phrase", "fuzzy", "prefix", "match_bool_prefix")
 MULTI_MATCH_TYPES = ("best_fields", "most_fields", "cross_fields")
 
 
@@ -85,6 +85,20 @@ def _scalar(v, path):
     if isinstance(v, (str, int, float, bool)) and not (isinstance(v, float) and not math.isfinite(v)):
         return v
     raise InvalidRequest(path, "a string, number or boolean")
+
+
+FUZZY_KEYS = {"fuzziness", "prefix_length", "max_expansions", "transpositions"}
+
+
+def _fuzzy_opts(spec, p, default=None):
+    fz = spec.get("fuzziness", default)
+    if fz is not None and not (isinstance(fz, (str, int)) and not isinstance(fz, bool)):
+        raise InvalidRequest(f"{p}.fuzziness", "AUTO, AUTO:low,high, 0, 1 or 2")
+    tr = spec.get("transpositions", True)
+    if not isinstance(tr, bool):
+        raise InvalidRequest(f"{p}.transpositions", "a bool")
+    return Fuzzy(fz, _int(spec.get("prefix_length", 0), f"{p}.prefix_length"),
+                 _int(spec.get("max_expansions", 50), f"{p}.max_expansions", 1), tr)
 
 
 class Parser:
@@ -158,13 +172,49 @@ class Parser:
         p = f"{path}.{field}"
         if not isinstance(spec, dict):
             return QMatch(field, _scalar(spec, p), path=p)
-        _keys(spec, {"query", "operator", "minimum_should_match", "boost"}, p)
+        _keys(spec, {"query", "operator", "minimum_should_match", "boost"} | FUZZY_KEYS, p)
         if "query" not in spec:
             raise InvalidRequest(f"{p}.query", "required")
         return QMatch(field, _scalar(spec["query"], f"{p}.query"), self._operator(spec.get("operator", "or"),
                                                                                     f"{p}.operator"),
                       _msm(spec.get("minimum_should_match"), f"{p}.minimum_should_match"),
-                      _num(spec.get("boost", 1.0), f"{p}.boost"), p)
+                      _num(spec.get("boost", 1.0), f"{p}.boost"), p, _fuzzy_opts(spec, p))
+
+    def q_fuzzy(self, body, path):
+        field, spec = _one_field(body, path, "fuzzy")
+        p = f"{path}.{field}"
+        if not isinstance(spec, dict):
+            return QFuzzy(field, _scalar(spec, p), Fuzzy("AUTO"), 1.0, path)
+        _keys(spec, {"value", "boost"} | FUZZY_KEYS, p)
+        if "value" not in spec:
+            raise InvalidRequest(f"{p}.value", "required")
+        return QFuzzy(field, _scalar(spec["value"], f"{p}.value"), _fuzzy_opts(spec, p, "AUTO"),
+                      _num(spec.get("boost", 1.0), f"{p}.boost"), path)
+
+    def q_prefix(self, body, path):
+        field, spec = _one_field(body, path, "prefix")
+        p = f"{path}.{field}"
+        if not isinstance(spec, dict):
+            return QPrefix(field, str(_scalar(spec, p)), 1.0, path)
+        _keys(spec, {"value", "boost"}, p)
+        if "value" not in spec:
+            raise InvalidRequest(f"{p}.value", "required")
+        return QPrefix(field, str(_scalar(spec["value"], f"{p}.value")), _num(spec.get("boost", 1.0), f"{p}.boost"),
+                       path)
+
+    def q_match_bool_prefix(self, body, path):
+        field, spec = _one_field(body, path, "match_bool_prefix")
+        p = f"{path}.{field}"
+        if not isinstance(spec, dict):
+            return QMatchBoolPrefix(field, self._text(spec, p), path=p)
+        _keys(spec, {"query", "operator", "minimum_should_match", "max_expansions", "boost"}, p)
+        if "query" not in spec:
+            raise InvalidRequest(f"{p}.query", "required")
+        return QMatchBoolPrefix(field, self._text(spec["query"], f"{p}.query"),
+                                self._operator(spec.get("operator", "or"), f"{p}.operator"),
+                                _msm(spec.get("minimum_should_match"), f"{p}.minimum_should_match"),
+                                _int(spec.get("max_expansions", 50), f"{p}.max_expansions", 1),
+                                _num(spec.get("boost", 1.0), f"{p}.boost"), p)
 
     def q_match_phrase(self, body, path):
         field, spec = _one_field(body, path, "match_phrase")
@@ -178,7 +228,8 @@ class Parser:
                             _num(spec.get("boost", 1.0), f"{p}.boost"), p)
 
     def q_multi_match(self, body, path):
-        _keys(body, {"query", "fields", "type", "operator", "minimum_should_match", "tie_breaker", "boost"}, path)
+        _keys(body, {"query", "fields", "type", "operator", "minimum_should_match", "tie_breaker", "boost"}
+              | FUZZY_KEYS, path)
         t = body.get("type", "best_fields")
         if t not in MULTI_MATCH_TYPES:
             raise UnsupportedQuery(f"{path}.type", f"type {t!r}: {', '.join(MULTI_MATCH_TYPES)}")
@@ -204,7 +255,7 @@ class Parser:
                            self._operator(body.get("operator", "or"), f"{path}.operator"),
                            _msm(body.get("minimum_should_match"), f"{path}.minimum_should_match"),
                            None if tb is None else _num(tb, f"{path}.tie_breaker"),
-                           _num(body.get("boost", 1.0), f"{path}.boost"), path)
+                           _num(body.get("boost", 1.0), f"{path}.boost"), path, _fuzzy_opts(body, path))
 
     def q_bool(self, body, path):
         _keys(body, {"must", "should", "filter", "must_not", "minimum_should_match", "boost"}, path)

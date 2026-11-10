@@ -13,7 +13,7 @@ import numpy as np
 
 from ..errors import InvalidRequest, UnsupportedQuery
 from .. import ops
-from .nodes import Bool, Dense, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
+from .nodes import Bool, Dense, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
 
 INF = float("inf")
 
@@ -114,6 +114,8 @@ class Executor:
             ctx.setdefault("lexical", (node, s, m))
         elif isinstance(node, Phrase):
             out = self._phrase(node)
+        elif isinstance(node, LexicalGroups):
+            out = self._groups(node)
         elif isinstance(node, MatchAll):
             out = (b.full(N, node.boost, "float32"), b.full(N, True, "bool"))
         elif isinstance(node, Term):
@@ -147,6 +149,27 @@ class Executor:
         if ctx.get("explain") is not None:
             ctx["explain"][id(node)] = out
         return out
+
+    def _groups(self, node):
+        b, st = self.b, self.st
+        N, F = st.N, len(st.text_fields)
+        if node.msm == 0 or not node.groups:
+            return b.zeros(N, "float32"), b.full(N, False, "bool")
+        w = np.zeros(F, np.float32)
+        for f, wt in node.fields:
+            w[st.field_index[f]] = wt
+        bb = np.full(F, st.mapping.b, np.float32)
+        if node.idf == "field":
+            f_i = next(st.field_index[f] for f, wt in node.fields if wt > 0)
+            idf, idf_h = st.idf_field[:, f_i], st.host_idf_field[:, f_i]
+        else:
+            idf, idf_h = st.idf, st.host_idf
+        groups = [[st.vocab[t] for t in g if t in st.vocab] for g in node.groups]
+        group_idf = [min((float(idf_h[t]) for t in g), default=0.0) for g in groups]
+        scores, present = ops.bm25f_groups(b, st, groups, list(node.modes), w, bb, st.mapping.k1, idf, group_idf)
+        score = b.sum(scores, axis=0)
+        m = b.sum(b.astype(present, "int32"), axis=0) >= node.msm
+        return b.where(m, score * node.boost, 0.0), m
 
     def _phrase(self, node):
         from ..ops.phrase import phrase, phrase_scores
