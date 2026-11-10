@@ -31,6 +31,10 @@ What it measures, for S8's pre-registered predictions (the lab's `company/milest
    tfidf-svd-128 encoder, timed as the total, the engine's part (time inside `engine.encode.TfidfSvdEncoder`) and the
    data plane's part (the rest).
 
+**Load.** The judge waits (up to 5 minutes) for a quiet machine, a 1-minute load average at or below 0.5, and
+refuses to start otherwise; it samples the load during the run and marks the timings not judged if the mean exceeds
+the cores it may use plus 0.75 (`referee/loadguard.py`).
+
 **If S8-4 is absent** (the updater does not make an upserted document searchable), the stream part stops with
 `UpdaterAbsent` and a message saying what it waited for, instead of measuring something else.
 """
@@ -517,6 +521,8 @@ def main(argv=None) -> int:
     ap.add_argument("--parts", default="stream,bulk,intake")
     ap.add_argument("--out", default="results/judge-s8.json")
     ap.add_argument("--self-test", action="store_true", help="run the judge's full self-tests on toy, then stop")
+    ap.add_argument("--ignore-load", action="store_true",
+                    help="measure even on a busy machine (the results are then labelled, never verdicts)")
     a = ap.parse_args(argv)
     if a.self_test:
         import pytest
@@ -526,6 +532,17 @@ def main(argv=None) -> int:
     res = {"kind": "judge-s8", "label": "CPU, development only", "dataset": "esci-sample",
            "threads": __import__("referee").blas_threads()}
     parts = set(a.parts.split(","))
+    from referee import loadguard
+    try:
+        res["load_at_start"] = loadguard.wait_for_quiet() if not a.ignore_load else {"ignored": True,
+                                                                                     "load1": loadguard.load1()}
+    except loadguard.Busy as e:
+        res["not_judged"] = str(e)
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps(res, indent=1, default=str) + "\n")
+        print(res["not_judged"])
+        return 3
+    sampler = loadguard.Sampler().__enter__()
     ds = None
     if "stream" in parts:
         ds, store, seg, base_ids, pool, texts, fit_reqs = setup_esci_sample(work)
@@ -543,6 +560,12 @@ def main(argv=None) -> int:
         res["bulk"] = bulk_http(ds.catalogue, ds.mapping, work)
     if "intake" in parts:
         res["intake"] = intake_timings(ds.catalogue, ds.mapping, work)
+    sampler.__exit__(None, None, None)
+    res["load_during_run"] = sampler.summary()
+    if res["load_during_run"]["overloaded"] or a.ignore_load:
+        res["timings_not_judged"] = ("the machine was busy during the run (mean 1-minute load "
+                                     f"{res['load_during_run']['load1_mean']:.2f} > {res['load_during_run']['limit']:.2f})"
+                                     if not a.ignore_load else "--ignore-load: measured, not judged")
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(res, indent=1, default=str) + "\n")
     print(json.dumps({k: (v if k != "stream" else {kk: vv for kk, vv in v.items() if kk in
