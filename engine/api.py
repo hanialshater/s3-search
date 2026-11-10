@@ -146,8 +146,9 @@ class Index:
             if part is not None:
                 st.check_part(part)
                 owned = {q.ids[loc] for q in old for loc in q.live_local.tolist()}
+                dead = set(delete_ids)          # tombstoned in the merge (changed after its snapshot)
                 clash = [i for i in part.ids[np.flatnonzero(part.local_live)].tolist()
-                         if i in st.pos and i not in owned]
+                         if i in st.pos and i not in owned and i not in dead]
                 if clash:
                     raise ValueError(f"_id {clash[0]!r} is live in a segment that is not replaced")
             if part is None and len(old) == len(st.parts):

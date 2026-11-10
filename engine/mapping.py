@@ -124,14 +124,21 @@ def parse_synonyms(lines) -> dict:
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
+        def entries(part, side):
+            words = [w.strip() for w in part.split(",")]
+            if not words or any(not w for w in words):
+                raise InvalidMapping(f"_meta.engine.synonyms[{i}]",
+                                     f"rule {line!r}: an empty {side} (as OpenSearch, the rule is refused)")
+            return [one(w, i) for w in words]
         if "=>" in line:
             lhs, rhs = line.split("=>", 1)
-            targets = {one(w, i) for w in rhs.split(",") if w.strip()}
-            for w in lhs.split(","):
-                if w.strip():
-                    out.setdefault(one(w, i), set()).update(targets)
+            if "=>" in rhs:
+                raise InvalidMapping(f"_meta.engine.synonyms[{i}]", f"rule {line!r}: more than one =>")
+            sources, targets = entries(lhs, "left side"), set(entries(rhs, "right side"))
+            for t in sources:
+                out.setdefault(t, set()).update(targets)
         else:
-            group = {one(w, i) for w in line.split(",") if w.strip()}
+            group = set(entries(line, "term"))
             for t in group:
                 out.setdefault(t, set()).update(group)
     return {t: tuple(sorted(alts)) for t, alts in out.items()}
