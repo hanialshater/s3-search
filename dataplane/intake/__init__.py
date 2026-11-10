@@ -20,12 +20,14 @@ import numpy as np
 
 from dataplane.intake.encoders import (Encoder, HashingEncoder, doc_text, fitted_arrays, get_encoder,  # noqa: F401
                                        load_fitted, needs_fit, register, save_fitted)
-from dataplane.mapping import (ID_MAX_BYTES, BadValue, Mapping, as_mapping, coerce, is_missing, json_safe)
+from dataplane.mapping import (ID_MAX_BYTES, BadValue, Mapping, as_mapping, coerce, coerce_nested, is_missing,
+                               json_safe)
 
 # The closed set of rejection reasons (additive). The first six are the architect's draft; the last four were added
 # by the dataplane-engineer for malformed input and the change feed (docs/INTERFACES.md §2, Changes).
 REASONS = ("missing_id", "duplicate_id_in_batch", "bad_type", "dims_mismatch", "unknown_field", "too_long",
-           "malformed", "bad_op", "not_hot", "no_such_key")
+           "malformed", "bad_op", "not_hot", "no_such_key",
+           "bad_geo", "geo_out_of_range", "bad_nested", "too_many_nested")   # S9: geo_point and nested
 
 
 @dataclass
@@ -130,9 +132,9 @@ def validate(doc: Any, mapping: dict | Mapping) -> dict | Rejection:
         if is_missing(v):
             continue
         try:
-            out[k] = coerce(f, v)
+            out[k] = coerce_nested(f, v, strict=m.dynamic == "strict") if f.type == "nested" else coerce(f, v)
         except BadValue as e:
-            return Rejection(_id, e.reason, k, e.detail)
+            return Rejection(_id, e.reason, e.field or k, e.detail)
     return out
 
 

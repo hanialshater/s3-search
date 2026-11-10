@@ -182,8 +182,21 @@ class Encoder(Protocol): name: str; dim: int; def encode(self, texts: list[str])
 Rejection reasons (closed set, additive): `missing_id`, `duplicate_id_in_batch`, `bad_type`, `dims_mismatch`,
 `unknown_field` (the mapping's `dynamic` is `strict`), `too_long` (keyword over `ignore_above` is *kept* but not indexed
 as keyword, as OpenSearch does; this reason is for ids over 512 bytes), `malformed` (a JSONL line or change record that
-is not an object, a patch without `fields`), `bad_op`, `not_hot` and `no_such_key` (the change feed). Rejected records
-go to `rejected.jsonl`, one `{"record": ..., "rejection": ...}` per line.
+is not an object, a patch without `fields`), `bad_op`, `not_hot` and `no_such_key` (the change feed), and for S9
+`bad_geo`, `geo_out_of_range`, `bad_nested` and `too_many_nested`. Rejected records go to `rejected.jsonl`, one
+`{"record": ..., "rejection": ...}` per line.
+
+- **geo_point at intake (S9-4):** `{"lat", "lon"}` (numbers or numeric strings), `"lat,lon"`, `[lon, lat]` and WKT
+  `"POINT (lon lat)"` (any case) are stored as `{"lat": float, "lon": float}`, the form `build_segment` reads. A
+  geohash, another shape or a non-finite number is `bad_geo`; a latitude outside [-90, 90] or a longitude outside
+  [-180, 180] is `geo_out_of_range`. Not hot: a location changes by upsert.
+- **nested at intake (S9-5):** an object or a list of objects is stored as a list of child objects, each sub-field
+  coerced by the nested mapping (`bad_type` and the other reasons name the field `path.sub`); missing sub-values are
+  left out; an empty list is no children; a non-object item is `bad_nested`; more than 65,535 objects is
+  `too_many_nested`; unknown sub-fields are kept in the source unless the mapping is `strict` (`unknown_field`). An
+  upsert (and so `_bulk`'s `update` with a partial doc naming the path, which serving merges at the top level)
+  replaces the whole array, as OpenSearch does. The snapshot's columns hold the point dicts and the lists of child
+  objects; deltas, merges and commits carry them through `build_segment` and `merge_segments`.
 
 - **Coercion.** `text`: strings, numbers (as text), lists of strings (joined by a newline). `keyword`: strings or
   numbers. `float`: finite numbers or numeric strings, within float32 range. `integer`/`long`: integers, integral
@@ -890,3 +903,7 @@ status:
   the response gains the top-level `knn.<field> = {"requested", "ran"}`, the shape the evaluation-steward proposed,
   ratified with one amendment: several clauses on one field give a list in request order. cuVS is optional
   (`engine/ann.py`); exact is the fallback. Additive.
+- 2026-11-10, dataplane-engineer (S9, geo_point and nested through the data plane): section 2 gains intake for both
+  types (the accepted point forms, WKT included; nested children validated by the nested mapping) and four rejection
+  reasons (`bad_geo`, `geo_out_of_range`, `bad_nested`, `too_many_nested`). Additive. Why: the engine supported
+  both (S9-4, S9-5) but intake refused them, so no geo or nested index could be created through serving.

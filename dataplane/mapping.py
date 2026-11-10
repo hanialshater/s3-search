@@ -9,12 +9,15 @@ import hashlib
 import json
 import math
 import numbers
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-TYPES = ("text", "keyword", "float", "integer", "long", "boolean", "knn_vector")
+TYPES = ("text", "keyword", "float", "integer", "long", "boolean", "knn_vector", "geo_point", "nested")
+NESTED_CHILD_TYPES = ("text", "keyword", "float", "integer", "long", "boolean")   # S9-5: no vectors, geo, nesting
+MAX_NESTED = (1 << 16) - 1   # children per parent (their first_offset is parent << 16 | i)
 NUMERIC = ("float", "integer", "long", "boolean")
 ID_MAX_BYTES = 512
 INT32 = (-(2 ** 31), 2 ** 31 - 1)
@@ -38,10 +41,11 @@ class InvalidMapping(ValueError):
 class BadValue(ValueError):
     """A value that does not fit its field. ``.reason`` is a rejection reason (``bad_type`` or ``dims_mismatch``)."""
 
-    def __init__(self, reason: str, detail: str):
+    def __init__(self, reason: str, detail: str, field: str | None = None):
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
+        self.field = field          # set for a nested child's sub-field ("path.sub"); else the caller's field
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,11 @@ class Field:
     dim: int | None = None                       # knn_vector
     ignore_above: int | None = None              # keyword
     subfields: tuple[tuple[str, str], ...] = ()  # (name, type), e.g. ("keyword", "keyword")
+    children: tuple[tuple[str, "Field"], ...] = ()  # nested: (sub-field name, its Field)
+
+    @property
+    def child(self) -> dict:
+        return dict(self.children)
 
 
 @dataclass
@@ -76,6 +85,44 @@ def as_mapping(m: dict | Mapping) -> Mapping:
     return m if isinstance(m, Mapping) else parse_mapping(m)
 
 
+def _parse_field(name: str, spec, path: str, in_nested: bool = False) -> Field:
+    if not isinstance(spec, dict):
+        raise InvalidMapping(path, "must be an object")
+    t = spec.get("type")
+    allowed = NESTED_CHILD_TYPES if in_nested else TYPES
+    if t not in allowed:
+        what = "nested properties are" if in_nested else "v1 supports"
+        raise InvalidMapping(f"{path}.type", f"unsupported type {t!r}; {what} {', '.join(allowed)}")
+    dim = None
+    if t == "knn_vector":
+        dim = spec.get("dimension")
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
+            raise InvalidMapping(f"{path}.dimension", "knn_vector needs a positive integer dimension")
+    if t == "geo_point":
+        extra = sorted(set(spec) - {"type"})
+        if extra:
+            raise InvalidMapping(f"{path}.{extra[0]}", "geo_point options are not supported")
+    children: tuple = ()
+    if t == "nested":
+        extra = sorted(set(spec) - {"type", "properties"})
+        if extra:
+            raise InvalidMapping(f"{path}.{extra[0]}", "nested options are not supported")
+        sub = spec.get("properties")
+        if not isinstance(sub, dict) or not sub:
+            raise InvalidMapping(f"{path}.properties", "a nested field needs properties")
+        children = tuple((k, _parse_field(k, ks, f"{path}.properties.{k}", in_nested=True)) for k, ks in sub.items())
+    ignore_above = spec.get("ignore_above")
+    if ignore_above is not None and (not isinstance(ignore_above, int) or ignore_above < 0):
+        raise InvalidMapping(f"{path}.ignore_above", "must be a non-negative integer")
+    subs = []
+    for sub, sspec in (spec.get("fields") or {}).items():
+        st = (sspec or {}).get("type")
+        if st != "keyword" or in_nested:
+            raise InvalidMapping(f"{path}.fields.{sub}.type", "v1 sub-fields are keyword only, and not inside nested")
+        subs.append((sub, st))
+    return Field(name, t, dim, ignore_above, tuple(subs), children)
+
+
 def parse_mapping(raw: dict) -> Mapping:
     if not isinstance(raw, dict):
         raise InvalidMapping("$", "a mapping is a JSON object")
@@ -85,29 +132,7 @@ def parse_mapping(raw: dict) -> Mapping:
     props = raw.get("properties")
     if not isinstance(props, dict) or not props:
         raise InvalidMapping("properties", "must be a non-empty object")
-    fields: dict[str, Field] = {}
-    for name, spec in props.items():
-        path = f"properties.{name}"
-        if not isinstance(spec, dict):
-            raise InvalidMapping(path, "must be an object")
-        t = spec.get("type")
-        if t not in TYPES:
-            raise InvalidMapping(f"{path}.type", f"unsupported type {t!r}; v1 supports {', '.join(TYPES)}")
-        dim = None
-        if t == "knn_vector":
-            dim = spec.get("dimension")
-            if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
-                raise InvalidMapping(f"{path}.dimension", "knn_vector needs a positive integer dimension")
-        ignore_above = spec.get("ignore_above")
-        if ignore_above is not None and (not isinstance(ignore_above, int) or ignore_above < 0):
-            raise InvalidMapping(f"{path}.ignore_above", "must be a non-negative integer")
-        subs = []
-        for sub, sspec in (spec.get("fields") or {}).items():
-            st = (sspec or {}).get("type")
-            if st != "keyword":
-                raise InvalidMapping(f"{path}.fields.{sub}.type", "v1 sub-fields are keyword only")
-            subs.append((sub, st))
-        fields[name] = Field(name, t, dim, ignore_above, tuple(subs))
+    fields = {name: _parse_field(name, spec, f"properties.{name}") for name, spec in props.items()}
     id_field = eng.get("id_field", "_id")
     if not isinstance(id_field, str) or not id_field:
         raise InvalidMapping("_meta.engine.id_field", "must be a non-empty string")
@@ -233,7 +258,94 @@ def coerce(f: Field, v: Any) -> Any:
         if n == 0.0:
             raise BadValue("bad_type", f"knn_vector field {f.name!r} is the zero vector (cosine is undefined)")
         return (a / n).astype(np.float32)
+    if t == "geo_point":
+        return coerce_point(f, v)
+    if t == "nested":
+        return coerce_nested(f, v)
     raise AssertionError(t)  # pragma: no cover
+
+
+_NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_WKT = re.compile(rf"\s*POINT\s*\(\s*({_NUM})\s+({_NUM})\s*\)\s*", re.IGNORECASE)
+_LATLON = re.compile(rf"\s*({_NUM})\s*,\s*({_NUM})\s*")
+
+
+def _num(x, what: str, f: Field) -> float:
+    if _is_bool(x) or isinstance(x, (dict, list, tuple)):
+        raise BadValue("bad_geo", f"geo_point field {f.name!r}: {what} is not a number")
+    try:
+        y = float(x)
+    except (TypeError, ValueError):
+        raise BadValue("bad_geo", f"geo_point field {f.name!r}: {what} {x!r:.40} is not a number") from None
+    if not math.isfinite(y):
+        raise BadValue("bad_geo", f"geo_point field {f.name!r}: {what} is not finite")
+    return y
+
+
+def coerce_point(f: Field, v: Any) -> dict:
+    """OpenSearch's point forms to ``{"lat", "lon"}``: an object ``{"lat", "lon"}``, a string ``"lat,lon"``, an array
+    ``[lon, lat]``, or a WKT ``"POINT (lon lat)"``. Geohashes are refused (the engine does not decode them)."""
+    if isinstance(v, dict):
+        if set(v) != {"lat", "lon"}:
+            raise BadValue("bad_geo", f"geo_point field {f.name!r}: an object point is {{lat, lon}}, got keys {sorted(v)}")
+        lat, lon = _num(v["lat"], "lat", f), _num(v["lon"], "lon", f)
+    elif isinstance(v, str):
+        m = _WKT.fullmatch(v)
+        if m:
+            lon, lat = float(m.group(1)), float(m.group(2))
+        else:
+            m = _LATLON.fullmatch(v)
+            if not m:
+                why = ("geohashes are not supported" if re.fullmatch(r"\s*[0-9a-z]+\s*", v)
+                       else "not 'lat,lon' or WKT 'POINT (lon lat)'")
+                raise BadValue("bad_geo", f"geo_point field {f.name!r}: {v!r:.40}: {why}")
+            lat, lon = float(m.group(1)), float(m.group(2))
+    elif isinstance(v, (list, tuple, np.ndarray)):
+        if len(v) != 2:
+            raise BadValue("bad_geo", f"geo_point field {f.name!r}: an array point is [lon, lat], got {len(v)} values")
+        lon, lat = _num(v[0], "lon", f), _num(v[1], "lat", f)
+    else:
+        raise BadValue("bad_geo", f"geo_point field {f.name!r}: a point is {{lat, lon}}, 'lat,lon', [lon, lat] "
+                                  f"or 'POINT (lon lat)', got {type(v).__name__}")
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+        raise BadValue("geo_out_of_range", f"geo_point field {f.name!r}: ({lat}, {lon}) is outside "
+                                           "lat [-90, 90], lon [-180, 180]")
+    return {"lat": lat, "lon": lon}
+
+
+def coerce_nested(f: Field, v: Any, strict: bool = False) -> list[dict]:
+    """A nested value (an object or a list of objects) to a list of child objects, each sub-field coerced by the
+    nested mapping; missing sub-values are left out; unknown sub-fields are kept in the source (the engine ignores
+    them) unless ``strict``. An empty list is no children."""
+    objs = [v] if isinstance(v, dict) else list(v) if isinstance(v, (list, tuple, np.ndarray)) else None
+    if objs is None:
+        raise BadValue("bad_nested", f"nested field {f.name!r}: a value is an object or a list of objects, "
+                                     f"got {type(v).__name__}")
+    if len(objs) > MAX_NESTED:
+        raise BadValue("too_many_nested", f"nested field {f.name!r}: {len(objs)} objects; at most {MAX_NESTED}")
+    kids = f.child
+    out = []
+    for i, o in enumerate(objs):
+        if not isinstance(o, dict):
+            raise BadValue("bad_nested", f"nested field {f.name!r}: item {i} is {type(o).__name__}, not an object")
+        c = {}
+        for k, x in o.items():
+            sub = kids.get(k)
+            if sub is None:
+                if strict:
+                    raise BadValue("unknown_field", f"{f.name}.{k} is not mapped and the mapping is strict",
+                                   f"{f.name}.{k}")
+                if not is_missing(x):
+                    c[k] = json_safe(x)
+                continue
+            if is_missing(x):
+                continue
+            try:
+                c[k] = coerce(sub, x)
+            except BadValue as e:
+                raise BadValue(e.reason, f"{f.name}[{i}]: {e.detail}", f"{f.name}.{k}") from None
+        out.append(c)
+    return out
 
 
 def json_safe(v: Any) -> Any:
