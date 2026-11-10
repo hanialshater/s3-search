@@ -13,7 +13,7 @@ import numpy as np
 
 from ..errors import InvalidRequest, UnsupportedQuery
 from .. import ops
-from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
+from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Nested, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
 
 INF = float("inf")
 
@@ -156,6 +156,8 @@ class Executor:
             out = (b.full(N, node.boost, "float32"), b.full(N, True, "bool"))
         elif isinstance(node, FunctionScore):
             out = self._function_score(node, ctx)
+        elif isinstance(node, Nested):
+            out = self._nested(node)
         elif isinstance(node, GeoDistance):
             from ..geo import haversine_m, lat_col, lon_col
             f = node.field
@@ -256,6 +258,39 @@ class Executor:
                       for alts in node.slots)
         sc = phrase_scores(b, st, f_i, freq, idf_sum, st.mapping.k1, st.mapping.b)
         return b.where(m, sc * node.boost, 0.0), m
+
+    def _child(self, path):
+        ex = getattr(self, "_children", {}).get(path)
+        if ex is None:
+            ex = Executor(self.st.nested[path], self.rankers)
+            self.__dict__.setdefault("_children", {})[path] = ex
+        return ex
+
+    def _nested(self, node):
+        """S9-5: the inner query on the children, rolled up to their parents (block join) by score_mode."""
+        b, st = self.b, self.st
+        ex = self._child(node.nested_path)
+        ex._prefetch([Plan(root=node.query)], Timer(b))
+        cs, cm = ex.eval(node.query, {"explain": None})
+        cm = cm & ex.st.live
+        par = st.nested_parent(node.nested_path)
+        keys = par[cm]
+        N = st.N
+        cnt = b.segment_count(keys, N)
+        m = cnt > 0
+        v = cs[cm]
+        sm = node.score_mode
+        if sm == "none":
+            s = b.zeros(N, "float32")
+        elif sm in ("sum", "avg"):
+            tot = b.astype(b.segment_sum(keys, v, N), "float64")
+            s = tot if sm == "sum" else tot / b.astype(b.where(m, cnt, 1), "float64")
+        elif sm == "max":
+            s = b.segment_max(keys, v, N)
+        else:
+            s = b.segment_min(keys, v, N)
+        s = b.astype(b.where(m, s, 0.0), "float32") * node.boost
+        return b.where(m, s, 0.0), m
 
     def _function_score(self, node, ctx):
         """function_score (S7-5), as OpenSearch combines it: each function applies where its filter matches; the
@@ -417,6 +452,14 @@ class Executor:
     def _agg(self, a, mask):
         from .. import aggs as A
         b, st = self.b, self.st
+        if a.kind == "nested":                          # S9-5: the children of the matching parents
+            ex = self._child(a.field)
+            par = st.nested_parent(a.field)
+            cm = ex.st.live & (par >= 0) & mask[b.where(par >= 0, par, 0)]
+            out = {"doc_count": int(b.count_nonzero(cm))}
+            for x in a.sub:
+                out[x.name] = ex._agg(x, cm)
+            return out
         if a.kind == "terms":
             codes, keys_of = self._facet_codes(a.field)
             counts = ops.facet_terms(b, codes, mask.reshape(1, -1), len(keys_of))

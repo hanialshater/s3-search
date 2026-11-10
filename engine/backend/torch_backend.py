@@ -127,6 +127,14 @@ class TorchBackend:
         out.index_put_((keys,), values.to(dt), accumulate=True)
         return out.to(torch.float32)
 
+    def segment_max(self, keys, values, n, init=float("-inf")):
+        out = torch.full((n,), init, dtype=torch.float64, device=self.device)
+        return out.scatter_reduce(0, keys, values.to(torch.float64), reduce="amax", include_self=True)
+
+    def segment_min(self, keys, values, n, init=float("inf")):
+        out = torch.full((n,), init, dtype=torch.float64, device=self.device)
+        return out.scatter_reduce(0, keys, values.to(torch.float64), reduce="amin", include_self=True)
+
     def segment_count(self, keys, n):
         return torch.bincount(keys, minlength=n).to(torch.int32)
 

@@ -70,6 +70,16 @@ class Range:
 
 
 @dataclass(frozen=True)
+class Nested:
+    """S9-5: ``query`` is planned against the children of ``nested_path``; parents match when a child does."""
+    nested_path: str
+    query: Any
+    score_mode: str = "avg"
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
 class GeoDistance:
     field: str
     lat: float
@@ -144,7 +154,7 @@ class Hybrid:
     path: str = "query"
 
 
-Node = Union[GeoDistance, GeoBox, FunctionScore, Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
+Node = Union[Nested, GeoDistance, GeoBox, FunctionScore, Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
 
 
 @dataclass(frozen=True)

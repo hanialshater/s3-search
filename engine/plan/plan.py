@@ -14,7 +14,11 @@ from ..analysis import analyze, analyze_with_positions
 from ..dsl import ast as A
 from ..dsl.parse import parse, resolve_msm
 from ..errors import InvalidRequest, UnsupportedQuery
-from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Nested, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+
+
+class _OutsideNested(Exception):
+    """A leaf names a field under a nested path outside a nested query: OpenSearch answers no docs."""
 
 
 class Planner:
@@ -23,6 +27,10 @@ class Planner:
 
     def _field(self, name, path, kinds):
         k = self.s.mapping.kind(name)
+        if k == "in_nested" and "in_nested" not in kinds:
+            if getattr(self, "_leaf", False):
+                raise _OutsideNested()
+            raise UnsupportedQuery(path, f"field {name!r} is under a nested path: use a nested query or aggregation")
         if k is None:
             raise InvalidRequest(path, f"unknown field {name!r}")
         if k not in kinds:
@@ -65,7 +73,21 @@ class Planner:
 
     # ---- queries
     def node(self, q):
-        return getattr(self, "n_" + type(q).__name__)(q)
+        if type(q).__name__ in ("QBool", "QHybrid", "QFunctionScore", "QNested"):
+            return getattr(self, "n_" + type(q).__name__)(q)
+        self._leaf = True
+        try:
+            return getattr(self, "n_" + type(q).__name__)(q)
+        except _OutsideNested:
+            return Ids((), 1.0, getattr(q, "path", "query"))      # matches nothing, as OpenSearch
+        finally:
+            self._leaf = False
+
+    def n_QNested(self, q):
+        if self.s.mapping.kind(q.path_name) != "nested":
+            raise InvalidRequest(f"{q.path}.path", f"{q.path_name!r} is not a nested field")
+        inner = Planner(self.s.nested[q.path_name]).node(q.query)
+        return Nested(q.path_name, inner, q.score_mode, q.boost, q.path)
 
     def _lexical(self, text, weights, operator, msm, boost, path):
         terms = tuple(dict.fromkeys(analyze(text)))
@@ -301,6 +323,11 @@ class Planner:
                   "cardinality": ("keyword", "numeric")}
 
     def agg(self, a: A.Agg) -> TermsAgg:
+        if a.kind == "nested":
+            if self.s.mapping.kind(a.field) != "nested":
+                raise InvalidRequest(f"{a.path}.nested.path", f"{a.field!r} is not a nested field")
+            child = Planner(self.s.nested[a.field])
+            return TermsAgg(a.name, a.field, 10, "nested", (), tuple(child.agg(x) for x in a.sub))
         kinds = self.AGG_FIELDS.get(a.kind, ("numeric",))
         self._field(a.field, f"{a.path}.{a.kind}.field", kinds)
         if a.kind not in ("terms", "value_count", "cardinality") and self.s.mapping.numeric.get(a.field) == "bool" \

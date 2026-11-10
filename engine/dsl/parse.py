@@ -12,7 +12,7 @@ import math
 import re
 
 from ..errors import InvalidRequest, UnsupportedQuery
-from .ast import (Agg, Fuzzy, Highlight, QGeoBox, QGeoDistance, QFunctionScore, QBool, QExists, QIds, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
+from .ast import (Agg, Fuzzy, Highlight, QNested, QGeoBox, QGeoDistance, QFunctionScore, QBool, QExists, QIds, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
 
 MAX_WINDOW = 10_000
 TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_after", "explain", "_source",
@@ -20,7 +20,7 @@ TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_aft
             "track_total_hits", "rank", "rescore"}
 QUERY_TYPES = ("match", "multi_match", "bool", "term", "terms", "range", "knn", "match_all", "hybrid", "neural",
                "match_phrase", "fuzzy", "prefix", "match_bool_prefix", "exists", "ids",
-               "function_score", "geo_distance", "geo_bounding_box")
+               "function_score", "geo_distance", "geo_bounding_box", "nested")
 MULTI_MATCH_TYPES = ("best_fields", "most_fields", "cross_fields")
 
 
@@ -207,6 +207,18 @@ class Parser:
         if kind not in QUERY_TYPES:
             raise UnsupportedQuery(f"{path}.{kind}", f"query type {kind!r} is not supported")
         return getattr(self, "q_" + kind)(body, f"{path}.{kind}")
+
+    def q_nested(self, body, path):
+        _keys(body, {"path", "query", "score_mode", "boost"}, path)
+        if not isinstance(body.get("path"), str):
+            raise InvalidRequest(f"{path}.path", "required: the nested field")
+        if "query" not in body:
+            raise InvalidRequest(f"{path}.query", "required")
+        sm = body.get("score_mode", "avg")
+        if sm not in ("avg", "sum", "max", "min", "none"):
+            raise InvalidRequest(f"{path}.score_mode", "avg | sum | max | min | none")
+        return QNested(body["path"], self.query(body["query"], f"{path}.query"), sm,
+                       _num(body.get("boost", 1.0), f"{path}.boost"), path)
 
     def _geo_field(self, body, path, reserved):
         from ..geo import BadGeo, parse_point  # noqa: F401
@@ -511,7 +523,8 @@ class Parser:
     # ---- aggregations, sort, rescore
     AGG_KEYS = {"terms": {"field", "size"}, "min": {"field"}, "max": {"field"}, "avg": {"field"}, "sum": {"field"},
                 "stats": {"field"}, "value_count": {"field"}, "cardinality": {"field"},
-                "range": {"field", "ranges"}, "histogram": {"field", "interval", "offset", "min_doc_count"}}
+                "range": {"field", "ranges"}, "histogram": {"field", "interval", "offset", "min_doc_count"},
+                "nested": {"path"}}
 
     def aggs(self, body, path, depth=0):
         _obj(body, path)
@@ -527,6 +540,16 @@ class Parser:
                 raise InvalidRequest(p, "an aggregation has exactly one type")
             kind = kinds[0]
             subkey = "aggs" if "aggs" in spec else "aggregations" if "aggregations" in spec else None
+            if kind == "nested":                         # S9-5: a bucket of children; its sub-aggregations
+                t = spec[kind]                           # see the children (terms under it may nest one level)
+                _keys(t, {"path"}, f"{p}.nested")
+                if not isinstance(t.get("path"), str):
+                    raise InvalidRequest(f"{p}.nested.path", "required: the nested field")
+                if depth > 0:
+                    raise UnsupportedQuery(f"{p}.nested", "a nested aggregation at the top level only")
+                sub = self.aggs(spec[subkey], f"{p}.{subkey}", 0) if subkey else ()
+                out.append(Agg(name, t["path"], "nested", (), sub, p))
+                continue
             if subkey is not None and (kind != "terms" or depth > 0):
                 raise UnsupportedQuery(f"{p}.{subkey}", "sub-aggregations only under terms, one level")
             t = spec[kind]

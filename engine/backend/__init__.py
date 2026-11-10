@@ -80,6 +80,11 @@ class Backend(Protocol):
         """``out[k] = sum(values[keys == k])`` for k in ``range(n)``; float32; deterministic order of summation
         (by entry index) on every device."""
 
+    def segment_max(self, keys: Array, values: Array, n: int, init: float = float("-inf")) -> Array:
+        """``out[k] = max(values[keys == k])`` (float64; ``init`` where none), for nested score modes (S9-5)."""
+
+    def segment_min(self, keys: Array, values: Array, n: int, init: float = float("inf")) -> Array: ...
+
     def segment_count(self, keys: Array, n: int) -> Array:
         """``int32[n]`` counts of ``keys``."""
 

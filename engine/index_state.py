@@ -218,6 +218,12 @@ class IndexState:
         if newest_wins:
             self._newest_wins()
         self._relayout()
+        # S9-5: the children of each nested path are an index of their own, one part per parent part
+        self.nested = {}
+        for path in self.mapping.nested:
+            self.nested[path] = IndexState([p.seg.nested[path] for p in self.parts], b, check_budget=False,
+                                           version=self.version, newest_wins=False)
+        self._sync_nested()
 
     # ---- structure
     def _attach(self, p: Part):
@@ -455,6 +461,43 @@ class IndexState:
         updated incrementally (equal to a rebuild)."""
         self.delete_incremental(ids)
 
+    # ---- nested documents (S9-5)
+    def _sync_nested(self) -> None:
+        """Children die with their parents: every child whose parent copy is dead is tombstoned."""
+        self._nested_parent = {}
+        for path, child in getattr(self, "nested", {}).items():
+            slots = []
+            for pp, cp in zip(self.parts, child.parts):
+                par = np.asarray(child.b.to_numpy(cp.numerics["_parent"]), np.int64) if cp.n else np.zeros(0, np.int64)
+                dead = cp.local_live & ~pp.local_live[par] if cp.n else np.zeros(0, bool)
+                if dead.any():
+                    slots.extend(cp.slot_of_local[np.flatnonzero(dead)].tolist())
+            if slots:
+                child._kill(slots)
+                child._finish()
+
+    def nested_parent(self, path: str):
+        """int64[Nc] on the device: each child slot's parent slot (-1 for a hole)."""
+        hit = self._nested_parent.get(path) if hasattr(self, "_nested_parent") else None
+        if hit is None:
+            child = self.nested[path]
+            out = np.full(child.N, -1, np.int64)
+            for k, (pp, cp) in enumerate(zip(self.parts, child.parts)):
+                sel = np.flatnonzero((child.slot_part == k) & child.host_live)
+                if len(sel):
+                    par = np.asarray(child.b.to_numpy(cp.numerics["_parent"]), np.int64)[child.slot_local[sel]]
+                    out[sel] = pp.slot_of_local[par]
+            if not hasattr(self, "_nested_parent"):
+                self._nested_parent = {}
+            hit = self._nested_parent[path] = self.b.asarray(out, "int64")
+        return hit
+
+    def snapshot_part(self, k: int) -> SegmentArrays:
+        seg = self.parts[k].snapshot()
+        if getattr(self, "nested", None):
+            seg.nested = {path: child.snapshot_part(k) for path, child in self.nested.items()}
+        return seg
+
     # ---- copy-on-write (S8-2c): a writer changes a clone and the Index swaps one reference
     def clone(self, field: str | None = None) -> "IndexState":
         """A copy a writer may change while searches keep using this one. ``field``: only that hot column will
@@ -488,6 +531,8 @@ class IndexState:
         # the vocabulary and the known ids are append-only and shared: a state reads only ids < its own G
         c.encoders = dict(self.encoders)
         c._exists = dict(self._exists)
+        c.nested = {p: child.clone() for p, child in getattr(self, "nested", {}).items()}
+        c._nested_parent = {}
         return c
 
     # ---- incremental changes (S8-2b): no full relayout per refresh
@@ -680,10 +725,20 @@ class IndexState:
             if p not in self.parts:
                 self.parts.append(p)
             self._relayout()
-            return
-        self._finish()
+        else:
+            self._finish()
+        for path, child in getattr(self, "nested", {}).items():   # S9-5: the new children, then the sync
+            child.add_part(Part(p.seg.nested[path], self.b))
+        self._sync_nested()
 
     def replace_parts(self, old: list, p: "Part | None", delete_ids=()) -> None:
+        self._before_replace = list(self.parts)
+        try:
+            self._replace_parts(old, p, delete_ids)
+        finally:
+            del self._before_replace
+
+    def _replace_parts(self, old: list, p: "Part | None", delete_ids=()) -> None:
         """S8-2b: replace segments by their merge (or drop them): the merged docs keep their slots; the
         statistics change only by docs that were in one and not the other."""
         captured = {}
@@ -707,20 +762,28 @@ class IndexState:
         assert (remap[live_parts] >= 0).all()
         self.slot_part = np.where(self.host_live, remap[self.slot_part], 0)
         self.parts = keep
+        old_k = [k for k, q in enumerate(self._before_replace) if q in old] if hasattr(self, "_before_replace") else []
         if p is not None:
             self.check_part(p)
             if not self._place(p, reuse, append=False):
                 self._relayout()
-                return
-        if not self.parts:
-            raise ValueError("an index needs at least one segment")
-        self._finish()
+            else:
+                self._finish()
+        else:
+            if not self.parts:
+                raise ValueError("an index needs at least one segment")
+            self._finish()
+        for path, child in getattr(self, "nested", {}).items():
+            child_old = [child.parts[k] for k in old_k]
+            child.replace_parts(child_old, Part(p.seg.nested[path], self.b) if p is not None else None)
+        self._sync_nested()
 
     def delete_incremental(self, ids) -> None:
         slots = [self.pos[i] for i in ids if i in self.pos]
         if slots:
             self._kill(slots)
             self._finish()
+            self._sync_nested()
 
     def value_codes(self, field: str):
         """For a numeric field: ``(codes int64[N] on the device, 0 = missing; keys list)``, codes in ascending value

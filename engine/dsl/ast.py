@@ -130,6 +130,15 @@ class QNeural:
 
 
 @dataclass(frozen=True)
+class QNested:
+    path_name: str
+    query: Any
+    score_mode: str = "avg"
+    boost: float = 1.0
+    path: str = "query.nested"
+
+
+@dataclass(frozen=True)
 class QGeoDistance:
     field: str
     lat: float
@@ -197,7 +206,7 @@ class QHybrid:
     path: str = "query.hybrid"
 
 
-Query = Union[QGeoDistance, QGeoBox, QFunctionScore, QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
+Query = Union[QNested, QGeoDistance, QGeoBox, QFunctionScore, QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
 
 
 @dataclass(frozen=True)
