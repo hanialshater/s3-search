@@ -241,20 +241,35 @@ class StoreError(ValueError); class NotHot(StoreError); class NoSuchKey(StoreErr
   recomputed. Also `list_segments`, `latest_segment`, `gc(out_dir, keep=3, protect=())`, `MergePolicy(max_deleted_ratio,
   max_pending, max_age_s).due(replica.stats())`, `reindex(store, out_dir, replica)` (§7 `_reindex`), and the job
   `python -m dataplane.indexer --store --mapping --out [--ingest FILE]`.
-- **The updater** (`dataplane/updater/`): `Replica(store, segment_dir, device="cpu", budget=None, batch=32)` holds the
-  live `Index` and a reference to swap; `segment_dir` is a segment or a directory of them (the latest is loaded).
-  Loading checks `device_nbytes + work_nbytes <= budget`, then replays the log. `poll()` reads
-  `store.changes(after=index.version)`: `patch` → `Index.patch`, `delete` → `Index.delete`, `upsert` → counted as
-  pending (visible only after the next build and swap). Within a poll the changes are coalesced: the last value of a
-  (field, id) wins, one `Index.patch` call per field, one `Index.delete` call, and an id the index does not hold live
-  (upserted or re-inserted since the segment) is not patched: it waits for the build like its upsert.
+- **The updater** (`dataplane/updater/`; S8): `Replica(store, segment_dir, device="cpu", budget=None, batch=32,
+  refresh_interval=0.5, merge_policy=TieredMergePolicy(), commit_dir=None, commit_every=5.0, keep_commits=3)` holds
+  the live `Index`, a base segment plus delta segments; `segment_dir` is a commit file, a segment, or a directory (its
+  newest commit, else its newest segment). Loading checks `device_nbytes + work_nbytes <= budget`, then refreshes.
+  - `refresh()` (`poll()` is the same step) = `dataplane.updater.delta.apply_delta(index, store, index.version)`: one
+    `Store.delta` read; patches to keys not upserted in the range → `Index.patch` (one call per field, the last value
+    wins); if any key was upserted, its docs at head become one delta segment (`build_segment(..., version=head,
+    vector_models=)`, with the store's encoder) added by `Index.add_segment(delta, version=head, delete_ids=deleted)`,
+    which tombstones the older copies; else deletes → `Index.delete` and `set_version(head)`. Upserts are visible
+    after the refresh, not after a rebuild (`pending_upserts` is 0).
+  - `merge()` = `delta.merge_once`: `TieredMergePolicy.plan(index.segments)`; the budget check
+    (`index.device_nbytes + inputs' device_nbytes + work_nbytes <= budget`, else the merge waits); `snapshot_segments`
+    under the replica's lock, `merge_segments(..., version=V)` outside it, then under the lock the records in
+    `(V, index.version]` for the merged keys are replayed onto the merged arrays (patches into its hot columns;
+    upserted or deleted keys become `delete_ids`) and one `replace_segments`.
+  - `commit()` = `Index.save_commit(commit_dir)` (the delta segments are written with it), then `gc_commits`.
+    **The commit hole (§4) is closed by replay on load:** loading a commit replays the patches logged after its oldest
+    segment's version, each only onto keys whose live copy is in a segment built before that patch; then the log
+    after the commit is refreshed.
+  - `start(interval=None, merges=True)`: a refresher thread every `refresh_interval` and a merger thread (merges when
+    due; commits every `commit_every` s and after each merge, with `commit_dir`). `stop()`.
+  - Serving's `Ports.refresh` hook is `dataplane.updater.serving_refresh(managed_index)`: one `apply_delta` from the
+    oldest pending upsert, then one merge if due.
   `swap(new_segment_dir)` checks `current device_nbytes + new device_nbytes + work_nbytes <= budget` (the double
   buffer, §0; 2x when the two are the same size) and raises `engine.backend.OverBudget` otherwise, loads the second
   `Index`, replays changes after its version (outside the lock, then the rest under it), then swaps one reference;
-  searches in flight finish on the old one. A swap to an older segment is the rollback. `budget=None` is
-  `Backend.memory_budget()` (the §0 rule, computed by the updater until the backends land). Also `start(interval)` /
-  `stop()` (a background poller), `stats()`, `live_ids()`, `on_visible(fn)`. Freshness = time from `apply` returning
-  to `poll` making it visible.
+  searches in flight finish on the old one. A swap to an older commit or segment is the rollback. `budget=None` is
+  `Backend.memory_budget()`. Also `stats()` (with `segments`, `deleted`, `merges`), `live_ids()`, `on_visible(fn)`.
+  Freshness = time from `apply` returning to the refresh making it visible.
 - **The freshness hook** (for B1-4): `dataplane.freshness.run(store, replica, n_changes=10_000, batch=100,
   interval=0.005, queries=None, check_rebuild=True) -> FreshnessReport` writes hot-field patches to random live ids,
   measures each change's apply-to-visible latency (p50, p99, max) and compares every query's response with a fresh
@@ -355,7 +370,9 @@ Layout (`seg-<version>-<8 hex>/`):
   `uint32 [0xFFFFFFFE, 0x00000003]`).
 - **A commit holds deletes, not hot-column patches**: a patch applied after a segment's build lives only in memory,
   so a replica that loads a commit must replay the log from the oldest segment's version (patches are idempotent),
-  or the data plane must rebuild or merge the segment before committing. (Open with the dataplane-engineer.)
+  or the data plane must rebuild or merge the segment before committing. **Chosen (dataplane-engineer, 2026-11-10):
+  replay on load** (§3, "The updater"): a replica loading a commit replays the patches logged after its oldest
+  segment's version, each only onto keys whose live copy is in a segment built before that patch.
 - `Index.save(path)` writes one segment of the live docs (a merge); `Index.n_docs` is the live count.
 
 The engine side (`engine/api.py`):

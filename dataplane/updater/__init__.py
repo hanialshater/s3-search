@@ -1,15 +1,11 @@
-"""The updater (docs/INTERFACES.md §3, §0): a replica's live ``Index``, kept fresh from the change log.
+"""The updater (docs/INTERFACES.md §3, §0, §4 "Multi-segment indexes"): a replica's live ``Index``, a base segment
+plus delta segments, kept fresh from the change log (S8; S2 had one segment and in-place patches only).
 
-``Replica(store, segment_dir, device)`` loads a segment (checking ``device_nbytes + work_nbytes <= budget``) and
-catches up with the log. ``poll()`` reads ``store.changes(after=index.version)`` and makes them visible:
-``patch`` -> ``Index.patch`` (hot columns, in place), ``delete`` -> ``Index.delete`` (a tombstone: the live bit),
-``upsert`` -> counted as pending (visible after the next build and swap). ``swap(new_segment)`` checks the double
-buffer fits (``current + new device_nbytes + work_nbytes <= budget``, else ``OverBudget``), loads the second
-``Index``, replays the log after its version, and swaps one reference; searches in flight finish on the old one.
-
-Within a poll, changes are coalesced: the last value of a (field, id) wins, a deleted id is never patched, and each
-field is patched with one ``Index.patch`` call. A patch for an id the index does not hold live (an upsert since the
-segment, or a re-insert after a delete) waits for the next build, like the upsert it follows.
+Every refresh (0.5 s by default) turns what the store logged into one delta step (``delta.apply_delta``): patches in
+place, upserts as a small delta segment that tombstones their older copies, deletes as tombstones. A merger thread
+runs the tiered merge policy (``indexer.TieredMergePolicy``) with the snapshot, merge, replay and replace protocol
+(``delta.merge_once``) and writes commit points. ``swap`` replaces the whole index (a rebuild or a rollback) after the
+double-buffer budget check (``current + new device_nbytes + work_nbytes <= budget``, else ``OverBudget``).
 """
 from __future__ import annotations
 
@@ -20,8 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 from dataplane import _engine
-from dataplane.indexer import MANIFEST, latest_segment, read_manifest
+from dataplane.indexer import MANIFEST, TieredMergePolicy, latest_segment, read_manifest
+from dataplane.indexer.commit import gc_commits, latest_commit, read_commit
+from dataplane.updater.delta import DEFAULT_REFRESH, MergeReport, apply_delta, merge_once
 
 try:
     from engine.backend import OverBudget
@@ -81,8 +81,10 @@ class PollReport:
     version: int          # the index's version after the poll
     changes: int          # change records read
     patched: int          # (field, id) values patched in place
-    deleted: int          # ids whose live bit was cleared
-    pending_upserts: int  # upserts (and patches behind them) waiting for the next build, since the segment
+    deleted: int          # keys deleted or tombstoned
+    pending_upserts: int  # upserts not yet visible (0 with delta segments: a refresh makes them visible)
+    added: int = 0        # docs in the delta segment this refresh added
+    segment_id: str | None = None
 
 
 @dataclass
@@ -93,40 +95,87 @@ class SwapReport:
     replayed: int         # change records replayed onto the new index
 
 
-class _Live:
-    """One loaded index with what the updater knows about it."""
+def serving_refresh(mi) -> dict:
+    """Serving's ``Ports.refresh`` hook (serving runs it under the index's admin lock): one delta step from the
+    oldest pending upsert (serving has already applied the patches and deletes after it; re-applying them is
+    harmless), then one tiered merge if one is due."""
+    policy = getattr(mi, "merge_policy", None) or TieredMergePolicy()
+    with mi._store_lock:
+        store = mi._get_store()
+        index = mi.index
+        after = (mi.pending_since - 1) if mi.pending_since else int(index.version)
+        rep = apply_delta(index, store, min(after, int(index.version)))
+        mi.applied_offset = max(int(getattr(mi, "applied_offset", 0)), rep.version)
+        mi.pending_upserts, mi.pending_since = 0, None
+        merged = merge_once(index, store, policy)
+    mi.epoch += 1
+    mi.cache.clear()
+    return {"version": int(index.version), "segment_id": rep.segment_id, "added": rep.added,
+            "segments": len(index.segments), "merged": None if merged is None else merged.inputs}
 
-    def __init__(self, index, segment: Path, ids: list[str], manifest: dict):
-        self.index = index
-        self.segment = segment
-        self.manifest = manifest
-        self.live = set(ids)          # ids the index holds with the live bit set
-        self.n_docs = len(ids)
-        self.deleted = 0
-        self.pending = 0
-        self.loaded_at = time.time()
+
+def _resolve(path: str | Path) -> tuple[str, Path]:
+    """``("commit", file)``, ``("segment", dir)``: what ``path`` names (a commit file, a segment, or a directory
+    whose newest commit, else newest segment, is used)."""
+    p = Path(path)
+    if p.is_file() and p.name.startswith("commit-"):
+        return "commit", p
+    if (p / MANIFEST).exists():
+        return "segment", p
+    c = latest_commit(p)
+    if c is not None:
+        return "commit", c
+    return "segment", _resolve_segment(p)
 
 
 class Replica:
+    """A replica's live ``Index`` over a base segment plus delta segments (S8), kept fresh from the store's log.
+
+    - ``refresh()`` (and ``poll()``, the S2 name for the same step): one delta step, ``delta.apply_delta``.
+    - ``merge()``: one tiered merge (``delta.merge_once``) under the budget check.
+    - ``commit()``: ``Index.save_commit`` into ``commit_dir``, then ``gc_commits``.
+    - ``start(interval)``: a refresher thread every ``interval`` (default 0.5 s) and a merger thread that merges when
+      the policy says so and commits every ``commit_every`` seconds (with ``commit_dir``).
+    - ``swap(path)``: a whole new index (a rebuild, or a rollback to a commit or segment), caught up, then one
+      reference swap after the double-buffer budget check.
+
+    Loading a commit: a commit holds deletes, not hot-column patches, so the patches logged after the oldest
+    segment's version and up to the commit's are replayed, each only onto keys whose live copy is in a segment built
+    before that patch (a segment built after it already holds it, or a newer value). Then the log after the commit
+    is applied as a refresh.
+    """
+
     def __init__(self, store, segment_dir: str | Path, device: str = "cpu", budget: int | None = None,
-                 batch: int = DEFAULT_BATCH, page: int = 10_000):
+                 batch: int = DEFAULT_BATCH, page: int = 10_000, refresh_interval: float = DEFAULT_REFRESH,
+                 merge_policy: TieredMergePolicy | None = None, commit_dir: str | Path | None = None,
+                 commit_every: float = 5.0, keep_commits: int = 3):
         self.store = store
         self.device = device
         self.batch = batch
         self.page = page
+        self.refresh_interval = refresh_interval
+        self.merge_policy = merge_policy or TieredMergePolicy()
+        self.commit_dir = Path(commit_dir) if commit_dir is not None else None
+        self.commit_every = commit_every
+        self.keep_commits = keep_commits
         self._budget = budget
-        self._lock = threading.RLock()        # one writer to the live index at a time (poll, swap)
+        self._lock = threading.RLock()        # one writer to the live index at a time (refresh, merge, swap)
         self._listeners: list[Callable[[int, float], None]] = []
-        self._thread: threading.Thread | None = None
+        self._threads: list[threading.Thread] = []
+        self._thread: threading.Thread | None = None   # the refresher (kept for S2 callers that look at it)
         self._stop = threading.Event()
-        self.last_error: Exception | None = None   # the background poller's last failure, if any
-        seg = _resolve_segment(segment_dir)
-        man = read_manifest(seg)
-        need = int(man.get("device_nbytes", 0)) + work_nbytes(int(man.get("n_docs", 0)), batch)
+        self.last_error: Exception | None = None       # the background threads' last failure, if any
+        self.merges: list[MergeReport] = []
+        self._committed = -1
+        kind, path = _resolve(segment_dir)
+        self._kind, self._path = kind, path
+        nbytes, n = self._footprint(kind, path)
+        need = nbytes + work_nbytes(n, batch)
         if need > self.budget:
-            raise OverBudget(f"loading {seg.name} needs {need} bytes on {device}; the budget is {self.budget}")
-        self._cur = self._load(seg, man)
-        self._replay(self._cur)
+            raise OverBudget(f"loading {path.name} needs {need} bytes on {device}; the budget is {self.budget}")
+        self._index, self._live = self._load(kind, path)
+        self._loaded_at = time.time()
+        self.refresh()
 
     # ---- state ------------------------------------------------------------------------------------------------------
     @property
@@ -135,147 +184,202 @@ class Replica:
 
     @property
     def index(self):
-        """The live index. Callers that search hold this reference for the whole request."""
-        return self._cur.index
+        """The live index. Refreshes and merges change it in place; ``swap`` replaces it."""
+        return self._index
 
     @property
     def version(self) -> int:
-        return int(self._cur.index.version)
+        return int(self._index.version)
 
     @property
     def segment(self) -> Path:
-        return self._cur.segment
+        """What this replica was loaded or last swapped from (a segment directory or a commit file)."""
+        return self._path
 
     def search(self, request: dict) -> dict:
-        return self._cur.index.search(request)
+        return self._index.search(request)
 
     def search_batch(self, requests: list[dict]) -> list[dict]:
-        return self._cur.index.search_batch(requests)
+        return self._index.search_batch(requests)
 
     def stats(self) -> dict:
-        c = self._cur
-        return {"segment": c.segment.name, "version": self.version, "segment_version": int(c.manifest.get("version", 0)),
-                "n_docs": c.n_docs, "live": len(c.live), "deleted": c.deleted, "pending_upserts": c.pending,
-                "loaded_at": c.loaded_at, "device": self.device, "device_nbytes": int(c.manifest.get("device_nbytes", 0))}
+        segs = self._index.segments
+        n = sum(s["n_docs"] for s in segs)
+        live = sum(s["live"] for s in segs)
+        return {"segment": self._path.name, "version": self.version, "segments": len(segs), "n_docs": n,
+                "live": live, "deleted": n - live, "pending_upserts": 0, "loaded_at": self._loaded_at,
+                "device": self.device, "device_nbytes": int(self._index.device_nbytes), "merges": len(self.merges)}
 
     def live_ids(self) -> list[str]:
-        return sorted(self._cur.live)
+        return sorted(self._live)
 
     def on_visible(self, fn: Callable[[int, float], None]) -> None:
-        """Call ``fn(version, perf_counter())`` after each poll that moved the version (freshness measurement)."""
+        """Call ``fn(version, perf_counter())`` after each step that moved the version (freshness measurement)."""
         self._listeners.append(fn)
 
     def off_visible(self, fn: Callable[[int, float], None]) -> None:
         if fn in self._listeners:
             self._listeners.remove(fn)
 
-    # ---- loading and replay -----------------------------------------------------------------------------------------
-    def _load(self, seg: Path, man: dict) -> _Live:
-        index = _engine.hooks().index_from_segment(seg, self.device)
-        return _Live(index, seg, _segment_ids(seg), man)
-
-    def _apply(self, cur: _Live, recs: list[dict]) -> tuple[int, int]:
-        patches: dict[str, dict[str, object]] = {}
-        dead: list[str] = []
-        live = cur.live
-        for r in recs:
-            op, _id = r["op"], r["_id"]
-            if op == "patch":
-                if _id in live:
-                    for f, v in r["fields"].items():
-                        patches.setdefault(f, {})[_id] = v
-                else:
-                    cur.pending += 1
-            elif op == "delete":
-                if _id in live:
-                    live.discard(_id)
-                    dead.append(_id)
-                    for p in patches.values():
-                        p.pop(_id, None)
-            else:
-                cur.pending += 1
-        index = cur.index
-        if dead:
-            index.delete(dead)
-            cur.deleted += len(dead)
-        n = 0
-        for f, vals in patches.items():
-            if vals:
-                index.patch(f, list(vals), list(vals.values()))
-                n += len(vals)
-        return n, len(dead)
-
-    def _replay(self, cur: _Live) -> PollReport:
-        changes = patched = deleted = 0
-        while True:
-            recs = self.store.changes(after=int(cur.index.version), limit=self.page, docs=False)
-            if not recs:
-                break
-            p, d = self._apply(cur, recs)
-            cur.index.set_version(recs[-1]["offset"])
-            changes += len(recs)
-            patched += p
-            deleted += d
-            if len(recs) < self.page:
-                break
-        return PollReport(int(cur.index.version), changes, patched, deleted, cur.pending)
-
-    # ---- the two operations -----------------------------------------------------------------------------------------
-    def poll(self) -> PollReport:
-        with self._lock:
-            before = self.version
-            rep = self._replay(self._cur)
-        if rep.version != before:
-            t = time.perf_counter()
-            for fn in list(self._listeners):
-                fn(rep.version, t)
-        return rep
-
-    def swap(self, new_segment: str | Path) -> SwapReport:
-        seg = _resolve_segment(new_segment)
-        man = read_manifest(seg)
-        cur_bytes = int(self._cur.manifest.get("device_nbytes", 0))
-        new_bytes = int(man.get("device_nbytes", 0))
-        need = cur_bytes + new_bytes + work_nbytes(max(int(man.get("n_docs", 0)), self._cur.n_docs), self.batch)
-        if need > self.budget:
-            raise OverBudget(f"swapping to {seg.name} needs {need} bytes on {self.device} (double buffer); "
-                             f"the budget is {self.budget}")
-        nxt = self._load(seg, man)
-        first = self._replay(nxt)                 # the bulk of the replay, outside the lock
-        with self._lock:
-            last = self._replay(nxt)              # what arrived meanwhile
-            old = self._cur
-            self._cur = nxt                       # the swap: one reference
+    def _notify(self) -> None:
         t = time.perf_counter()
         for fn in list(self._listeners):
             fn(self.version, t)
-        return SwapReport(seg, int(old.index.version), int(nxt.index.version), first.changes + last.changes)
 
-    # ---- a background poller ----------------------------------------------------------------------------------------
-    def start(self, interval: float = 0.05) -> "Replica":
+    # ---- loading ----------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _footprint(kind: str, path: Path) -> tuple[int, int]:
+        if kind == "segment":
+            man = read_manifest(path)
+            return int(man.get("device_nbytes", 0)), int(man.get("n_docs", 0))
+        c = read_commit(path, verify=False)
+        mans = [read_manifest(path.parent / s) for s in c["segments"]]
+        return sum(int(m.get("device_nbytes", 0)) for m in mans), sum(int(m.get("n_docs", 0)) for m in mans)
+
+    def _load(self, kind: str, path: Path):
+        from engine.api import Index
+        if kind == "segment":
+            index = _engine.hooks().index_from_segment(path, self.device)
+            return index, set(_segment_ids(path))
+        index = Index.from_commit(path, device=self.device)
+        c = read_commit(path)
+        owner: dict[str, int] = {}
+        for sid in c["segments"]:
+            d = path.parent / sid
+            ids = _segment_ids(d)
+            v = int(read_manifest(d).get("version", 0))
+            bits = c["live"].get(sid)
+            if bits is None:
+                alive = range(len(ids))
+            else:
+                words = np.asarray(bits, np.uint32)
+                alive = [i for i in range(len(ids)) if (int(words[i >> 5]) >> (i & 31)) & 1]
+            for i in alive:
+                owner[ids[i]] = v
+        self._replay_patches(index, owner, upto=int(c["version"]))
+        return index, set(owner)
+
+    def _replay_patches(self, index, owner: dict[str, int], upto: int) -> int:
+        """The commit hole (§3): patches in (oldest segment version, upto] onto keys whose live copy predates them."""
+        if not owner:
+            return 0
+        after = min(owner.values())
+        runs: dict[str, dict[str, object]] = {}
+        while after < upto:
+            recs = self.store.changes(after, limit=self.page, docs=False)
+            if not recs:
+                break
+            for r in recs:
+                if r["offset"] > upto:
+                    break
+                if r["op"] == "patch" and r["_id"] in owner and r["offset"] > owner[r["_id"]]:
+                    for f, v in r["fields"].items():
+                        runs.setdefault(f, {})[r["_id"]] = v
+            after = recs[-1]["offset"]
+        n = 0
+        for f, kv in runs.items():
+            index.patch(f, list(kv), list(kv.values()))
+            n += len(kv)
+        return n
+
+    # ---- the steps --------------------------------------------------------------------------------------------------
+    def refresh(self) -> PollReport:
+        with self._lock:
+            before = self.version
+            rep = apply_delta(self._index, self.store, before)
+            self._live.difference_update(rep.removed)
+            self._live.update(rep.upserted)
+        if rep.version != before:
+            self._notify()
+        return PollReport(rep.version, rep.records, rep.patched, rep.deleted, 0, rep.added, rep.segment_id)
+
+    poll = refresh
+
+    def merge(self) -> MergeReport | None:
+        work = work_nbytes(int(self._index.n_docs), self.batch)
+        rep = merge_once(self._index, self.store, self.merge_policy, lock=self._lock, budget=self.budget, work=work)
+        if rep is not None:
+            self.merges.append(rep)
+        return rep
+
+    def commit(self) -> Path | None:
+        if self.commit_dir is None:
+            return None
+        with self._lock:
+            if self.version == self._committed:
+                return latest_commit(self.commit_dir)
+            p = Path(self._index.save_commit(self.commit_dir))
+            self._committed = self.version
+        gc_commits(self.commit_dir, keep=self.keep_commits)
+        return p
+
+    def swap(self, new_segment: str | Path) -> SwapReport:
+        kind, path = _resolve(new_segment)
+        nbytes, n = self._footprint(kind, path)
+        need = int(self._index.device_nbytes) + nbytes + work_nbytes(max(n, int(self._index.n_docs)), self.batch)
+        if need > self.budget:
+            raise OverBudget(f"swapping to {path.name} needs {need} bytes on {self.device} (double buffer); "
+                             f"the budget is {self.budget}")
+        index, live = self._load(kind, path)
+        first = apply_delta(index, self.store, int(index.version))   # the bulk of the replay, outside the lock
+        live.difference_update(first.removed)
+        live.update(first.upserted)
+        with self._lock:
+            last = apply_delta(index, self.store, int(index.version))   # what arrived meanwhile
+            live.difference_update(last.removed)
+            live.update(last.upserted)
+            old = self._index
+            self._index, self._live, self._kind, self._path = index, live, kind, path
+            self._loaded_at = time.time()
+        self._notify()
+        return SwapReport(path, int(old.version), int(index.version), first.records + last.records)
+
+    # ---- background threads -----------------------------------------------------------------------------------------
+    def start(self, interval: float | None = None, merges: bool = True) -> "Replica":
+        """A refresher every ``interval`` seconds (default ``refresh_interval``) and, with ``merges``, a merger."""
         if self._thread is not None:
             return self
         self._stop.clear()
+        interval = self.refresh_interval if interval is None else interval
 
-        def run():
+        def guard(fn):
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001 - keep going; the next step retries from the same offset
+                self.last_error = e
+
+        def refresher():
             while not self._stop.is_set():
-                try:
-                    self.poll()
-                    self.last_error = None
-                except Exception as e:  # keep polling; the next poll retries from the same offset
-                    self.last_error = e
+                guard(self.refresh)
                 self._stop.wait(interval)
 
-        self._thread = threading.Thread(target=run, name="replica-poll", daemon=True)
-        self._thread.start()
+        def merger():
+            last_commit = time.monotonic()
+            while not self._stop.is_set():
+                merged = []
+                guard(lambda: merged.append(self.merge()))
+                if self.commit_dir is not None and (merged and merged[0] is not None
+                                                    or time.monotonic() - last_commit >= self.commit_every):
+                    guard(self.commit)
+                    last_commit = time.monotonic()
+                if not (merged and merged[0] is not None):
+                    self._stop.wait(max(interval, 0.05))
+
+        self._thread = threading.Thread(target=refresher, name="replica-refresh", daemon=True)
+        self._threads = [self._thread]
+        if merges:
+            self._threads.append(threading.Thread(target=merger, name="replica-merge", daemon=True))
+        for t in self._threads:
+            t.start()
         return self
 
     def stop(self) -> None:
         if self._thread is None:
             return
         self._stop.set()
-        self._thread.join()
-        self._thread = None
+        for t in self._threads:
+            t.join()
+        self._threads, self._thread = [], None
 
     def __enter__(self) -> "Replica":
         return self

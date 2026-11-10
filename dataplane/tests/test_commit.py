@@ -80,3 +80,19 @@ def test_gc_keeps_what_the_kept_commits_name(two_segments, store, catalogue):
     assert latest_commit(out).name == "commit-150.json" and a.exists() and b.exists()
     removed = {p.name for p in gc_commits(out, keep=1)}
     assert removed == {"commit-140.json", f"del-140-{a.name}.npy", a.name, b.name} and c.exists()
+
+
+def test_commit_checksum_vector(tmp_path):
+    """The shared vector (engine/tests/test_s8_segments.py::test_commit_checksum_vector, recorded in §4): the
+    data plane's and the engine's commit writers hash the same bytes."""
+    import hashlib
+    from engine.commit import commit_checksum as engine_checksum
+    bits = np.array([0xFFFFFFFE, 0x00000003], dtype=np.uint32)
+    with open(tmp_path / "del-7-seg-5-aaaa0000.npy", "wb") as fh:
+        np.save(fh, bits, allow_pickle=False)
+    commit = {"format": "s3commit", "format_version": 1, "version": 7, "segments": ["seg-5-aaaa0000", "seg-7-bbbb1111"],
+              "deletes": {"seg-5-aaaa0000": "del-7-seg-5-aaaa0000.npy"}}
+    file_sha = hashlib.sha256((tmp_path / "del-7-seg-5-aaaa0000.npy").read_bytes()).hexdigest()
+    body = dict(commit, delete_sha256={"seg-5-aaaa0000": file_sha})
+    want = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert commit_checksum(commit, tmp_path) == want == engine_checksum(commit, tmp_path)

@@ -83,7 +83,12 @@ def default_ports() -> Ports:
         from dataplane.intake import apply_changes as _apply
         return _apply(changes, mapping, store)
 
-    return Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker, apply_changes)
+    def refresh(managed_index):
+        # S8-4 (dataplane-engineer): a delta segment of the pending upserts, then one tiered merge if due
+        from dataplane.updater import serving_refresh
+        return serving_refresh(managed_index)
+
+    return Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker, apply_changes, refresh)
 
 
 def read_manifest(segment_dir: Path) -> dict:
