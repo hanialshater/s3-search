@@ -81,6 +81,8 @@ def check_tree(node: dict, path: str = "root") -> list[dict]:
                             "kind": kind, "ok": _close(float(node["value"]), exp)})
         for i, k in enumerate(kids):
             out += check_tree(k, f"{path}/{i}")
+    if isinstance(node.get("source"), dict):  # the tree a value came from: never summed into this node, but checked itself
+        out += check_tree(node["source"], f"{path}/source")
     return out
 
 
