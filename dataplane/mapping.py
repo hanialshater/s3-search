@@ -19,6 +19,7 @@ NUMERIC = ("float", "integer", "long", "boolean")
 ID_MAX_BYTES = 512
 INT32 = (-(2 ** 31), 2 ** 31 - 1)
 INT64 = (-(2 ** 63), 2 ** 63 - 1)
+_F32_MAX = float(np.finfo(np.float32).max)
 
 
 class InvalidMapping(ValueError):
@@ -141,18 +142,25 @@ def parse_mapping(raw: dict) -> Mapping:
 
 # ---- values ---------------------------------------------------------------------------------------------------------
 
+try:
+    import pandas as _pd
+    _PD_MISSING = (_pd.NA, _pd.NaT)
+except ImportError:  # pragma: no cover
+    _PD_MISSING = ()
+_PLAIN = (str, int, bool)      # never missing: the common case returns at once
+
+
 def is_missing(v: Any) -> bool:
+    t = type(v)
+    if t in _PLAIN:
+        return False
     if v is None:
         return True
-    if isinstance(v, float) and math.isnan(v):
-        return True
-    if isinstance(v, np.floating) and np.isnan(v):
-        return True
-    try:
-        import pandas as pd
-        return v is pd.NA or v is pd.NaT
-    except ImportError:  # pragma: no cover
-        return False
+    if t is float:
+        return v != v
+    if isinstance(v, np.floating):
+        return bool(np.isnan(v))
+    return any(v is m for m in _PD_MISSING)
 
 
 def _is_bool(v: Any) -> bool:
@@ -183,7 +191,7 @@ def coerce(f: Field, v: Any) -> Any:
             x = float(v)
         except (TypeError, ValueError):
             raise BadValue("bad_type", f"float field {f.name!r} got {v!r:.80}") from None
-        if not math.isfinite(x) or abs(x) > float(np.finfo(np.float32).max):
+        if not math.isfinite(x) or abs(x) > _F32_MAX:
             raise BadValue("bad_type", f"float field {f.name!r} got a non-finite or out-of-range value {x!r}")
         return x
     if t in ("integer", "long"):
