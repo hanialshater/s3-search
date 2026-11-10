@@ -305,7 +305,7 @@ class Planner:
         if len(q.vector) != dim:
             raise InvalidRequest(f"{p}.vector", f"a list of {dim} numbers")
         flt = self.node(q.filter) if q.filter is not None else None
-        return Dense(q.field, q.vector, None, q.k, flt, q.boost, q.path)
+        return Dense(q.field, q.vector, None, q.k, flt, q.boost, q.path, q.method, q.method_parameters)
 
     def n_QNeural(self, q):
         p = f"{q.path}.{q.field}"
@@ -313,7 +313,7 @@ class Planner:
         if q.field not in self.s.encoders:
             raise UnsupportedQuery(p, f"field {q.field!r} has no query encoder in this index (given vectors: use knn)")
         flt = self.node(q.filter) if q.filter is not None else None
-        return Dense(q.field, None, q.text, q.k, flt, q.boost, q.path)
+        return Dense(q.field, None, q.text, q.k, flt, q.boost, q.path, q.method, q.method_parameters)
 
     def n_QHybrid(self, q):
         return Hybrid(tuple(map(self.node, q.queries)), path=q.path)

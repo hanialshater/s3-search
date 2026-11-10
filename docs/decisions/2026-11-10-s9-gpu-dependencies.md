@@ -24,6 +24,9 @@ HNSW; use cuVS and cuML where they fit", with the budget line search-floor-s9 ($
    differ from the reference by up to a few 1e-6 (measured 2.4e-6 on 10,000 rows here, on CPU XGBoost 3.4.1).
 4. **S9-1, cuVS** for approximate knn (CAGRA, IVF-PQ), built per segment and filtered with cuVS's bitset prefilter;
    exact knn is the fallback without cuVS or a GPU, and the response names the method that ran.
+5. **The GPU numbers** come from `python -m colab.s9_gpu_check --out results_s9.json`, which the founder runs in Colab
+   (S9 predictions 1 to 3: cuVS recall against exact, filtered and not; the GPU fit's time and nDCG@10; the trees'
+   differences and rescored orders). It writes numbers for the evaluation steward's judges and judges nothing.
 
 **Why.** The founder asked for GPU-friendly features with cuVS and cuML where they fit, and no HNSW; CI must stay
 light and CPU-only; and every GPU path must be checkable against the CPU reference.

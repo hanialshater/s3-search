@@ -115,10 +115,10 @@ encoder stay the reference and the fallback.
 
 | Id | Item | Owner | Status | Claimed |
 |---|---|---|---|---|
-| S9-1 | cuVS approximate knn: CAGRA and IVF-PQ, filtered; built per segment, rebuilt on merge; exact knn as the CPU fallback, the method named in the response | architect | claimed | architect, 2026-11-10 |
-| S9-2 | The tfidf-svd encoder fitted and applied with cuML on the GPU; the fitted encoder stored as now | architect | claimed | architect, 2026-11-10 |
-| S9-3 | GBDT inference on the GPU (cuML FIL or XGBoost), equal to the reference within 1e-5 | architect | claimed | architect, 2026-11-10 |
-| S9-4 | Geo: the `geo_point` type, `geo_distance`, `geo_bounding_box`, `_geo_distance` sort | architect | claimed | architect, 2026-11-10 |
-| S9-5 | Nested documents: the `nested` type, the `nested` query with `score_mode`, the `nested` aggregation | architect | claimed | architect, 2026-11-10 |
+| S9-1 | cuVS approximate knn: CAGRA and IVF-PQ, filtered; built per segment, rebuilt on merge; exact knn as the CPU fallback, the method named in the response | architect | in review | architect, 2026-11-10 |
+| S9-2 | The tfidf-svd encoder fitted and applied with cuML on the GPU; the fitted encoder stored as now | architect | in review | architect, 2026-11-10 |
+| S9-3 | GBDT inference on the GPU (cuML FIL or XGBoost), equal to the reference within 1e-5 | architect | in review | architect, 2026-11-10 |
+| S9-4 | Geo: the `geo_point` type, `geo_distance`, `geo_bounding_box`, `_geo_distance` sort | architect | in review | architect, 2026-11-10 |
+| S9-5 | Nested documents: the `nested` type, the `nested` query with `score_mode`, the `nested` aggregation | architect | in review | architect, 2026-11-10 |
 | S9-6 | Conformance families for geo and nested against OpenSearch 2.19; the Colab judges for S9-1 to S9-3 | evaluation-steward | open | |
 | S9-7 | Demo: a geo filter and nested facets | tools-engineer | open | |
