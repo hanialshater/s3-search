@@ -290,6 +290,38 @@ class Executor:
             return kw.codes, kw.values
         return st.value_codes(field)
 
+    # ---- aggregations (S7-4)
+    def _agg(self, a, mask):
+        from .. import aggs as A
+        b, st = self.b, self.st
+        if a.kind == "terms":
+            codes, keys_of = self._facet_codes(a.field)
+            counts = ops.facet_terms(b, codes, mask.reshape(1, -1), len(keys_of))
+            (top, with_value), = ops.top_buckets(b, counts, a.size)
+            buckets = []
+            for c, n in top:
+                bk = {"key": keys_of[c], "doc_count": n}
+                if a.sub:
+                    sub_mask = mask & (codes == c)
+                    for x in a.sub:
+                        bk[x.name] = self._agg(x, sub_mask)
+                buckets.append(bk)
+            return {"doc_count_error_upper_bound": 0, "sum_other_doc_count": with_value - sum(c for _, c in top),
+                    "buckets": buckets}
+        if a.kind in ("value_count", "cardinality") and a.field in st.keywords:
+            codes = st.keywords[a.field].codes
+            return A.keyword_metric(b, a.kind, codes, mask, st.keywords[a.field].n)
+        vals, miss = st.numerics[a.field], st.missing[a.field]
+        present = mask & ~miss
+        if a.kind == "cardinality":
+            codes, keys_of = st.value_codes(a.field)
+            return A.keyword_metric(b, "cardinality", codes, present, len(keys_of))
+        if a.kind == "range":
+            return A.range_agg(b, vals, present, a.param("ranges"))
+        if a.kind == "histogram":
+            return A.histogram(b, vals, present, a.param("interval"), a.param("offset"), a.param("min_doc_count"))
+        return A.metric(b, a.kind, vals, present)
+
     # ---- sort keys
     def _keys(self, plan, score, tier=None):
         b, st = self.b, self.st
@@ -415,15 +447,7 @@ class Executor:
                 score, tier = self._rescore(plan, score, match, ctx, t)
             resp = {}
             if plan.aggs:
-                aggs = {}
-                for a in plan.aggs:
-                    codes, keys_of = self._facet_codes(a.field)
-                    counts = ops.facet_terms(b, codes, match.reshape(1, -1), len(keys_of))
-                    (top, with_value), = ops.top_buckets(b, counts, a.size)
-                    aggs[a.name] = {"doc_count_error_upper_bound": 0,
-                                    "sum_other_doc_count": with_value - sum(c for _, c in top),
-                                    "buckets": [{"key": keys_of[c], "doc_count": n} for c, n in top]}
-                resp["aggregations"] = aggs
+                resp["aggregations"] = {a.name: self._agg(a, match) for a in plan.aggs}
                 t.lap("facet")
             keys = self._keys(plan, score, tier)
             after = self._after_to_keys(plan, plan.search_after, tier is not None) if plan.search_after else None

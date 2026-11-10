@@ -70,6 +70,10 @@ class NumpyBackend:
     def log1p(self, a):
         return np.log1p(a)
 
+    def amin(self, a):
+        """The minimum of all elements (a 0-d array)."""
+        return np.asarray(a.min())
+
     def isnan(self, a):
         return np.isnan(a)
 

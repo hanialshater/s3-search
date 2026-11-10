@@ -113,9 +113,16 @@ Node = Union[Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, Ma
 
 @dataclass(frozen=True)
 class TermsAgg:
+    """An aggregation node (S7-4: any kind, not only terms; the name is kept for compatibility)."""
     name: str
     field: str
     size: int = 10
+    kind: str = "terms"
+    params: tuple = ()
+    sub: tuple = ()
+
+    def param(self, key, default=None):
+        return dict(self.params).get(key, default)
 
 
 @dataclass(frozen=True)

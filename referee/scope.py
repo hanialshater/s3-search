@@ -35,15 +35,15 @@ SCOPE = [
     ("collapse keyword", "S7-3", True, "collapse", {"query": Q, "collapse": {"field": "category"}}),
     ("collapse numeric", "S7-3", True, "collapse", {"query": Q, "collapse": {"field": "stock"}}),
     # S7-4: metric and bucket aggregations, one level of sub-aggregations under terms
-    *[(f"agg {a}", "S7-4", False, a, {"query": Q, "size": 0, "aggs": {"x": {a: {"field": "price"}}}})
+    *[(f"agg {a}", "S7-4", True, a, {"query": Q, "size": 0, "aggs": {"x": {a: {"field": "price"}}}})
       for a in ("min", "max", "avg", "sum", "stats", "value_count")],
-    ("agg cardinality", "S7-4", False, "cardinality",
+    ("agg cardinality", "S7-4", True, "cardinality",
      {"query": Q, "size": 0, "aggs": {"x": {"cardinality": {"field": "category"}}}}),
-    ("agg range", "S7-4", False, "range",
+    ("agg range", "S7-4", True, "range",
      {"size": 0, "aggs": {"x": {"range": {"field": "price", "ranges": [{"to": 50}, {"from": 50}]}}}}),
-    ("agg histogram", "S7-4", False, "histogram",
+    ("agg histogram", "S7-4", True, "histogram",
      {"size": 0, "aggs": {"x": {"histogram": {"field": "price", "interval": 50}}}}),
-    ("agg terms sub-aggregation", "S7-4", False, "aggs",
+    ("agg terms sub-aggregation", "S7-4", True, "aggs",
      {"size": 0, "aggs": {"c": {"terms": {"field": "category"}, "aggs": {"p": {"avg": {"field": "price"}}}}}}),
     # S7-5: highlight (plain, text fields), function_score with field_value_factor and weight
     ("highlight text", "S7-5", False, "highlight", {"query": Q, "highlight": {"fields": {"product_title": {}}}}),
