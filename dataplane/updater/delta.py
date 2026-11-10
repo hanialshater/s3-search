@@ -148,6 +148,8 @@ class MergeReport:
     version: int
     replayed: int
     seconds: float
+    locked_seconds: float = 0.0     # time holding the caller's lock (snapshot, then replay and replace)
+    merge_seconds: float = 0.0      # merge_segments, outside the lock
 
 
 def merge_once(index, store, policy, lock=None, budget: int | None = None, work: int = 0) -> MergeReport | None:
@@ -166,7 +168,9 @@ def merge_once(index, store, policy, lock=None, budget: int | None = None, work:
     t0 = time.perf_counter()
     with lock:
         snaps, v = index.snapshot_segments(plan)
+    t1 = time.perf_counter()
     merged = merge_segments(snaps, store.mapping.raw, version=v)
+    t2 = time.perf_counter()
     with lock:
         recs = [r for r in store.changes(v, limit=max(1, int(index.version) - v), docs=False)
                 if r["offset"] <= int(index.version)] if int(index.version) > v else []
@@ -182,4 +186,6 @@ def merge_once(index, store, policy, lock=None, budget: int | None = None, work:
             else:
                 dead.append(k)
         index.replace_segments(plan, merged, delete_ids=dead)
-    return MergeReport(plan, merged.manifest.get("segment_id", ""), len(pos), v, len(recs), time.perf_counter() - t0)
+    t3 = time.perf_counter()
+    return MergeReport(plan, merged.manifest.get("segment_id", ""), len(pos), v, len(recs), t3 - t0,
+                       (t1 - t0) + (t3 - t2), t2 - t1)

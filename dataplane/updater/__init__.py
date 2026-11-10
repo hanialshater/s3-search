@@ -348,10 +348,12 @@ class Replica:
             except Exception as e:  # noqa: BLE001 - keep going; the next step retries from the same offset
                 self.last_error = e
 
-        def refresher():
+        def refresher():                     # a fixed cadence: the refresh's own cost does not stretch the period
+            due = time.monotonic()
             while not self._stop.is_set():
                 guard(self.refresh)
-                self._stop.wait(interval)
+                due = max(due + interval, time.monotonic())
+                self._stop.wait(max(0.0, due - time.monotonic()))
 
         def merger():
             last_commit = time.monotonic()
