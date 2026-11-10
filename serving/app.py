@@ -12,6 +12,8 @@ Routes::
     POST /indexes/{name}/_docs       [{"op", "_id", "doc"|"fields"}, ...] -> {"first_offset", "last_offset", ...}
     POST /indexes/{name}/_reindex    {} -> {"segment_id", "version"}
     GET  /indexes/{name}/versions    -> [{"segment_id", "version", "created", "live"}]
+    POST /indexes/{name}/_rankers    {"name", "path"} -> {"name", "rankers"}    (a ranker JSON under the data dir, for rescore)
+    GET  /indexes/{name}/_mapping    {name: {"mappings": ..., "s3_fields": {field: capabilities}}}
     POST /indexes/{name}/_rollback   {"segment_id"} -> {"segment_id", "version"}
     GET  /indexes, /indexes/{name}   what is loaded
     GET  /healthz /readyz /metrics   liveness, readiness, Prometheus text
@@ -40,7 +42,7 @@ from .ports import Ports, default_ports
 log = logging.getLogger("serving")
 
 _INDEX_ROUTE = re.compile(r"^/indexes/([^/]+)(?:/([^/]+))?$")
-_ACTIONS = {"_search": "POST", "_msearch": "POST", "_docs": "POST", "_reindex": "POST", "_rollback": "POST",
+_ACTIONS = {"_search": "POST", "_msearch": "POST", "_docs": "POST", "_reindex": "POST", "_rollback": "POST", "_rankers": "POST", "_mapping": "GET",
             "versions": "GET"}
 
 
@@ -180,6 +182,15 @@ class App:
 
     def _reindex(self, mi, body: bytes) -> Response:
         return _json(200, mi.reindex())
+
+    def _rankers(self, mi, body: bytes) -> Response:
+        spec = self._parse(body)
+        if not isinstance(spec, dict):
+            raise InvalidRequestBody('body is {"name": "...", "path": "..."}', path="")
+        return _json(200, mi.add_ranker(spec.get("name"), spec.get("path")))
+
+    def _mapping(self, mi, body: bytes) -> Response:
+        return _json(200, {mi.name: {"mappings": mi.mapping, "s3_fields": mi.field_capabilities()}})
 
     def _versions(self, mi, body: bytes) -> Response:
         return _json(200, mi.versions())

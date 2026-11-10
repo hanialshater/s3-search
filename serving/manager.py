@@ -40,6 +40,7 @@ class ManagedIndex:
         self.epoch = 0
         self.applied_offset = 0
         self.pending_upserts = 0
+        self.rankers: dict[str, Any] = {}        # re-registered on every new Index, so a swap keeps them
         self._admin = threading.RLock()          # one admin operation at a time
         self._store_lock = threading.RLock()     # the store is one SQLite connection
         self._store: Any = None
@@ -111,6 +112,8 @@ class ManagedIndex:
             store = self._get_store()
             if store is not None:
                 self._replay(new_index, after=getattr(new_index, "version", 0))
+        for rname, model in self.rankers.items():
+            new_index.add_ranker(rname, model)
         self.index, self.segment_id = new_index, segment_id
         self.epoch += 1
         self.cache.clear()
@@ -175,6 +178,51 @@ class ManagedIndex:
             seg_dir = self._segment_dir(segment_id)
             self._swap_in(self._load(seg_dir), segment_id, "rollback")
             return {"segment_id": self.segment_id, "version": self.index.version}
+
+    def add_ranker(self, name: str, path: str) -> dict:
+        """Load a trained ranker file (under the data dir) and register it for ``rescore.s3_ranker``."""
+        if not isinstance(name, str) or not name or not isinstance(path, str) or not path:
+            raise InvalidRequestBody('body is {"name": "...", "path": "..."}', path="name")
+        if self.ports.load_ranker is None:
+            raise InvalidRequestBody("no ranker loader configured", path="path")
+        base = Path(self.cfg.data_dir).resolve()
+        full = (base / path).resolve()
+        if base not in full.parents:
+            raise InvalidRequestBody("ranker files must live under the serving data dir", path="path")
+        if not full.is_file():
+            raise InvalidRequestBody(f"no ranker file {path!r} under the data dir", path="path")
+        with self._admin:
+            if not self.ready:
+                raise NotReady(f"index {self.name!r} is not loaded")
+            try:
+                model = self.ports.load_ranker(full)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise InvalidRequestBody(f"not a ranker file: {exc}", path="path") from None
+            self.index.add_ranker(name, model)
+            self.rankers[name] = model
+            self.epoch += 1
+            self.cache.clear()
+        return {"name": name, "rankers": sorted(self.rankers)}
+
+    def field_capabilities(self) -> dict:
+        """Per field (sub-fields as ``f.keyword``): type and what it can do, for the demo page and other clients."""
+        hot = set(((self.mapping.get("_meta") or {}).get("engine") or {}).get("hot") or [])
+        out: dict = {}
+        scalar = ("keyword", "float", "integer", "long", "boolean")
+
+        def add(fname: str, prop: dict) -> None:
+            t = prop.get("type")
+            cap = {"type": t, "searchable": t == "text", "filterable": t in scalar, "facetable": t == "keyword",
+                   "sortable": t in scalar, "dense": t == "knn_vector", "hot": fname in hot}
+            if t == "knn_vector":
+                cap["dimension"] = prop.get("dimension")
+            out[fname] = cap
+            for sub, sp in (prop.get("fields") or {}).items():
+                add(f"{fname}.{sub}", sp)
+
+        for fname, prop in (self.mapping.get("properties") or {}).items():
+            add(fname, prop)
+        return out
 
     def add_docs(self, changes: list[dict]) -> dict:
         if not isinstance(changes, list) or not changes:
@@ -321,7 +369,7 @@ class ManagedIndex:
     def info(self) -> dict:
         return {"name": self.name, "ready": self.ready, "segment_id": self.segment_id,
                 "version": getattr(self.index, "version", None), "n_docs": getattr(self.index, "n_docs", None),
-                "device": self.cfg.resolved_device(), "pending_upserts": self.pending_upserts,
+                "device": self.cfg.resolved_device(), "rankers": sorted(self.rankers), "pending_upserts": self.pending_upserts,
                 "cache": {"entries": len(self.cache), "hits": self.cache.hits, "misses": self.cache.misses}}
 
 
@@ -353,6 +401,8 @@ class IndexManager:
         """Register and load an index that is already on disk (start-up preload, a replica pod)."""
         mi = ManagedIndex(name, self.root / name, self._mapping_on_disk(name), self.cfg, self.ports, self.metrics)
         mi.load_existing(segment_id)
+        for rname, rpath in self.cfg.rankers.items():
+            mi.add_ranker(rname, rpath)
         with self._lock:
             self._indexes[name] = mi
         return mi

@@ -4,6 +4,7 @@ Environment (all optional):
   S3_SEARCH_DEVICE        cpu | torch-cpu | cuda          (also read by the engine's backend; default cpu)
   S3_SERVING_DATA_DIR     where indexes live: <data_dir>/<name>/{mapping.json, store.sqlite, segments/seg-*}
   S3_SERVING_PRELOAD      "name" or "name:segment_id", comma separated: loaded at start (a replica pod sets one)
+  S3_SERVING_RANKERS      "name=path,..." ranker JSON files (relative to the data dir) added to every preloaded index
   S3_SERVING_MAX_BATCH    scheduler maximum batch size (default 32)
   S3_SERVING_MAX_WAIT_MS  scheduler maximum wait for a fuller batch (default 2.0)
   S3_SERVING_CACHE        query cache entries per index, 0 disables (default 1024)
@@ -29,6 +30,7 @@ class ServingConfig:
     drain_seconds: float = 3.0
     max_body_bytes: int = 64 * 1024 * 1024
     preload: list[tuple[str, str | None]] = field(default_factory=list)
+    rankers: dict[str, str] = field(default_factory=dict)
 
     def resolved_device(self) -> str:
         return self.device or os.environ.get("S3_SEARCH_DEVICE") or "cpu"
@@ -45,6 +47,7 @@ class ServingConfig:
         cfg.cache_size = int(e.get("S3_SERVING_CACHE", cfg.cache_size))
         cfg.drain_seconds = float(e.get("S3_SERVING_DRAIN_SECONDS", cfg.drain_seconds))
         cfg.preload = parse_preload(e.get("S3_SERVING_PRELOAD", ""))
+        cfg.rankers = dict(x.split("=", 1) for x in e.get("S3_SERVING_RANKERS", "").split(",") if "=" in x)
         return cfg
 
 
