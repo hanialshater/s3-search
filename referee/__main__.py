@@ -63,9 +63,15 @@ def fast(argv=()) -> int:
     took = time.perf_counter() - t
     c = tally.counts
     counts = ", ".join(f"{n} {k}" for k, n in c.items() if n)
-    over = took > 60
+    # The 60 s budget is for the 2-core CPU container (CI and development). It does not apply on Colab, whose
+    # contract runs on every device it reports (cpu, torch-cpu, cuda) with GPU warm-ups: the time is shown, not judged.
+    import os
+    on_colab = bool(os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("COLAB_GPU")) or "google.colab" in sys.modules
+    over = took > 60 and not on_colab
+    budget = "the 60 s budget is for the 2-core CPU container; it does not apply on Colab" if on_colab \
+        else "budget 60 s on 2 cores"
     if code == 0 and not over:
-        print(f"referee fast: PASSED ({counts}) in {took:.1f} s (budget 60 s on 2 cores)")
+        print(f"referee fast: PASSED ({counts}) in {took:.1f} s ({budget})")
         return 0
     shown = "; ".join(tally.failed[:5]) + (f"; and {len(tally.failed) - 5} more" if len(tally.failed) > 5 else "")
     why = f"FAILED ({counts}): {shown}" if tally.failed else f"FAILED (pytest exit {int(code)}; {counts})"

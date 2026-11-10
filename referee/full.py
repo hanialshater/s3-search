@@ -12,6 +12,10 @@
 4. Latency at batch 1, throughput, cost per million queries (from the stated price).
 5. Freshness: 10,000 hot-field changes through `Index.patch` on toy, on this device.
 
+Each step prints a progress line with the elapsed time. **Development mode** (`--queries=N`: the first N test queries;
+`--catalogue=sample`: ESCI-sample and its own test split) is labelled as such, sets `score_of_record` false and
+writes `results-dev.json`; it refuses to write `results.json`. Only the full mode can be the score of record.
+
 A land is accepted only if no gate falls and held-out nDCG@10 does not fall (the brief); comparing two results.json
 files is the founder's step.
 
@@ -46,6 +50,7 @@ def contract(device: str) -> int:
 
 
 def main(argv=None) -> int:
+    import time
     ap = argparse.ArgumentParser(prog="python -m referee full")
     ap.add_argument("--dataset", default="esci-us", choices=loader.DATASETS)
     ap.add_argument("--engine", default="engine", choices=("engine", "opensearch", "reference"))
@@ -56,19 +61,49 @@ def main(argv=None) -> int:
     ap.add_argument("--latency-queries", type=int, default=1000)
     ap.add_argument("--price-per-hour", type=float, default=None)
     ap.add_argument("--skip-contract", action="store_true")
-    ap.add_argument("--out", default="results.json")
+    ap.add_argument("--queries", type=int, default=None,
+                    help="DEVELOPMENT MODE: only the first N test queries (never a score of record)")
+    ap.add_argument("--catalogue", choices=("full", "sample"), default="full",
+                    help="DEVELOPMENT MODE with 'sample': ESCI-sample and its own test split (never a score of record)")
+    ap.add_argument("--out", default=None, help="default results.json; results-dev.json in development mode")
     a = ap.parse_args(argv)
+    dev = a.queries is not None or a.catalogue == "sample"
+    out_path = Path(a.out or ("results-dev.json" if dev else "results.json"))
+    if dev and out_path.name == "results.json":
+        print("referee full: development mode never writes results.json (the score of record's file); "
+              "use --out=results-dev.json", file=sys.stderr)
+        return 2
+    dataset = "esci-sample" if a.catalogue == "sample" else a.dataset
+    t0 = time.perf_counter()
 
+    def say(msg):
+        print(f"[referee full {time.perf_counter() - t0:7.1f} s] {msg}", flush=True)
+
+    if dev:
+        say("DEVELOPMENT MODE: " + ", ".join(x for x in (f"first {a.queries} test queries" if a.queries else "",
+                                                          "ESCI-sample catalogue" if a.catalogue == "sample" else "") if x)
+            + "; this run is not a score of record")
     api = bench.get_api(a.engine)
     devices = api.available_devices()
     device = a.device or ("cuda" if "cuda" in devices else devices[0])
     out = {"kind": "full", "device": device, "devices": devices, "engine": a.engine}
 
-    out["contract_exit_code"] = None if (a.skip_contract or a.engine != "engine") else contract(device)
+    if a.skip_contract or a.engine != "engine":
+        out["contract_exit_code"] = None
+    else:
+        say(f"contract: referee/contract on {device}")
+        out["contract_exit_code"] = contract(device)
+        say(f"contract: exit {out['contract_exit_code']}")
 
-    ds = loader.load_dataset(a.dataset)
-    judg = loader._load_dataset_test_judgments(a.dataset)       # the scorer, and only here
+    say(f"data: loading {dataset}")
+    ds = loader.load_dataset(dataset)
+    judg = loader._load_dataset_test_judgments(dataset)       # the scorer, and only here
     queries = ds.test_queries
+    if a.queries is not None:
+        queries = queries.iloc[: a.queries]
+        keep = set(int(q) for q in queries["query_id"])
+        judg = {q: j for q, j in judg.items() if q in keep}
+    say(f"data: {len(ds.catalogue):,} products, {len(queries):,} test queries")
     subsets = {}
     ho = held_out_ids()
     if ho is not None:
@@ -77,30 +112,36 @@ def main(argv=None) -> int:
         (bench.OPENSEARCH_TEMPLATE if a.engine == "opensearch" else None)
     res = bench.run(ds, queries, judg, api, device=device, template=template, k=a.k, batch=a.batch,
                     latency_queries=a.latency_queries, price_per_hour=a.price_per_hour, split="test",
-                    engine=a.engine, subsets=subsets)
+                    engine=a.engine, subsets=subsets, progress=say)
     out.update(res)
     out["kind"] = "full"
     out["held_out"] = None if ho is None else {"n_queries": len(subsets["held_out"])}
-    out["score_of_record"] = device == "cuda" and a.dataset == "esci-us"
-    if out["score_of_record"] is False:
+    out["score_of_record"] = (not dev) and device == "cuda" and dataset == "esci-us"
+    if dev:
+        out["label"] = "DEVELOPMENT MODE: not a score of record"
+        out["development_mode"] = {"queries": a.queries, "catalogue": a.catalogue}
+    elif out["score_of_record"] is False:
         out["label"] = "development only"
 
     if a.engine in ("engine", "reference"):
+        say("freshness: 10,000 hot-field changes on toy")
         toy = loader.load_dataset("toy")
         idx = api.build_index(toy.catalogue, toy.mapping, device=device)
         if hasattr(idx, "patch"):
             out["freshness"] = freshness.check_freshness(idx, toy.catalogue, toy.mapping, freshness.patch_hook(idx),
                                                          api.build_index, n_changes=10_000, device=device)
+        say(f"freshness: done (passed {out.get('freshness', {}).get('passed')})")
     gates = {"contract": out["contract_exit_code"] in (0, None),
              "freshness": out.get("freshness", {}).get("passed", True)}
     out["gates"] = gates
-    Path(a.out).write_text(json.dumps(out, indent=1, default=str) + "\n")
+    out_path.write_text(json.dumps(out, indent=1, default=str) + "\n")
     q = out["quality"]
-    print(f"referee full: {a.dataset} on {device} ({a.engine}): nDCG@10 {q['ndcg@10']:.4f}, "
-          f"Exact recall@{a.k} {q.get(f'exact_recall@{a.k}')}, held-out "
-          f"{out.get('quality_subsets', {}).get('held_out', {}).get('ndcg@10')}; "
-          f"p50 {out['latency_ms']['p50']:.2f} ms, p99 {out['latency_ms']['p99']:.2f} ms; "
-          f"{out['throughput']['qps']:.0f} QPS; gates {gates} -> {a.out}")
+    say(f"done: {dataset} on {device} ({a.engine}): nDCG@10 {q['ndcg@10']:.4f}, "
+        f"Exact recall@{a.k} {q.get(f'exact_recall@{a.k}')}, held-out "
+        f"{out.get('quality_subsets', {}).get('held_out', {}).get('ndcg@10')}; "
+        f"p50 {out['latency_ms']['p50']:.2f} ms, p99 {out['latency_ms']['p99']:.2f} ms; "
+        f"{out['throughput']['qps']:.0f} QPS; gates {gates}; "
+        f"{'NOT a score of record' if not out['score_of_record'] else 'score candidate'} -> {out_path}")
     return 0 if all(gates.values()) else 1
 
 
