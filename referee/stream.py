@@ -530,13 +530,19 @@ def bulk_http(catalogue, mapping, work: Path) -> dict:
     srv = Server(work / "serving")
     try:
         srv.call("PUT", "/indexes/esci", {"mapping": mapping, "source": {"path": str(one)}})
+        try:  # the server's default refresh settings, recorded (the request sends no ?refresh= and sets none)
+            settings = srv.call("GET", "/indexes/esci/_settings")
+        except Exception as e:  # noqa: BLE001
+            settings = {"error": f"{type(e).__name__}: {e}"}
         lines, ops = [], []
         for rec in catalogue.to_dict("records"):
             d = _doc(rec)
             lines += [{"index": {"_id": d["product_id"]}}, d]
             ops.append("index")
         resp, s = _post_ndjson(srv.base, "/indexes/esci/_bulk", lines)
-        out = {"all_products": {"s": s, "docs_per_s": len(ops) / s, **_account(resp, len(ops), ops)}}
+        out = {"settings_used": {"server_defaults": settings, "request_refresh_param": None,
+                                 "S3_SERVING_REFRESH_INTERVAL": __import__("os").environ.get("S3_SERVING_REFRESH_INTERVAL")},
+               "all_products": {"s": s, "docs_per_s": len(ops) / s, **_account(resp, len(ops), ops)}}
         ids = list(catalogue["product_id"].iloc[:40])
         mixed, mops = [], []
         for pid in ids[:10]:

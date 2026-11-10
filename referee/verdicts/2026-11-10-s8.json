@@ -1,0 +1,167 @@
+{
+ "judge": "evaluation-steward",
+ "date": "2026-11-10",
+ "label": "CPU, development only (2 cores, device cpu)",
+ "commit_judged": "f143a92 (S8-2c merged), in the steward's worktree",
+ "commands": {
+  "stream, _bulk, intake": "taskset -c 0,1 python -m referee.stream --duration=60 --rate=200 --qps=100 --writer=process",
+  "quality": "taskset -c 0,1 python -m referee bench --dataset=esci-sample",
+  "S2 freshness": "taskset -c 0,1 python -m referee.judge s2",
+  "referee fast": "taskset -c 0,1 python -m referee fast"
+ },
+ "query_design": "committed 9358878 before any judged S8 run: a separate writer process; open loop, Poisson arrivals at 100 queries/s, batch 1, each timed from its scheduled arrival",
+ "disclosure": "Before writing the query design the steward had seen the dataplane-engineer's development numbers (refresh 22-29 ms; visibility p99 534-721 ms; query p99 4-6x idle, mostly lock waits) and the note that the loop design moves p99. The design was fixed (9358878) and the _bulk settings recording added (f4721d0) before this run; nothing was changed after it.",
+ "load": {
+  "start": {
+   "load1_at_start": 0.37646484375,
+   "waited_s": 7.815000572009012e-06,
+   "max_load1_to_start": 0.5
+  },
+  "during_stream_bulk_intake": {
+   "load1_mean": 0.9712126358695652,
+   "load1_max": 1.34423828125,
+   "samples": 161,
+   "limit": 2.75,
+   "overloaded": false
+  }
+ },
+ "verdicts": {
+  "S8 prediction 1": {
+   "text": "Under a sustained stream of 200 upserts per second (new products and full-text edits, plus deletes), each change is searchable within 1 s at p99, and at any quiesced point every fit query's results (ids, order and scores within 1e-4) equal a full rebuild's on the same catalogue",
+   "verdict": "held",
+   "visibility_ms": {
+    "p50": 143.53085500033558,
+    "p99": 513.7236320006195,
+    "max": 610.2147940000577,
+    "by_kind_p99": {
+     "new": 526.2134140002672,
+     "edit": 511.2597529996492,
+     "delete": 536.5721380003379
+    },
+    "resolution": "probe every 10 ms, from store.apply returning in the writer process"
+   },
+   "writes": {
+    "changes": 12000,
+    "applied_per_s": 200.16455816229814,
+    "visible": {
+     "new": 4733,
+     "edit": 5393,
+     "delete": 1874
+    },
+    "never_visible": {
+     "new": 0,
+     "edit": 0,
+     "delete": 0
+    }
+   },
+   "quiesced": {
+    "version": 52002,
+    "same_version_store_replica_rebuild": true,
+    "fit_queries": 2000,
+    "differ": 0,
+    "max_rel_score_diff": 0.0
+   }
+  },
+  "S8 prediction 2": {
+   "text": "On ESCI-sample with 2 cores: building from the store takes at most 10 s, lexical intake reaches at least 20,000 docs/s, and intake that fits the tfidf-svd-128 encoder takes at most 10 s",
+   "verdict": "wrong",
+   "build_from_store_s": 10.255251769000097,
+   "build_held": false,
+   "lexical_intake_docs_per_s": 23665.091957257504,
+   "lexical_held": true,
+   "encoder_intake_s": {
+    "total_s": 14.907140762000381,
+    "engine_s": 11.810302130998934,
+    "dataplane_s": 3.0968386310014466,
+    "note": "engine_s = time inside engine.encode.TfidfSvdEncoder (fit, fit_transform, encode)"
+   },
+   "encoder_held": false,
+   "why_wrong": "build from the store 10.26 s (over 10 s by 0.26 s) and encoder intake 14.9 s (over 10 s; the engine's TfidfSvdEncoder 11.8 s of it, the data plane 3.1 s); lexical intake held (23,665 docs/s)"
+  },
+  "S8 prediction 3": {
+   "text": "While the 200 upserts/s stream and a background merge run, query p99 at batch 1 rises by at most 25% over idle, and no query fails or returns a partial result during a merge swap",
+   "verdict": "wrong",
+   "query_ms": {
+    "idle": {
+     "n": 1386,
+     "p50": 3.3079918548537535,
+     "p99": 10.77362735745739
+    },
+    "stream": {
+     "n": 5587,
+     "p50": 37.398194001070806,
+     "p99": 519.5236161431968
+    },
+    "p99_rise": 47.22179187250134
+   },
+   "merge_swaps": {
+    "observed": 74,
+    "queries_inside": 549,
+    "failed_or_partial_inside": 0
+   },
+   "failed_queries": 0,
+   "witness_queries": 620,
+   "wrong_totals": 0,
+   "segments": {
+    "max": 20,
+    "last": 11
+   },
+   "why_wrong": "query p99 at batch 1 rose from 10.8 ms idle to 520 ms under the stream (+4,722%, against at most +25%); the no-failed-or-partial clause held (0 of 549 queries inside 74 merge swaps, 0 wrong totals over 620 witnesses)",
+   "finding_not_a_prediction": "the index held up to 20 segments during the stream, above the 16-segment cap in the S8-1 proposal"
+  },
+  "S8 prediction 4": {
+   "text": "POST _bulk (OpenSearch NDJSON: index, create, update, delete) ingests all 48,639 ESCI-sample products over HTTP in at most 15 s on 2 cores, and every action is accounted for in the response (applied, or rejected with a named reason)",
+   "verdict": "held",
+   "settings_used": {
+    "server_defaults": {
+     "esci": {
+      "settings": {
+       "index": {
+        "refresh_interval": "500ms"
+       }
+      }
+     }
+    },
+    "request_refresh_param": null,
+    "S3_SERVING_REFRESH_INTERVAL": null
+   },
+   "all_products": {
+    "s": 14.994110867000018,
+    "docs_per_s": 3243.8735735273085,
+    "actions": 48639,
+    "items": 48639,
+    "all_accounted": true,
+    "by_op_status": {
+     "index 200": 1,
+     "index 201": 48638
+    }
+   },
+   "mixed_request_accounting": {
+    "actions": 40,
+    "items": 40,
+    "all_accounted": true,
+    "by_op_status": {
+     "create 409": 10,
+     "update 404": 10,
+     "delete 200": 10,
+     "index 201": 5,
+     "update 200": 5
+    }
+   },
+   "note": "14.994 s against at most 15 s: held by 6 ms, inside run-to-run noise; a rerun could fall either side"
+  },
+  "S8 prediction 5": {
+   "text": "Nothing already supported changes: bench nDCG@10 0.4644 and Exact recall@100 0.7551 to 4 decimals, the S2 freshness p99 stays under 1 s, and referee fast stays under 60 s",
+   "verdict": "held",
+   "ndcg@10": 0.4643594185392334,
+   "exact_recall@100": 0.7550547837544519,
+   "to_4_decimals": [
+    0.4644,
+    0.7551
+   ],
+   "s2_freshness_p99_ms": 49.901912840101616,
+   "s2_freshness_passed": true,
+   "referee_fast_s": 9.9
+  }
+ }
+}
