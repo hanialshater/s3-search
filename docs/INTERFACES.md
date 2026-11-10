@@ -587,6 +587,10 @@ status:
 - **It never assumes a GPU.** Only when `device: cuda` does it add `nvidia.com/gpu` limits from `resources`, a
   `nodeSelector` (`nvidia.com/gpu.present: "true"`) and the `nvidia.com/gpu` toleration. One `Dockerfile` with
   `ARG BASE=cpu|cuda` selects the base image and `requirements-gpu.txt`.
+- The operator runs on watches (SearchIndex, and the Deployments and Jobs it owns) with a periodic resync as the backstop,
+  and elects a leader with a `coordination.k8s.io/v1` Lease `s3-operator` (flags `--lease-duration 15 --renew-deadline 10
+  --retry-period 2`; `--no-leader-elect` for a single replica); the manifest runs 2 replicas. Decision record
+  `docs/decisions/2026-11-10-rpc-and-operator-watches.md`.
 - CRD: `deploy/crd/searchindex.yaml`; operator manifests: `deploy/manifests/operator.yaml`; samples:
   `deploy/samples/`; image: `deploy/Dockerfile` (`ARG BASE=cpu|cuda`, built from the repository root).
 - Tests: the reconciler against a real kube-apiserver and etcd (envtest binaries at
@@ -659,3 +663,4 @@ status:
   answered differently except a float field's exact-boundary term or range, and a fractional term on an integer field
   (now refused, before an empty answer).
 - 2026-11-10, platform-engineer: RPC serving (S7-7), additive: `rpc` listener, client, Service port 9090.
+- 2026-11-10, platform-engineer: the operator on watches with Lease leader election (S7-7); no spec or status change.

@@ -355,6 +355,12 @@ def test_rbac_in_the_manifest_is_enough(sim, apiserver, ns):
         limited.request("GET", "/api/v1/secrets")
     assert e.value.status == 403
     from deploy.s3operator.reconcile import Reconciler
+    from deploy.s3operator.leader import LeaderElector
+    el = LeaderElector(limited, "s3-search-system", "rbac-check", "me")
+    assert el.try_acquire_or_renew() and el.try_acquire_or_renew()          # the manifest's leases rule: create, get, update
+    with pytest.raises(ApiError):                                            # and it can watch what it reconciles
+        limited.request("GET", "/api/v1/nodes")
+    assert list(limited.watch(SEARCHINDEX, sim.ns, "0", timeout_seconds=1)) is not None
     sim.mapping()
     sim.create()
     r = Reconciler(limited)
