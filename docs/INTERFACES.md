@@ -595,7 +595,7 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
 | `POST /indexes/{name}/_rollback` | `{"segment_id"}` → `{"segment_id", "version"}`: swap to a kept segment, replay the log after it |
 | `POST /indexes/{name}/_bulk` | OpenSearch NDJSON (`index`, `create`, `update` with a partial `doc` / `doc_as_upsert` / `upsert`, `delete`; `?refresh=false\|true\|wait_for`) → `{"took", "errors", "items": [{op: {"_index", "_id", "status", "result", "_seq_no"} \| {..., "error": {"type", "reason", "s3_reason", "field"}}}]}`; see **Bulk** below |
 | `POST /indexes/{name}/_refresh` | `{}` → `{"refreshed", "segment_id", "version"}`: make every stored upsert visible now |
-| `GET`, `PUT /indexes/{name}/_settings` | `{"index": {"refresh_interval": "1s"}}` (`500ms`, `5s`, `2m`, `-1` = no background refresh); default `S3_SERVING_REFRESH_INTERVAL` = `1s`; stored in `<index>/settings.json` |
+| `GET`, `PUT /indexes/{name}/_settings` | `{"index": {"refresh_interval": "500ms"}}` (`500ms`, `5s`, `2m`, `-1` = no background refresh); default `S3_SERVING_REFRESH_INTERVAL` = `500ms` (the S8-1 ruling); stored in `<index>/settings.json` |
 | `GET /indexes/{name}/_mapping` | → `{name: {"mappings": <the mapping>, "s3_fields": {field: {"type", "searchable", "filterable", "facetable", "sortable", "dense", "hot"[, "dimension"]}}}}`; sub-fields appear as `f.keyword`. Facetable = keyword; filterable and sortable = keyword and numeric/boolean; searchable = text |
 | `POST /indexes/{name}/_rankers` | `{"name", "path"}` → `{"name", "rankers": [...]}`: loads a ranker file (the JSON of `GBDT.to_dict()`; `engine.api` has no save/load of its own, so this is interim) from under the serving data dir into `Index.add_ranker`; kept across swaps. At startup: `S3_SERVING_RANKERS=name=path,...` |
 | `GET /indexes`, `GET /indexes/{name}` | what is loaded: segment id, version, docs, device, cache counters |
@@ -624,8 +624,9 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
   pending; with the full-rebuild backend also at least 4x the last refresh's cost apart); `true` refreshes before
   returning (`"forced_refresh": true`); `wait_for` returns when a refresh covers the write (forces one if the interval
   is `-1` or it takes too long). **The hook:** `serving.ports.Ports.refresh(managed_index) -> {"segment_id", "version"}`;
-  while it is `None` a refresh is a full rebuild from the store and a swap (18.7 s on ESCI-sample); when the data plane's
-  delta segments land (S8-4) it supplies the hook and refresh becomes a delta (it runs under the admin lock and may call
+  the data plane's `default_ports()` sets it to `dataplane.updater.serving_refresh` (a delta segment from the oldest pending
+  upsert, then one tiered merge if due; measured below); with it `None` a refresh is a full rebuild from the store and a swap
+  (18.7 s on ESCI-sample), and refresh becomes a delta (it runs under the admin lock and may call
   `managed_index._swap_in(new_index, segment_id, "refresh")`).
 - **Write metrics:** `s3_index_lag` (store head minus the highest offset fully visible, so upserts waiting for a refresh
   count), `s3_index_pending_upserts`, `s3_refresh_ms`, `s3_bulk_requests_total{refresh}`, `s3_bulk_items_total{op,outcome}`,

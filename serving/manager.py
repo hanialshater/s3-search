@@ -29,7 +29,7 @@ from .scheduler import BatchScheduler
 
 log = logging.getLogger("serving")
 INTERVAL_RE = re.compile(r"^(-1|\d+(?:\.\d+)?)(ms|s|m|h)?$")
-DEFAULT_SETTINGS = {"refresh_interval": "1s"}
+DEFAULT_SETTINGS = {"refresh_interval": "500ms"}
 
 
 def parse_interval(text) -> float | None:
