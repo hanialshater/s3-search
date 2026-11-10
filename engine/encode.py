@@ -61,8 +61,14 @@ def _token_ids(texts, word_id: dict, assign):
 
 
 class TfidfSvdEncoder:
-    def __init__(self, dim: int = 128, max_features: int = 100_000, seed: int = 0):
+    def __init__(self, dim: int = 128, max_features: int = 100_000, seed: int = 0, fit: str = "numpy"):
+        """``fit`` (S9-2): "numpy" (the reference, the default), "gpu" (alias "cuml": the sparse products and the
+        orthonormalisation on the GPU with CuPy, the same algorithm and random start), or "auto" (gpu when CuPy and
+        CUDA are present, else numpy). The fitted arrays are the same format either way, and encoding queries uses
+        them on any device."""
         self.dim, self.max_features, self.seed = dim, max_features, seed
+        self.fit_backend = fit
+        self.fitted_with = None
         self.vocab: dict[str, int] = {}
         self.idf = np.zeros(0, np.float32)
         self.components = np.zeros((0, dim), np.float32)
@@ -127,8 +133,14 @@ class TfidfSvdEncoder:
         if l == 0 or len(vals) == 0:
             return rows, cols, vals, n
         rng = np.random.default_rng(self.seed)
+        omega = rng.standard_normal((V, l))
+        if _gpu_fit_wanted(self.fit_backend):
+            self.components[:, :] = _svd_gpu(rows, cols, vals, n, V, omega, self.dim)
+            self.fitted_with = "gpu"
+            return rows, cols, vals, n
+        self.fitted_with = "numpy"
         rc, cc, vc = rows, cols, vals                       # bincount needs no sort by column
-        Y = _sparse_matmul(rows, cols, vals, rng.standard_normal((V, l)), n, "rows")
+        Y = _sparse_matmul(rows, cols, vals, omega, n, "rows")
         for _ in range(3):                                  # power iterations
             Qm = _orthonormal(Y)
             Z = _orthonormal(_sparse_matmul(rc, cc, vc, Qm, V, "cols"))
@@ -172,11 +184,54 @@ class TfidfSvdEncoder:
         return enc
 
 
-def get_encoder(name: str):
-    """A fresh (unfitted) encoder by name. ``tfidf-svd-<d>``; ``bge-small-en-v1.5`` needs sentence-transformers."""
+def _gpu_fit_wanted(fit: str) -> bool:
+    if fit == "numpy":
+        return False
+    if fit not in ("gpu", "cuml", "auto"):
+        raise ValueError("fit: numpy | gpu | cuml | auto")
+    try:
+        import cupy as cp
+        ok = cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:                                       # no CuPy, no driver, no GPU
+        ok = False
+    if not ok and fit != "auto":
+        from .errors import DeviceUnavailable
+        raise DeviceUnavailable(f"fit={fit!r} needs CuPy and a CUDA GPU (requirements-gpu.txt)")
+    return ok
+
+
+def _svd_gpu(rows, cols, vals, n, V, omega, dim):
+    """The numpy fit's randomized SVD (same start, 3 power iterations), on the GPU: CuPy sparse products and QR."""
+    import cupy as cp
+    import cupyx.scipy.sparse as csp
+    A = csp.csr_matrix((cp.asarray(vals), (cp.asarray(rows), cp.asarray(cols))), shape=(n, V))
+    At = A.T.tocsr()
+    Y = A @ cp.asarray(omega)
+    for _ in range(3):
+        Q, _ = cp.linalg.qr(Y)
+        Z, _ = cp.linalg.qr(At @ Q)
+        Y = A @ Z
+    Q, _ = cp.linalg.qr(Y)
+    Bt = At @ Q
+    w, Vv = cp.linalg.eigh(Bt.T @ Bt)
+    order = cp.argsort(-w)
+    w, Vv = cp.clip(w[order], 0, None), Vv[:, order]
+    S = cp.sqrt(w)
+    s0 = float(S[0]) if len(S) else 0.0
+    k = min(dim, int((S > s0 * 1e-10).sum())) if s0 > 0 else 0
+    comp = (Bt @ Vv[:, :k]) / S[:k]
+    comp = cp.asnumpy(comp)
+    comp *= np.where(comp[np.abs(comp).argmax(axis=0), np.arange(k)] < 0, -1.0, 1.0)
+    out = np.zeros((V, dim), np.float32)
+    out[:, :k] = comp
+    return out
+
+
+def get_encoder(name: str, fit: str = "numpy"):
+    """A fresh (unfitted) encoder by name. ``tfidf-svd-<d>``; ``fit``: numpy | gpu | cuml | auto (S9-2)."""
     m = re.fullmatch(r"tfidf-svd-(\d+)", name)
     if m:
-        return TfidfSvdEncoder(dim=int(m.group(1)))
+        return TfidfSvdEncoder(dim=int(m.group(1)), fit=fit)
     raise ValueError(f"unknown encoder {name!r} (v1: tfidf-svd-<d>)")
 
 
