@@ -260,13 +260,126 @@ def judge_s4b(out_path):
     return res
 
 
+def _report_on(results_path, run_path, work, tag):
+    import contextlib
+    import io
+    from tools import report
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = report.main([str(results_path), "--out", str(work / f"report-{tag}.html"), "--recompute-run",
+                            str(run_path), "--data-dir", str(loader.SAMPLE_DIR)])
+    return {"exit_code": code, "output": buf.getvalue().strip().splitlines()[-12:]}
+
+
+def judge_s5a(out_path):
+    import engine.api as api
+    from tools import explain
+    from tools.common import engine_search, text_request
+
+    res = {"kind": "judge-s5a", "label": "CPU, development only", "dataset": "esci-sample"}
+    ds = loader.load_dataset("esci-sample")
+    work = Path(tempfile.mkdtemp(prefix="judge-s5a-"))
+    index = api.build_index(ds.catalogue, ds.mapping, device="cpu")
+    queries = ds.fit[["query_id", "query"]].drop_duplicates("query_id").reset_index(drop=True)
+    judg = loader.fit_judgments(ds)
+
+    # Part 1: the referee's bench run (fit split) and the report recomputing it from the same run.
+    res["report"] = {}
+    for k in (100, 1000):
+        runs = {}
+        r = bench.run(ds, queries, judg, api, index=index, k=k, latency_queries=200, runs_out=runs)
+        rp, run_p = work / f"results-k{k}.json", work / f"run-k{k}.jsonl"
+        rp.write_text(json.dumps(r, indent=1) + "\n")
+        run_p.write_text("".join(json.dumps({"query_id": q, "ids": ids}) + "\n" for q, ids in runs.items()))
+        rep = _report_on(rp, run_p, work, f"k{k}")
+        rep["referee_quality"] = r["quality"]
+        res["report"][f"k={k}"] = rep
+        print(f"S5-a report (bench --k={k}): exit {rep['exit_code']}; " + " | ".join(rep["output"][-3:]), flush=True)
+
+    # Part 2a: the explain tool's own sample check (lexical, no ranker), 100 pairs from 200 fit queries.
+    rng = np.random.default_rng(HOT_SEED + 2)
+    sample_q = [str(t) for t in queries["query"].iloc[np.sort(rng.choice(len(queries), 200, replace=False))]]
+    t = time.perf_counter()
+    lex = explain.sample_check(engine_search(index), sample_q, n=100, seed=1)
+    res["explain_lexical"] = {**lex, "s": time.perf_counter() - t}
+    print(f"S5-a explain (lexical, tool's sample_check): {lex['n_ok']}/{lex['n']} ok, {lex['n_complete']} complete",
+          flush=True)
+    # The judge's own arithmetic on the same kind of trees: root = sum of terms = hit score; a term's pseudo_tf (in its
+    # description, 4 significant digits) = the sum of its field contributions.
+    import re
+    rng2 = np.random.default_rng(HOT_SEED + 4)
+    pairs, n_root_ok, n_ptf_ok = [], 0, 0
+    for q in sample_q[:100]:
+        r = index.search({**text_request(q, size=100), "explain": True})
+        for h, e in zip(r["hits"]["hits"], r["explain"]):
+            pairs.append((h, e))
+    for i in rng2.permutation(len(pairs))[:100]:
+        h, e = pairs[i]
+        terms = e.get("details") or []
+        if abs(sum(t["value"] for t in terms) - h["_score"]) <= 1e-4 * max(1.0, abs(h["_score"])) and \
+                abs(e["value"] - h["_score"]) <= 1e-4 * max(1.0, abs(h["_score"])):
+            n_root_ok += 1
+        ok = True
+        for t in terms:
+            m = re.search(r"pseudo_tf ([0-9.e+-]+)$", t["description"])
+            fs = sum(f["value"] for f in t.get("details") or [])
+            ok &= m is not None and abs(float(m.group(1)) - fs) <= 1e-3 * max(1.0, fs)
+        n_ptf_ok += ok
+    res["explain_lexical_judge_arithmetic"] = {"n": 100, "root_is_sum_of_terms_and_score": n_root_ok,
+                                               "pseudo_tf_is_sum_of_fields": n_ptf_ok}
+    print(f"S5-a explain (lexical, judge's arithmetic): root = sum of terms = score in {n_root_ok}/100; "
+          f"pseudo_tf = sum of fields in {n_ptf_ok}/100", flush=True)
+
+    # Part 2b: the ranker. Train on fit queries, register it, explain 100 rescored (query, product) pairs.
+    from engine.rank.train import train_ranker
+    t = time.perf_counter()
+    model = train_ranker(index, ds.fit, lambda q: text_request(q), window=200, max_queries=300)
+    index.add_ranker("judge", model)
+    train_s = time.perf_counter() - t
+    resc = lambda q, size=100: {**text_request(q, size=size),  # noqa: E731
+                                "rescore": {"window_size": 100, "s3_ranker": {"model": "judge"}}}
+    pairs = []
+    for q in sample_q[:50]:
+        pairs += [(q, h["_id"]) for h in index.search(resc(q))["hits"]["hits"]]
+    order = np.random.default_rng(HOT_SEED + 3).permutation(len(pairs))[:100]
+    rows, feature_sums = [], []
+    for i in order:
+        q, pid = pairs[i]
+        e = explain.explain_product(engine_search(index), resc(q), pid, windows=(100,))
+        if not e["found"]:
+            rows.append({"found": False})
+            continue
+        root = e["tree"]
+        kids = root.get("details") or []
+        kid_sum = float(sum(k["value"] for k in kids))
+        feature_sums.append(abs(kid_sum - float(e["score"])) <= 1e-4 * max(1.0, abs(float(e["score"]))))
+        rows.append({"found": True, "ok": e["ok"], "complete": e["complete"], "root_matches_score": e["root_matches_score"],
+                     "root": root["description"], "n_children": len(kids), "children_sum": kid_sum, "score": e["score"],
+                     "n_leaves": len(e["leaves"]),
+                     "feature_leaves": sum("feature" in l["description"].lower() for l in e["leaves"])})
+    found = [r for r in rows if r["found"]]
+    res["explain_ranker"] = {
+        "train_s": train_s, "n": len(rows), "found": len(found),
+        "tool_ok": sum(r["ok"] for r in found), "tool_complete": sum(r["complete"] for r in found),
+        "children_sum_to_ranker_score": int(sum(feature_sums)),
+        "with_feature_leaves": sum(r["feature_leaves"] > 0 for r in found), "examples": found[:3]}
+    er = res["explain_ranker"]
+    print(f"S5-a explain (ranker): {er['found']}/{er['n']} found; tool ok {er['tool_ok']}, complete "
+          f"{er['tool_complete']}; children sum to the ranker score in {er['children_sum_to_ranker_score']}; "
+          f"with any per-feature leaf: {er['with_feature_leaves']}", flush=True)
+    res["work_dir"] = str(work)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps(res, indent=1, default=str) + "\n")
+    return res
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee.judge")
     ap.add_argument("what", choices=("s2", "s4b", "s5a", "s5b"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
     out = a.out or f"results/judge-{a.what}.json"
-    {"s2": judge_s2, "s4b": judge_s4b}[a.what](out)
+    {"s2": judge_s2, "s4b": judge_s4b, "s5a": judge_s5a}[a.what](out)
     return 0
 
 
