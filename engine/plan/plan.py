@@ -14,7 +14,7 @@ from ..analysis import analyze, analyze_with_positions
 from ..dsl import ast as A
 from ..dsl.parse import parse, resolve_msm
 from ..errors import InvalidRequest, UnsupportedQuery
-from .nodes import Bool, Dense, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+from .nodes import Bool, Dense, Exists, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
 
 
 class Planner:
@@ -45,8 +45,17 @@ class Planner:
             n = len(sort) + (1 if rescore else 0) + 1
             if len(r.search_after) != n:
                 raise InvalidRequest("search_after", f"expected the last hit's sort list ({n} values)")
+        post = self.node(r.post_filter) if r.post_filter is not None else None
+        collapse = None
+        if r.collapse is not None:
+            self._field(r.collapse, "collapse.field", ("keyword", "numeric"))
+            if r.search_after is not None:
+                raise UnsupportedQuery("search_after", "search_after with collapse is not supported")
+            if rescore is not None:
+                raise InvalidRequest("collapse", "collapse cannot be combined with rescore (as OpenSearch)")
+            collapse = r.collapse
         return Plan(root=root, aggs=aggs, sort=sort, from_=r.from_, size=r.size, search_after=r.search_after,
-                    rescore=rescore, explain=r.explain)
+                    rescore=rescore, explain=r.explain, post_filter=post, collapse=collapse)
 
     # ---- queries
     def node(self, q):
@@ -123,6 +132,13 @@ class Planner:
         need = n if q.operator == "and" else max(1, resolve_msm(q.msm, n))
         return LexicalGroups(((q.field, 1.0),), groups, ("sum",) * (n - 1) + ("const",), min(need, n), "field",
                              q.boost, q.path)
+
+    def n_QExists(self, q):
+        self._field(q.field, f"{q.path}.field", ("text", "keyword", "numeric", "vector"))
+        return Exists(q.field, q.boost, q.path)
+
+    def n_QIds(self, q):
+        return Ids(q.values, q.boost, q.path)
 
     def n_QMatchAll(self, q):
         return MatchAll(q.boost, q.path)

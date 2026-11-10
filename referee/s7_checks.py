@@ -128,7 +128,82 @@ def check_s7_2(index, ds):
     return problems
 
 
-CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2}
+def check_s7_3(index, ds):
+    """exists, ids, post_filter (aggregations before it, hits and total after it), collapse (keyword or numeric; the
+    missing values as one group; from/size over groups; total = matching documents)."""
+    import pandas as pd
+    from referee import reference
+    c = ds.catalogue.reset_index(drop=True)
+    ids = list(c["product_id"])
+    problems = []
+    for field, col in (("product_color", "product_color"), ("product_bullet_point", "product_bullet_point"),
+                       ("product_brand.keyword", "product_brand"), ("price", "price"), ("stock", "stock")):
+        exp = {p for p, v in zip(ids, c[col]) if pd.notna(v)}
+        total, got = _ids(index, {"query": {"exists": {"field": field}}})
+        if got != exp or total != len(exp):
+            problems.append(f"exists {field}: {len(got)} hits, expected {len(exp)}")
+    want = [ids[3], ids[77], "NO-SUCH-ID", ids[150]]
+    total, got = _ids(index, {"query": {"ids": {"values": want}}})
+    if got != set(want) - {"NO-SUCH-ID"} or total != 3:
+        problems.append(f"ids: {sorted(got)} (total {total})")
+    total, got = _ids(index, {"query": {"bool": {"must": [{"ids": {"values": want}}],
+                                                 "filter": [{"range": {"price": {"lt": 1e9}}}]}}})
+    if got != set(want) - {"NO-SUCH-ID"}:
+        problems.append("ids inside bool: wrong set")
+
+    ref = reference.build_index(ds.catalogue, ds.mapping)
+    agg = {"c": {"terms": {"field": "category", "size": 20}}}
+    for q, pf in (({"match": {"product_title": "red lamp"}}, {"term": {"category": "lamp"}}),
+                  ({"match_all": {}}, {"range": {"price": {"lt": 100}}}),
+                  ({"bool": {"filter": [{"range": {"stock": {"gt": 0}}}]}}, {"terms": {"category": ["mug", "tent"]}})):
+        r = index.search({"query": q, "post_filter": pf, "aggs": agg, "size": ALL})
+        before = ref.search({"query": q, "aggs": agg, "size": 0})
+        after = ref.search({"query": {"bool": {"must": [q], "filter": [pf]}}, "size": ALL})
+        if r["aggregations"]["c"]["buckets"] != before["aggregations"]["c"]["buckets"]:
+            problems.append(f"post_filter {pf}: aggregations are not over the query's match set")
+        if r["hits"]["total"] != after["hits"]["total"] or \
+                {h["_id"] for h in r["hits"]["hits"]} != {h["_id"] for h in after["hits"]["hits"]}:
+            problems.append(f"post_filter {pf}: hits or total are not after the filter "
+                            f"({r['hits']['total']} vs {after['hits']['total']})")
+
+    def collapsed(order_req, field, col):
+        full = [h["_id"] for h in ref.search({**order_req, "size": ALL})["hits"]["hits"]]
+        val = dict(zip(ids, c[col]))
+        seen, tops = set(), []
+        for p in full:
+            v = val[p]
+            key = None if pd.isna(v) else v
+            if key not in seen:
+                seen.add(key)
+                tops.append(p)
+        return len(full), tops
+
+    cases = [({"query": {"match_all": {}}, "sort": [{"price": "asc"}, {"product_id": "asc"}]}, "category", "category"),
+             ({"query": {"match_all": {}}, "sort": [{"price": "desc"}, {"product_id": "asc"}]},
+              "product_brand.keyword", "product_brand"),
+             ({"query": {"bool": {"filter": [{"range": {"price": {"lt": 200}}}]}},
+               "sort": [{"price": "asc"}, {"product_id": "asc"}]}, "product_color.keyword", "product_color"),
+             ({"query": {"match_all": {}}, "sort": [{"price": "asc"}, {"product_id": "asc"}]}, "stock", "stock"),
+             ({"query": {"multi_match": {"query": "waterproof red lamp boots", "fields": checks_fields()}}},
+              "category", "category")]
+    for req, field, col in cases:
+        n_match, tops = collapsed(req, field, col)
+        for frm, size in ((0, ALL), (0, 3), (2, 4), (len(tops) - 1, 5), (len(tops) + 2, 3)):
+            r = index.search({**req, "collapse": {"field": field}, "from": frm, "size": size})
+            got = [h["_id"] for h in r["hits"]["hits"]]
+            if got != tops[frm:frm + size] or r["hits"]["total"] != n_match:
+                problems.append(f"collapse {field} from {frm} size {size}: {got[:4]} (total {r['hits']['total']}) "
+                                f"!= {tops[frm:frm + size][:4]} (total {n_match})")
+                break
+    return problems
+
+
+def checks_fields():
+    from referee import checks
+    return checks.FIELDS5
+
+
+CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3}
 
 
 def check_landed_correct(index, ds):

@@ -79,8 +79,22 @@ def _fuzzy_as_term(r):
     return r
 
 
+def _post_filter_into_query(r):
+    if "post_filter" in r:
+        r = dict(r)
+        pf = r.pop("post_filter")
+        return {**r, "query": {"bool": {"must": [r.get("query", {"match_all": {}})], "filter": [pf]}}}
+    return r
+
+
+def _collapse_ignored(r):
+    return {k: v for k, v in r.items() if k != "collapse"}
+
+
 def test_correctness_checks_catch_planted_errors(index, ds):
     from referee import s7_checks
+    assert s7_checks.check_s7_3(_Rewrites(index, _post_filter_into_query), ds), "facets after post_filter must be caught"
+    assert s7_checks.check_s7_3(_Rewrites(index, _collapse_ignored), ds), "an ignored collapse must be caught"
     assert s7_checks.check_s7_1(_Rewrites(index, _phrase_as_match), ds), "a bag-of-words phrase must be caught"
     assert s7_checks.check_s7_2(_Rewrites(index, _fuzzy_as_term), ds), "fuzzy answered as an exact term must be caught"
 

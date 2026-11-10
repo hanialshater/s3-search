@@ -7,10 +7,11 @@ float32 scores, doc ids and int32 values exactly).
 from __future__ import annotations
 
 
-def after_mask(b, keys, after):
-    """``bool[N]``: entries strictly after ``after`` (one value per key, then a doc id) in the sort order."""
+def after_mask(b, keys, after, tiekey=None):
+    """``bool[N]``: entries strictly after ``after`` (one value per key, then the tie key) in the sort order. The tie
+    key is ``tiekey`` (the docs' first_offset, ascending in doc order) or the doc id."""
     N = keys[0][0].shape[0]
-    doc = b.arange(N)
+    doc = b.arange(N) if tiekey is None else tiekey
     out = b.full(N, False, "bool")
     eq = b.full(N, True, "bool")
     for (key, desc), v in zip(keys, after[:-1]):
@@ -20,15 +21,17 @@ def after_mask(b, keys, after):
     return out | (eq & (doc > int(after[-1])))
 
 
-def page(b, keys, mask, from_: int, size: int, after=None, extra=()):
+def page(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None, collapse=None):
     """``keys``: list of ``(array[N], descending)``; the first may be the float32 score. ``extra``: arrays[N] to read
     at the page's docs (e.g. the score). Returns host ``(doc_ids list[int], key_values list[list], extra_values
     list[list])``."""
-    valid = mask if after is None else mask & after_mask(b, keys, after)
+    # collapse: int64[N] group codes (S7-3): only the first doc of each group in sort order is kept, and
+    # from/size count groups.
+    valid = mask if after is None else mask & after_mask(b, keys, after, tiekey)
     need = from_ + size
     if need == 0:
         return [], [], []
-    if len(keys) == 1 and keys[0][1] and str(keys[0][0].dtype).endswith("float32"):
+    if collapse is None and len(keys) == 1 and keys[0][1] and str(keys[0][0].dtype).endswith("float32"):
         idx, _ = b.topk(keys[0][0].reshape(1, -1), need, valid.reshape(1, -1))
         sel = b.astype(idx[0][from_:need], "int64")
     else:
@@ -36,6 +39,13 @@ def page(b, keys, mask, from_: int, size: int, after=None, extra=()):
         for key, desc in reversed(keys):
             order = b.argsort(key[cand], descending=desc)
             cand = cand[order]
+        if collapse is not None:                    # the first of each group, in sort order
+            g = collapse[cand]
+            o = b.argsort(g)                         # stable: within a group, sort order is kept
+            gs = g[o]
+            first = b.concatenate([b.full(1, True, "bool"), gs[1:] != gs[:-1]]) if gs.shape[0] else gs > 0
+            firsts = o[first]
+            cand = cand[firsts[b.argsort(firsts)]]   # back in sort order
         sel = cand[from_:need]
     if sel.shape[0] == 0:
         return [], [], []

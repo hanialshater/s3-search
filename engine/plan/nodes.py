@@ -70,6 +70,20 @@ class Range:
 
 
 @dataclass(frozen=True)
+class Exists:
+    field: str
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
+class Ids:
+    values: tuple
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
 class MatchAll:
     boost: float = 1.0
     path: str = "query"
@@ -94,7 +108,7 @@ class Hybrid:
     path: str = "query"
 
 
-Node = Union[Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
+Node = Union[Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
 
 
 @dataclass(frozen=True)
@@ -127,3 +141,5 @@ class Plan:
     search_after: tuple | None = None
     rescore: Rescore | None = None
     explain: bool = False
+    post_filter: Any = None               # S7-3: a node; hits and total after it, aggregations before it
+    collapse: str | None = None           # S7-3: keep the top hit per value of this field
