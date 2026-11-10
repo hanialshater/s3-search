@@ -57,7 +57,9 @@ def fast(argv=()) -> int:
         print("referee fast: the engine has no API yet (engine/api.py), so only the referee's own tests run")
     t = time.perf_counter()
     tally = _Tally()
-    code = pytest.main(["-q", "-p", "no:cacheprovider", *targets, *argv], plugins=[tally])
+    # The judges' full self-tests are marked slow and run with the judges (`python -m pytest -m slow referee/tests`).
+    select = [] if any(a == "-m" or a.startswith("-m") for a in argv) else ["-m", "not slow"]
+    code = pytest.main(["-q", "-p", "no:cacheprovider", *select, *targets, *argv], plugins=[tally])
     took = time.perf_counter() - t
     c = tally.counts
     counts = ", ".join(f"{n} {k}" for k, n in c.items() if n)
