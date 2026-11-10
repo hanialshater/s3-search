@@ -74,6 +74,11 @@ class Planner:
         order = self.s.field_index
         fw = tuple(sorted(weights.items(), key=lambda x: order[x[0]]))
         idf = "field" if sum(1 for _, w in fw if w > 0) == 1 else "global"
+        syn = self.s.mapping.synonyms
+        if syn and any(t in syn for t in terms):         # S7-6: a term with synonyms is one clause of them all
+            groups = tuple(syn.get(t, (t,)) for t in terms)
+            modes = tuple("synonym" if t in syn else "sum" for t in terms)
+            return LexicalGroups(fw, groups, modes, min(need, n), idf, boost, path)
         return Lexical(fw, terms, min(need, n), idf, boost, path)
 
     def _ordered(self, weights):
@@ -133,11 +138,12 @@ class Planner:
             return LexicalGroups(((q.field, 1.0),), (), (), 0, "field", q.boost, q.path)
         d = text_dictionary(self.s)
         last = tuple(d.terms[i] for i in d.prefix(toks[-1], field_mask(self.s, [q.field]), q.max_expansions))
-        groups = tuple((t,) for t in toks[:-1]) + (last,)
+        syn = self.s.mapping.synonyms
+        groups = tuple(syn.get(t, (t,)) for t in toks[:-1]) + (last,)
         n = len(groups)
         need = n if q.operator == "and" else max(1, resolve_msm(q.msm, n))
-        return LexicalGroups(((q.field, 1.0),), groups, ("sum",) * (n - 1) + ("const",), min(need, n), "field",
-                             q.boost, q.path)
+        modes = tuple("synonym" if t in syn else "sum" for t in toks[:-1]) + ("const",)
+        return LexicalGroups(((q.field, 1.0),), groups, modes, min(need, n), "field", q.boost, q.path)
 
     def n_QFunctionScore(self, q):
         fns = []
@@ -181,7 +187,7 @@ class Planner:
         if not self.s.has_positions:
             raise UnsupportedQuery(q.path, "this index was built without positions (_meta.engine.positions: false)")
         toks, pos = analyze_with_positions(str(q.query))
-        slots = tuple((t,) for t in toks)
+        slots = tuple(self.s.mapping.synonyms.get(t, (t,)) for t in toks)     # S7-6: synonyms per slot
         offsets = tuple(p - pos[0] for p in pos) if pos else ()
         return Phrase(q.field, slots, offsets, q.slop, q.boost, q.path)
 
