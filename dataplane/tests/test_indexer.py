@@ -58,6 +58,22 @@ def test_merge_policy():
     assert p.due({"n_docs": 100, "deleted": 1, "pending_upserts": 0, "loaded_at": 0})
 
 
+def test_tiered_merge_policy():
+    from dataplane.indexer import TieredMergePolicy
+    p = TieredMergePolicy(floor=1000, factor=10, merge_factor=10, max_deleted_ratio=0.25, max_segments=16)
+    seg = lambda i, live, n=None: {"segment_id": f"s{i:02d}", "live": live, "n_docs": n or live}
+    base = seg(0, 48_000)
+    assert p.plan([base]) is None and p.tier(9_999) == 0 and p.tier(10_000) == 1
+    deltas = [seg(i, 100) for i in range(1, 10)]
+    assert p.plan([base] + deltas) is None                                   # 9 small ones: not yet
+    assert p.plan([base] + deltas + [seg(10, 120)]) == [f"s{i:02d}" for i in range(1, 10)] + ["s10"]
+    assert p.plan([seg(0, 30_000, 48_000), seg(1, 100)]) == ["s00"]          # 37.5% deleted: expunge
+    many = [seg(i, 5_000 + i) for i in range(17)]                           # tier 0 with 17 > merge factor
+    assert len(p.plan(many)) == 10
+    p2 = TieredMergePolicy(merge_factor=100, max_segments=16)
+    assert p2.plan(many) == ["s00", "s01"]                                  # over the cap: smallest first
+
+
 def test_cli_ingests_and_builds(tmp_path, catalogue, mapping, capsys):
     (tmp_path / "m.json").write_text(json.dumps(mapping))
     catalogue.to_parquet(tmp_path / "b.parquet")
