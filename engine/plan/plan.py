@@ -264,9 +264,17 @@ class Planner:
         return Hybrid(tuple(map(self.node, q.queries)), path=q.path)
 
     # ---- aggregations and sort
+    AGG_FIELDS = {"terms": ("keyword", "numeric"), "value_count": ("keyword", "numeric"),
+                  "cardinality": ("keyword", "numeric")}
+
     def agg(self, a: A.Agg) -> TermsAgg:
-        self._field(a.field, f"{a.path}.terms.field", ("keyword", "numeric"))
-        return TermsAgg(a.name, a.field, a.size)
+        kinds = self.AGG_FIELDS.get(a.kind, ("numeric",))
+        self._field(a.field, f"{a.path}.{a.kind}.field", kinds)
+        if a.kind not in ("terms", "value_count", "cardinality") and self.s.mapping.numeric.get(a.field) == "bool" \
+                and a.kind in ("range", "histogram"):
+            raise UnsupportedQuery(f"{a.path}.{a.kind}.field", "range and histogram need a number field")
+        return TermsAgg(a.name, a.field, int(a.param("size", 10)), a.kind, a.params,
+                        tuple(self.agg(x) for x in a.sub))
 
     def sort_key(self, s: A.Sort) -> SortKey:
         if s.field not in ("_score", "_doc"):

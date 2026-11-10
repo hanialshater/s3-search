@@ -439,6 +439,10 @@ Index.from_segment(path, device) -> Index
 | `query.ids` (S7-3) | `{"values": [...], "boost"}` | the docs with these `_id`s; constant score |
 | `post_filter` (S7-3) | a query | filters the hits and `hits.total` after aggregations are computed (multi-select facets) |
 | `collapse` (S7-3) | `{"field"}`: keyword or numeric | the top hit per value in sort order (missing values form one group); from/size count groups; `hits.total` counts docs; each hit gains `"fields": {field: [value]}`; with `search_after` refused (`UnsupportedQuery`), with `rescore` `InvalidRequest` |
+| metric aggregations (S7-4) | `min`, `max`, `avg`, `sum`, `stats`, `value_count`, `cardinality`: `{"field"}` | numeric fields (value_count and cardinality also keyword); values read as float64 (float fields' float32 values exactly); `{"value": x}`, `None` for min/max/avg with no values, 0.0 for sum; `stats` is `{count, min, max, avg, sum}`; cardinality is exact; `missing`, `script` and the like refused |
+| `range` aggregation (S7-4) | `{"field", "ranges": [{"from", "to", "key"}]}` | buckets sorted by (from, to); `from` inclusive, `to` exclusive (compared in float64, unlike the range query's float32 bounds, as OpenSearch); key `"<from>-<to>"` with `*` for an open end (Python's float repr, e.g. `"10.0-20.0"`) unless given; `keyed` refused |
+| `histogram` aggregation (S7-4) | `{"field", "interval", "offset": 0, "min_doc_count": 0}` | key `floor((v - offset) / interval) * interval + offset` (a float), ascending; with min_doc_count 0 the empty buckets between the first and last are returned; bounds and `keyed` refused |
+| sub-aggregations (S7-4) | `"aggs"` inside a `terms` aggregation, one level | any of the above per bucket, over that bucket's docs |
 | `query.neural` (S3) | `{field: {"query_text", "k"}}` | encoded by the field's encoder |
 | `query.hybrid` + `rank.rrf` (S1-5, extension) | `{"hybrid": {"queries": [...]}}`, `"rank": {"rrf": {"rank_constant": 60, "window_size": 20000}}` | RRF fusion; `_score` is the RRF score |
 | `rescore` (S1-5, extension) | `{"window_size": 1000, "s3_ranker": {"model": "<name>"}}` | the learned ranker over the top window |
@@ -790,3 +794,5 @@ status:
 - 2026-11-10, architect (S7-3): section 5 gains `exists`, `ids`, `post_filter` and `collapse`; a collapsed hit
   carries `fields`. The last `sort` value is now the doc's `first_offset` in every response (S8 ruling), and
   `search_after` compares it. Additive. Why: S7 (multi-select facets, one hit per brand).
+- 2026-11-10, architect (S7-4): section 5 gains the metric aggregations, `range`, `histogram` and one level of
+  sub-aggregations under `terms` (`engine/aggs.py`, on the backend, one transfer per aggregation). Additive. Why: S7.

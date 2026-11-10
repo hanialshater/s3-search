@@ -160,10 +160,17 @@ Query = Union[QExists, QIds, QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPr
 
 @dataclass(frozen=True)
 class Agg:
+    """An aggregation: ``kind`` is terms, min, max, avg, sum, stats, value_count, cardinality, range or histogram;
+    ``params`` its options as sorted (key, value) pairs; ``sub`` its sub-aggregations (under terms only, one level)."""
     name: str
     field: str
-    size: int = 10
+    kind: str = "terms"
+    params: tuple = ()
+    sub: tuple = ()
     path: str = "aggs"
+
+    def param(self, key, default=None):
+        return dict(self.params).get(key, default)
 
 
 @dataclass(frozen=True)
