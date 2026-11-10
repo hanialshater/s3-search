@@ -24,11 +24,16 @@ def _with_method(mapping, name):
     return m
 
 
-def method_reported(resp, field="embedding"):
-    """The method the response says ran for `field` (the proposed place), or None."""
+def method_reported(resp, field="embedding", clause=0):
+    """(ran, requested) for `field`, as INTERFACES section 5 now says (architect, 2026-11-10, ratifying the steward's
+    proposal): `knn.<field> = {"requested", "ran"}`, or a list of those objects in request order when several knn
+    clauses use the field; `clause` picks one. None when absent."""
     k = resp.get("knn")
-    if isinstance(k, dict) and isinstance(k.get(field), dict):
-        return k[field].get("ran"), k[field].get("requested")
+    v = k.get(field) if isinstance(k, dict) else None
+    if isinstance(v, list):
+        v = v[clause] if clause < len(v) else None
+    if isinstance(v, dict):
+        return v.get("ran"), v.get("requested")
     return None
 
 
