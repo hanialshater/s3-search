@@ -345,7 +345,8 @@ class Executor:
         f = node.field
         if f in st.keywords:
             kw = st.keywords[f]
-            codes = [kw.code_of[str(v)] for v in node.values if v is not None and str(v) in kw.code_of and str(v)]
+            vals = [str(v) for v in node.values if v is not None and str(v)]
+            codes = [int(c) for c in kw.lookup(vals) if c > 0]
             return ops.term_mask(b, kw.codes, np.asarray(codes or [-1], np.int64))
         dt = st.num_dtype[f]
         vals = list(node.values)              # the planner converted them to the field's type
@@ -466,7 +467,8 @@ class Executor:
             elif k.field in st.keywords:
                 kw = st.keywords[k.field]
                 s = str(v)
-                out.append(float(kw.code_of[s]) if s in kw.code_of and s else
+                c = int(kw.lookup([s])[0]) if s else -1
+                out.append(float(c) if c > 0 else
                            float(np.searchsorted(kw.values[1:], s)) + 0.5)
             else:
                 out.append(float(v))
