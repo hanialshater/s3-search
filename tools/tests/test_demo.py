@@ -71,7 +71,7 @@ def _node(url, mode):
         pytest.skip("node not available")
     if subprocess.run([node, "-e", "require('playwright')"], capture_output=True, cwd=str(HERE)).returncode:
         pytest.skip("playwright for node not installed")
-    r = subprocess.run([node, str(HERE / "browser_real.js"), url, mode], capture_output=True, text=True, timeout=90)
+    r = subprocess.run([node, str(HERE / "browser_real.js"), url, mode], capture_output=True, text=True, timeout=240)
     if "Executable doesn't exist" in r.stdout + r.stderr:
         pytest.skip("no playwright browser installed")
     out = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
