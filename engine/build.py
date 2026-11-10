@@ -9,7 +9,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from .analysis import ANALYZER_VERSION, analyze
+from .analysis import ANALYZER_VERSION, analyze, analyze_with_positions
 from .encode import doc_texts, get_encoder
 from .errors import InvalidMapping
 from .mapping import Mapping, parse_mapping
@@ -36,16 +36,19 @@ def resolve_id_field(m: Mapping, catalogue: pd.DataFrame) -> str:
     raise InvalidMapping("_meta.engine.id_field", f"{m.id_field!r} is not a catalogue column")
 
 
-def build_text(catalogue: pd.DataFrame, fields: list[str]) -> TextArrays:
+POS_BITS = 24                    # a position is (field << 24) | position-in-field, uint32
+
+
+def build_text(catalogue: pd.DataFrame, fields: list[str], positions: bool = True) -> TextArrays:
     N, F = len(catalogue), len(fields)
     term_of: dict[str, int] = {}
     per_field = []
     field_len = np.zeros((N, F), dtype=np.int32)
     for f_i, f in enumerate(fields):
         col = catalogue[f].tolist() if f in catalogue.columns else [None] * N
-        docs, terms = [], []
+        docs, terms, poss = [], [], []
         for d, text in enumerate(col):
-            toks = analyze(text)
+            toks, pos = analyze_with_positions(text)
             field_len[d, f_i] = len(toks)
             for t in toks:
                 tid = term_of.get(t)
@@ -53,13 +56,16 @@ def build_text(catalogue: pd.DataFrame, fields: list[str]) -> TextArrays:
                     tid = term_of[t] = len(term_of)
                 terms.append(tid)
             docs.extend([d] * len(toks))
-        per_field.append((np.asarray(terms, np.int64), np.asarray(docs, np.int64)))
+            if positions:
+                poss.extend(pos)
+        per_field.append((np.asarray(terms, np.int64), np.asarray(docs, np.int64),
+                          np.minimum(np.asarray(poss, np.int64), (1 << POS_BITS) - 1) if positions else None))
     vocab = sorted(term_of)
     V = len(vocab)
     remap = np.zeros(max(V, 1), np.int64)
     remap[[term_of[t] for t in vocab]] = np.arange(V)
     keys, counts = [], []
-    for terms, docs in per_field:
+    for terms, docs, _ in per_field:
         k, c = np.unique(remap[terms] * N + docs, return_counts=True) if len(terms) else (np.zeros(0, np.int64),) * 2
         keys.append(k), counts.append(np.minimum(c, 255).astype(np.uint8))
     postings = np.unique(np.concatenate(keys)) if keys else np.zeros(0, np.int64)
@@ -73,8 +79,24 @@ def build_text(catalogue: pd.DataFrame, fields: list[str]) -> TextArrays:
     term_ptr = np.zeros(V + 1, dtype=np.int64)
     term_ptr[1:] = np.cumsum(df)
     avg_len = field_len.mean(axis=0).astype(np.float32) if N else np.zeros(F, np.float32)
+    pos_ptr = pos_vals = None
+    if positions:
+        # Positions, CSR over postings: for posting p, positions[pos_ptr[p]:pos_ptr[p+1]] holds
+        # (field << 24) | position, ascending (by field, then position).
+        post_of, code = [], []
+        for f_i, (terms, docs, pos) in enumerate(per_field):
+            if len(terms):
+                post_of.append(np.searchsorted(postings, remap[terms] * N + docs))
+                code.append((np.int64(f_i) << POS_BITS) | pos)
+        post_of = np.concatenate(post_of) if post_of else np.zeros(0, np.int64)
+        code = np.concatenate(code) if code else np.zeros(0, np.int64)
+        order = np.lexsort((code, post_of))
+        pos_vals = code[order].astype(np.uint32)
+        pos_ptr = np.zeros(len(postings) + 1, np.int64)
+        pos_ptr[1:] = np.cumsum(np.bincount(post_of, minlength=len(postings)))
     return TextArrays(fields=list(fields), vocab=vocab, term_ptr=term_ptr, doc_ids=docs_of_p.astype(np.int32), tf=tf,
-                      field_len=field_len, df=df, df_field=df_field.astype(np.int32), avg_len=avg_len)
+                      field_len=field_len, df=df, df_field=df_field.astype(np.int32), avg_len=avg_len,
+                      pos_ptr=pos_ptr, positions=pos_vals)
 
 
 def keyword_column(series: pd.Series, ignore_above: int) -> KeywordColumn:
@@ -129,7 +151,7 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
     N = len(catalogue)
     first_offset = (catalogue[FIRST_OFFSET_COLUMN].to_numpy(np.int64) if FIRST_OFFSET_COLUMN in catalogue.columns
                     else np.arange(N, dtype=np.int64))
-    text = build_text(catalogue, m.text)
+    text = build_text(catalogue, m.text, positions=m.positions)
     seg = SegmentArrays(manifest={}, ids=ids, first_offset=first_offset, text=text,
                         live=pack_bits(np.ones(N, bool)))
     for f, spec in m.keyword.items():

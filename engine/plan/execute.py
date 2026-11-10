@@ -13,7 +13,7 @@ import numpy as np
 
 from ..errors import InvalidRequest, UnsupportedQuery
 from .. import ops
-from .nodes import Bool, Dense, Hybrid, Lexical, MatchAll, Plan, Range, Term
+from .nodes import Bool, Dense, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
 
 INF = float("inf")
 
@@ -112,6 +112,8 @@ class Executor:
                 m = nm >= node.msm
             out = (b.where(m, s * node.boost, 0.0), m)
             ctx.setdefault("lexical", (node, s, m))
+        elif isinstance(node, Phrase):
+            out = self._phrase(node)
         elif isinstance(node, MatchAll):
             out = (b.full(N, node.boost, "float32"), b.full(N, True, "bool"))
         elif isinstance(node, Term):
@@ -145,6 +147,18 @@ class Executor:
         if ctx.get("explain") is not None:
             ctx["explain"][id(node)] = out
         return out
+
+    def _phrase(self, node):
+        from ..ops.phrase import phrase, phrase_scores
+        b, st = self.b, self.st
+        f_i = st.field_index[node.field]
+        slots = [[st.vocab[t] for t in alts if t in st.vocab] for alts in node.slots]
+        if not slots:
+            return b.zeros(st.N, "float32"), b.full(st.N, False, "bool")
+        freq, m = phrase(b, st, f_i, slots, list(node.offsets), node.slop)
+        idf_sum = sum(max((float(st.host_idf_field[t, f_i]) for t in s), default=0.0) for s in slots)
+        sc = phrase_scores(b, st, f_i, freq, idf_sum, st.mapping.k1, st.mapping.b)
+        return b.where(m, sc * node.boost, 0.0), m
 
     def _bool(self, node, ctx):
         b, N = self.b, self.st.N

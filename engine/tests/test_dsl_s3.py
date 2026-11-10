@@ -13,8 +13,9 @@ M = {"match": {"product_title": "shoes"}}
 UNSUPPORTED = [
     # query types outside the subset
     ({"query": {"fuzzy": {"product_title": "shoe"}}}, "query.fuzzy"),
-    ({"query": {"match_phrase": {"product_title": "red shoe"}}}, "query.match_phrase"),
     ({"query": {"match_phrase_prefix": {"product_title": "re"}}}, "query.match_phrase_prefix"),
+    ({"query": {"match_phrase": {"product_title": {"query": "x", "analyzer": "standard"}}}},
+     "query.match_phrase.product_title.analyzer"),
     ({"query": {"match_bool_prefix": {"product_title": "re"}}}, "query.match_bool_prefix"),
     ({"query": {"query_string": {"query": "shoe"}}}, "query.query_string"),
     ({"query": {"simple_query_string": {"query": "shoe"}}}, "query.simple_query_string"),

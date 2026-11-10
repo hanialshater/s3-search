@@ -131,6 +131,9 @@ names.
   stopwords, Porter stemmer via `snowballstemmer`, which S1 adds to `requirements.txt`). Code:
   `engine.analysis.analyze(text: str, analyzer: str = "s3_english") -> list[str]`. The conformance suite defines the
   same analyzer in the OpenSearch index settings.
+- **Positions** (`_meta.engine.positions`, default `true`; S7-1): index each term's positions, for phrases. Every
+  word takes a position, stopwords included (dropped, leaving a gap, as Lucene's stop filter does), so
+  `"red the lamp"` is red@0, lamp@2 (`engine.analysis.analyze_with_positions`).
 - **Hot fields** (`_meta.engine.hot`): numeric or boolean fields that may be patched in place (§3, §4). Only these
   (a keyword patch could need a new dictionary code, so keywords change by upsert and rebuild in v1).
 - **Vectors:** if the catalogue has a column named like the `knn_vector` field holding float arrays, they are used
@@ -292,6 +295,7 @@ Layout (`seg-<version>-<8 hex>/`):
 | `text/field_len.npy` | int32 [N, F] | tokens per field |
 | `text/df.npy`, `text/df_field.npy` | int32 [V], int32 [V, F] | document frequency, overall and per field |
 | `text/avg_len.npy` | float32 [F] | mean field length |
+| `text/pos_ptr.npy`, `text/positions.npy` (optional, S7-1) | int64 [P+1]; uint32 [T] | positions, CSR over postings: posting p's are `positions[pos_ptr[p]:pos_ptr[p+1]]`, each `(field << 24) \| position`, ascending; absent in segments built before S7 or with `positions: false`, which still load (phrases are then refused) |
 | `kw/<field>.codes.npy` | int32 [N] | 0 = missing; codes order = sorted value order |
 | `kw/<field>.values.parquet` | `value` string | row = code; row 0 is `""` |
 | `num/<field>.npy` | float32, int32, int64 or bool [N] | the column |
@@ -396,6 +400,7 @@ Index.from_segment(path, device) -> Index
 | `query.range` | `gte`, `gt`, `lte`, `lt` on numeric and keyword fields | constant score, as `term` |
 | `query.knn` | `{field: {"vector": [...], "k": int, "filter": query}}` | exact; `_score = (1 + cos) / 2` (OpenSearch `cosinesimil`); `filter` is a pre-filter |
 | `query.match_all` | `{}` | score 1.0 |
+| `query.match_phrase` (S7-1) | `{field: "text"}` or `{field: {"query", "slop": 0, "boost"}}` | text fields with positions; Lucene's rule: some choice of one position per term with `max(v) - min(v) <= slop`, `v = position - query offset` (stopwords keep their offsets); score = BM25 with the phrase frequency as tf and the sum of the terms' field idf (with slop > 0 the frequency is `sum 1 / (1 + matchLength)` over matching starts, an approximation of Lucene's); on a keyword or numeric field it is a `term` |
 | `query.neural` (S3) | `{field: {"query_text", "k"}}` | encoded by the field's encoder |
 | `query.hybrid` + `rank.rrf` (S1-5, extension) | `{"hybrid": {"queries": [...]}}`, `"rank": {"rrf": {"rank_constant": 60, "window_size": 20000}}` | RRF fusion; `_score` is the RRF score |
 | `rescore` (S1-5, extension) | `{"window_size": 1000, "s3_ranker": {"model": "<name>"}}` | the learned ranker over the top window |
@@ -686,3 +691,6 @@ status:
   gap to it is N and avgdl over documents that have the field, and one-byte lengths, by design (the steward's
   reproduction, `referee/lucene_model.py`). Why: the coordinator's audit (numeric codes recomputed on the host per
   request, rescoring on the host, FP64 on T4-class GPUs) and the steward's first contact with OpenSearch 2.19.1.
+- 2026-11-10, architect (S7-1): section 4 gains optional positions (`text/pos_ptr.npy`, `text/positions.npy`; older
+  segments load without them); section 2 gains `_meta.engine.positions` and the position rule; section 5 gains
+  `match_phrase` with `slop`. Additive. Why: the founder's feature coverage (S7).

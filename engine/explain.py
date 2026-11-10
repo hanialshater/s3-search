@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .plan.nodes import Bool, Dense, Hybrid, Lexical, MatchAll, Range, Term
+from .plan.nodes import Bool, Dense, Phrase, Hybrid, Lexical, MatchAll, Range, Term
 
 
 def _node(op, value, description, details=(), **extra):
@@ -94,6 +94,9 @@ def explain_node(ex, node, ctx, doc):
                 kids.append(_node("value", 1.0 / (node.rrf_k + r), f"1 / ({node.rrf_k} + rank {r}) in query {i}",
                                   source=explain_node(ex, q, ctx, doc)))
         return _node("sum", value, f"RRF (rank_constant {node.rrf_k}): sum over the lists that hold the doc", kids)
+    if isinstance(node, Phrase):
+        return _node("value", value, f"phrase on {node.field} (slop {node.slop}): idf sum * freq * (k1 + 1) / "
+                                     f"(k1 + freq / norm) x boost {node.boost}")
     if isinstance(node, Dense):
         return _node("value", value, f"knn on {node.field}: (1 + cos) / 2 x boost {node.boost}")
     if isinstance(node, (Term, Range, MatchAll)):

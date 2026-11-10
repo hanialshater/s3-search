@@ -29,6 +29,8 @@ class TextArrays:
     df: np.ndarray                    # int32[V]
     df_field: np.ndarray              # int32[V, F]
     avg_len: np.ndarray               # float32[F]
+    pos_ptr: np.ndarray | None = None     # int64[P+1], optional (S7-1): positions of posting p are
+    positions: np.ndarray | None = None   # positions[pos_ptr[p]:pos_ptr[p+1]], uint32 (field << 24) | position
 
 
 @dataclass
@@ -69,6 +71,8 @@ def device_nbytes(seg: SegmentArrays) -> int:
     total += sum(k.codes.nbytes for k in seg.keywords.values())
     total += sum(c.values.nbytes + n for c in seg.numerics.values())
     total += sum(v.nbytes for v in seg.vectors.values()) + n
+    if t.positions is not None:
+        total += t.pos_ptr.nbytes + t.positions.nbytes
     return int(total)
 
 
@@ -111,6 +115,9 @@ def write_segment(seg: SegmentArrays, path) -> Path:
     _strings(tmp / "text/vocab.parquet", "term", t.vocab)
     for name in ("term_ptr", "doc_ids", "tf", "field_len", "df", "df_field", "avg_len"):
         arrays[f"text/{name}.npy"] = getattr(t, name)
+    if t.positions is not None:
+        arrays["text/pos_ptr.npy"] = t.pos_ptr
+        arrays["text/positions.npy"] = t.positions
     for f, col in seg.keywords.items():
         arrays[f"kw/{f}.codes.npy"] = col.codes
         _strings(tmp / f"kw/{f}.values.parquet", "value", col.values)
@@ -180,6 +187,8 @@ def read_segment(path, verify: bool = True, mmap: bool = False) -> SegmentArrays
     text = TextArrays(fields=list(m["text_fields"]), vocab=strings("text/vocab.parquet", "term"),
                       **{k: arr(f"text/{k}.npy") for k in ("term_ptr", "doc_ids", "tf", "field_len", "df",
                                                             "df_field", "avg_len")})
+    if "text/positions.npy" in files:          # optional (S7-1): older segments have none
+        text.pos_ptr, text.positions = arr("text/pos_ptr.npy"), arr("text/positions.npy")
     seg = SegmentArrays(manifest=m, ids=ids["_id"].astype(object).to_numpy(),
                         first_offset=ids["first_offset"].to_numpy(np.int64), text=text, live=arr("live.npy"))
     for f in m.get("keyword_fields", []):

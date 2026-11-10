@@ -12,12 +12,13 @@ import math
 import re
 
 from ..errors import InvalidRequest, UnsupportedQuery
-from .ast import (Agg, QBool, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
+from .ast import (Agg, QBool, QMatchPhrase, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
 
 MAX_WINDOW = 10_000
 TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_after", "explain", "_source",
             "track_total_hits", "rank", "rescore"}
-QUERY_TYPES = ("match", "multi_match", "bool", "term", "terms", "range", "knn", "match_all", "hybrid", "neural")
+QUERY_TYPES = ("match", "multi_match", "bool", "term", "terms", "range", "knn", "match_all", "hybrid", "neural",
+               "match_phrase")
 MULTI_MATCH_TYPES = ("best_fields", "most_fields", "cross_fields")
 
 
@@ -164,6 +165,17 @@ class Parser:
                                                                                     f"{p}.operator"),
                       _msm(spec.get("minimum_should_match"), f"{p}.minimum_should_match"),
                       _num(spec.get("boost", 1.0), f"{p}.boost"), p)
+
+    def q_match_phrase(self, body, path):
+        field, spec = _one_field(body, path, "match_phrase")
+        p = f"{path}.{field}"
+        if not isinstance(spec, dict):
+            return QMatchPhrase(field, _scalar(spec, p), path=p)
+        _keys(spec, {"query", "slop", "boost"}, p)
+        if "query" not in spec:
+            raise InvalidRequest(f"{p}.query", "required")
+        return QMatchPhrase(field, _scalar(spec["query"], f"{p}.query"), _int(spec.get("slop", 0), f"{p}.slop"),
+                            _num(spec.get("boost", 1.0), f"{p}.boost"), p)
 
     def q_multi_match(self, body, path):
         _keys(body, {"query", "fields", "type", "operator", "minimum_should_match", "tie_breaker", "boost"}, path)

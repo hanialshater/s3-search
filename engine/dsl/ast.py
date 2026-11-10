@@ -31,6 +31,15 @@ class QMultiMatch:
 
 
 @dataclass(frozen=True)
+class QMatchPhrase:
+    field: str
+    query: Any
+    slop: int = 0
+    boost: float = 1.0
+    path: str = "query.match_phrase"
+
+
+@dataclass(frozen=True)
 class QBool:
     must: tuple = ()
     should: tuple = ()
@@ -93,7 +102,7 @@ class QHybrid:
     path: str = "query.hybrid"
 
 
-Query = Union[QMatch, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
+Query = Union[QMatch, QMatchPhrase, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
 
 
 @dataclass(frozen=True)
