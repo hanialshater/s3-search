@@ -1,0 +1,200 @@
+{
+ "judge": "evaluation-steward",
+ "date": "2026-11-10",
+ "label": "CPU, development only (2 cores, device cpu)",
+ "commit_judged": "ff21d54 (worktree merge of ccr-9dde3de0-jbs051 at 85c2bc0)",
+ "verdicts": {
+  "S5 re-run (a)": {
+   "verdict": "held",
+   "command": "taskset -c 0,1 python -m referee.judge s5a-rerun",
+   "report_exit_code": 0,
+   "referee_quality": {
+    "ndcg@10": 0.4643594185392334,
+    "n_ndcg@10": 2000,
+    "exact_recall@100": 0.7550547837544519,
+    "n_exact_recall@100": 2000
+   },
+   "lexical": {
+    "n": 100,
+    "tree_arithmetic": 100,
+    "root_is_score": 100,
+    "score_is_reference": 100
+   },
+   "rescored": {
+    "n": 100,
+    "base_plus_contrib_is_score": 100,
+    "root_is_score": 100,
+    "predict_on_tree_features_is_score": 100,
+    "nodes_per_tree": 19
+   }
+  },
+  "S5 re-run (b)": {
+   "verdict": "held",
+   "command": "taskset -c 0,1 python -m referee.judge s5b",
+   "actions": 268,
+   "errors": 0,
+   "by_kind": {
+    "search": 100,
+    "facet": 34,
+    "facet-clear": 34,
+    "next": 50,
+    "prev": 50
+   },
+   "page1_ms_judge_clock": {
+    "n": 218,
+    "p50": 58,
+    "p95": 67,
+    "max": 85
+   },
+   "page1_ms_page_clock": {
+    "n": 219,
+    "p95": 17.299999999813735,
+    "p50": 14.299999999813735
+   }
+  },
+  "S2 re-run (neural)": {
+   "verdict": "held",
+   "command": "taskset -c 0,1 python -m referee.judge s2-neural",
+   "segment_vector_fields": {
+    "embedding": {
+     "dim": 128,
+     "dtype": "float32",
+     "encoder": true,
+     "model": "tfidf-svd-128",
+     "space_type": "cosinesimil"
+    }
+   },
+   "refused_of_first_20": 0,
+   "differ_of_500": 0,
+   "intake_s": 20.94465724499969,
+   "reindex_s": 10.212906337999812
+  },
+  "S2-b check (not a new verdict)": {
+   "still_holds": true,
+   "reindex_s": 10.688901499000167,
+   "differ_of_2000": 0,
+   "S2-a_p99_ms": 49.35530199963978
+  },
+  "S3 prediction 1": {
+   "verdict": "held",
+   "command": "taskset -c 0,1 python -m referee conformance --engine=engine --device=cpu --against=recorded",
+   "suite": "v2 7645b267b34b",
+   "p1": {
+    "passed": 160,
+    "n": 160,
+    "rate": 1.0
+   },
+   "by_family": {
+    "filter": {
+     "role": "p1",
+     "passed": 30,
+     "n": 30,
+     "rate": 1.0
+    },
+    "filter_terms": {
+     "role": "p1",
+     "passed": 20,
+     "n": 20,
+     "rate": 1.0
+    },
+    "sort": {
+     "role": "p1",
+     "passed": 30,
+     "n": 30,
+     "rate": 1.0
+    },
+    "facets": {
+     "role": "p1",
+     "passed": 30,
+     "n": 30,
+     "rate": 1.0
+    },
+    "page": {
+     "role": "p1",
+     "passed": 30,
+     "n": 30,
+     "rate": 1.0
+    },
+    "search_after": {
+     "role": "p1",
+     "passed": 20,
+     "n": 20,
+     "rate": 1.0
+    },
+    "unsupported": {
+     "role": "p2",
+     "passed": 16,
+     "n": 16,
+     "rate": 1.0
+    },
+    "match": {
+     "role": "info",
+     "passed": 4,
+     "n": 6,
+     "rate": 0.6666666666666666,
+     "as_sets": {
+      "passed": 6,
+      "n": 6,
+      "rate": 1.0
+     }
+    },
+    "multi_match": {
+     "role": "info",
+     "passed": 0,
+     "n": 6,
+     "rate": 0.0,
+     "as_sets": {
+      "passed": 2,
+      "n": 6,
+      "rate": 0.3333333333333333
+     }
+    },
+    "bool_scored": {
+     "role": "info",
+     "passed": 0,
+     "n": 4,
+     "rate": 0.0,
+     "as_sets": {
+      "passed": 4,
+      "n": 4,
+      "rate": 1.0
+     }
+    },
+    "knn": {
+     "role": "info",
+     "passed": 4,
+     "n": 4,
+     "rate": 1.0,
+     "as_sets": {
+      "passed": 4,
+      "n": 4,
+      "rate": 1.0
+     }
+    },
+    "knn_filter": {
+     "role": "info",
+     "passed": 4,
+     "n": 4,
+     "rate": 1.0,
+     "as_sets": {
+      "passed": 4,
+      "n": 4,
+      "rate": 1.0
+     }
+    }
+   },
+   "devices_judged": [
+    "cpu"
+   ],
+   "not_judged": "torch-cpu: torch is not installed in this sandbox"
+  },
+  "S3 prediction 2": {
+   "verdict": "held",
+   "p2": {
+    "passed": 16,
+    "n": 16,
+    "rate": 1.0
+   }
+  }
+ }
+}
