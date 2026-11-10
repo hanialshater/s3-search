@@ -24,6 +24,30 @@ def _has_engine() -> bool:
         return False
 
 
+class _Tally:
+    """Counts outcomes, so the last line of `referee fast` says whether it passed and names what failed."""
+
+    def __init__(self):
+        self.counts = {"passed": 0, "failed": 0, "skipped": 0, "error": 0}
+        self.failed = []
+
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call" or (report.when == "setup" and not report.passed):
+            if report.failed:
+                key = "failed" if report.when == "call" else "error"
+                self.counts[key] += 1
+                self.failed.append(report.nodeid)
+            elif report.skipped:
+                self.counts["skipped"] += 1
+            elif report.passed:
+                self.counts["passed"] += 1
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.counts["error"] += 1
+            self.failed.append(f"collecting {report.nodeid}")
+
+
 def fast(argv=()) -> int:
     import pytest
     targets = [str(HERE / "tests")]
@@ -32,9 +56,21 @@ def fast(argv=()) -> int:
     else:
         print("referee fast: the engine has no API yet (engine/api.py), so only the referee's own tests run")
     t = time.perf_counter()
-    code = pytest.main(["-q", "-p", "no:cacheprovider", *targets, *argv])
-    print(f"referee fast: {time.perf_counter() - t:.1f} s (budget 60 s on 2 cores)")
-    return code
+    tally = _Tally()
+    code = pytest.main(["-q", "-p", "no:cacheprovider", *targets, *argv], plugins=[tally])
+    took = time.perf_counter() - t
+    c = tally.counts
+    counts = ", ".join(f"{n} {k}" for k, n in c.items() if n)
+    over = took > 60
+    if code == 0 and not over:
+        print(f"referee fast: PASSED ({counts}) in {took:.1f} s (budget 60 s on 2 cores)")
+        return 0
+    shown = "; ".join(tally.failed[:5]) + (f"; and {len(tally.failed) - 5} more" if len(tally.failed) > 5 else "")
+    why = f"FAILED ({counts}): {shown}" if tally.failed else f"FAILED (pytest exit {int(code)}; {counts})"
+    if over:
+        why += f"; over the 60 s budget"
+    print(f"referee fast: {why} in {took:.1f} s")
+    return int(code) or 1
 
 
 def bench(argv=()) -> int:

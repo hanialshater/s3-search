@@ -34,21 +34,21 @@ def test_scope_table_catches_drift(ds):
     import copy
     from referee import scope
 
-    class AnswersPhraseAndFuzzy:
+    class AnswersWildcard:
         def __init__(self, inner):
             self.inner = inner
 
         def search(self, r):
             q = json.dumps(r)
-            if "match_phrase" in q or "fuzzy" in q:
+            if "wildcard" in q:
                 return {"hits": {"total": 0, "hits": []}}
             return self.inner.search(r)
 
-    with pytest.raises(AssertionError, match="fuzzy"):        # fuzzy answered, S7-2 not marked landed
-        checks.check_errors(AnswersPhraseAndFuzzy(checks.reference_for(ds)), reference)
+    with pytest.raises(AssertionError, match="wildcard: answered"):   # outside S7: must stay refused
+        checks.check_errors(AnswersWildcard(checks.reference_for(ds)), reference)
     saved = copy.deepcopy(scope.SCOPE)
     try:                                                      # marked landed, but the implementation refuses it
-        scope.SCOPE[:] = [(n, i, True if i == "S7-3" else l, f, r) for n, i, l, f, r in scope.SCOPE]
+        scope.SCOPE[:] = [(n, i, True if i is not None else l, f, r) for n, i, l, f, r in scope.SCOPE]
         with pytest.raises(AssertionError, match="marked landed"):
             checks.check_landed_are_answered(checks.reference_for(ds), reference)
     finally:
