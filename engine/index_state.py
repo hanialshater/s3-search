@@ -113,6 +113,24 @@ def _pack(mask):
     return NumpyBackend().pack_bits(np.asarray(mask, bool))
 
 
+def _children_of(part, path):
+    """The part's child segment for ``path`` with its live bits re-derived from the parents' (§4, S9-5): a child is
+    live only if its own bit and its parent copy's are set. A commit's live bitmaps cover parent docs only, so a
+    child of a parent tombstoned by an edit or delete is dead on load. The caller's segment is not changed."""
+    seg = part.seg.nested[path]
+    n = len(seg.ids)
+    if not n:
+        return seg
+    par = np.asarray(seg.numerics["_parent"].values, np.int64)
+    own = _unpack(seg.live, n) if seg.live is not None else np.ones(n, bool)
+    live = own & part.local_live[par]
+    if live.all() and seg.live is None:
+        return seg
+    out = _copy.copy(seg)
+    out.live = _pack(live)
+    return out
+
+
 class Part:
     """One segment of the index."""
 
@@ -221,7 +239,7 @@ class IndexState:
         # S9-5: the children of each nested path are an index of their own, one part per parent part
         self.nested = {}
         for path in self.mapping.nested:
-            self.nested[path] = IndexState([p.seg.nested[path] for p in self.parts], b, check_budget=False,
+            self.nested[path] = IndexState([_children_of(p, path) for p in self.parts], b, check_budget=False,
                                            version=self.version, newest_wins=False)
         self._sync_nested()
 

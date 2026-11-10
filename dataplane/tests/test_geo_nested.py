@@ -206,10 +206,9 @@ def test_deltas_merges_and_a_parent_patch_equal_a_rebuild(tmp_path, geo_store):
     stream(tmp_path, geo_store)
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError,
-                   reason="engine: Index.from_commit revives the nested children of a parent copy tombstoned by "
-                          "add_segment (an edit), so the edited parent's children are 'live in two segments'")
 def test_commit_reload_with_edited_nested_parents(tmp_path, geo_store):
+    """A commit taken after nested edits reloads equal to a rebuild (children's live bits follow their parents',
+    §4; the engine's fix e00a310), with the log after the commit replayed."""
     r, out = stream(tmp_path, geo_store)
     c = r.commit()
     apply_changes([{"op": "patch", "_id": "P00160", "fields": {"price": 99.0}},
