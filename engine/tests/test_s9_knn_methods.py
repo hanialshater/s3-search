@@ -50,7 +50,10 @@ def test_method_named_and_fallback_equals_exact(index, method):
     v = np.linspace(-1, 1, 16)
     a = index.search(knn(v, 12))
     b = index.search(knn(v, 12, method))
-    assert b["knn"] == {"embedding": {"requested": method, "ran": "exact"}}
+    want = {"requested": method, "ran": "exact"}
+    if method != "exact":
+        want["reason"] = f"not a cuda index (device {index._st.b.name})"
+    assert b["knn"] == {"embedding": want}
     assert a["knn"] == {"embedding": {"requested": "exact", "ran": "exact"}}
     assert ids(a) == ids(b) and [h["_score"] for h in a["hits"]["hits"]] == [h["_score"] for h in b["hits"]["hits"]]
 
@@ -65,7 +68,8 @@ def test_several_clauses_on_one_field_are_a_list(index):
         {"knn": {"embedding": {"vector": v, "k": 5, "method": "cagra"}}},
         {"neural": {"embedding": {"query_text": "black shoes", "k": 5}}}]}}})
     ran = "cagra" if has_cuvs() else "exact"
-    assert r["knn"] == {"embedding": [{"requested": "cagra", "ran": ran}, {"requested": "exact", "ran": "exact"}]}
+    got = [{k: v for k, v in e.items() if k != "reason"} for e in r["knn"]["embedding"]]
+    assert got == [{"requested": "cagra", "ran": ran}, {"requested": "exact", "ran": "exact"}]
 
 
 @pytest.mark.parametrize("spec,where", [
@@ -86,7 +90,7 @@ def exact_segment_searcher(b, part, field, method, params, q, k, valid_local):
     """A stand-in for cuVS: each segment's exact top-k among its valid docs."""
     sims = ops.dense_scores(b, part.vectors[field], q)
     idx, _ = b.topk(sims, k, valid_local.reshape(1, -1))
-    return b.astype(idx, "int64")
+    return b.astype(idx, "int64"), "cuvs"
 
 
 @pytest.mark.parametrize("seed", [0, 1])
@@ -96,7 +100,7 @@ def test_segment_merge_path_equals_exact(monkeypatch, device, seed):
     reqs = [(vec("P0007"), None), (vec("P0042"), {"range": {"price": {"gte": 20, "lte": 80}}}),
             (vec("P0101"), {"term": {"category": "socks"}})]
     want = [ix.search(knn(v, 15, None, f)) for v, f in reqs]
-    monkeypatch.setattr(ann, "available", lambda b: True)
+    monkeypatch.setattr(ann, "_unavailable", lambda b: None)
     monkeypatch.setattr(ann, "search_part", exact_segment_searcher)
     for (v, f), w in zip(reqs, want):
         for m in ("cagra", "ivf_pq"):
@@ -115,13 +119,96 @@ def test_segment_searcher_sees_only_valid_docs(monkeypatch):
         seen.append((part.n, int(np.count_nonzero(b.to_numpy(valid_local))), k, dict(params)))
         return exact_segment_searcher(b, part, field, method, params, q, k, valid_local)
 
-    monkeypatch.setattr(ann, "available", lambda b: True)
+    monkeypatch.setattr(ann, "_unavailable", lambda b: None)
     monkeypatch.setattr(ann, "search_part", spy)
     ix.search(knn(vec("P0007"), 15, "ivf_pq", {"term": {"category": "socks"}}, {"n_probes": 7}))
     assert len(seen) == len(ix.segments)
     st = ix._st
     for (n, nvalid, k, params), part in zip(seen, st.parts):
         assert nvalid <= len(part.live_local) and k == min(15, nvalid) and params == {"n_probes": 7}
+
+
+def unfiltered_raw_search(b, part, field, method, params, q, k, prefilter):
+    """A stand-in for a cuVS search that takes no filter (26.06's ivf_pq): the exact top k over every local doc."""
+    assert prefilter is None
+    sims = ops.dense_scores(b, part.vectors[field], q)
+    idx, _ = b.topk(sims, k)
+    return b.astype(idx, "int64")
+
+
+def test_overfetch_rule():
+    assert ann.overfetch(10, 100_000, 100_000) == 20               # selectivity 1: 2k
+    assert ann.overfetch(10, 100_000, 10_000) == 200               # 10%: ceil(k / 0.1) * 2
+    assert ann.overfetch(10, 100_000, 10) == 2000                  # under 1% counts as 1%
+    assert ann.overfetch(10, 500, 5) == 500                        # at most the segment
+    assert ann.overfetch(100, 10**7, 10**4) == ann.MAX_OVERFETCH
+
+
+def test_filter_argument_is_discovered():
+    def old(sp, idx, q, k, neighbors=None, distances=None, resources=None, filter=None): ...
+    def new(sp, idx, q, k, neighbors=None, distances=None, resources=None): ...
+    def other(sp, idx, q, k, prefilter=None): ...
+
+    class Cython:                                                  # no signature: the docstring's parameters
+        __doc__ = """Search.\n\n    Parameters\n    ----------\n    search_params : SearchParams\n
+    index : Index\n    queries : array\n    k : int\n    filter : Optional[cuvsFilter]\n"""
+
+        def __call__(self, *a):
+            pass
+    assert ann.filter_arg(old) == "filter" and ann.filter_arg(new) is None and ann.filter_arg(other) == "prefilter"
+    import inspect
+    try:
+        inspect.signature(Cython())
+        has_sig = True
+    except (TypeError, ValueError):
+        has_sig = False
+    if not has_sig:
+        assert ann.filter_arg(Cython()) == "filter"
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_postfilter_equals_exact_and_is_named(monkeypatch, device, seed):
+    base, deltas, final = scenario(seed)
+    ix = incremental(base, deltas, device)               # deletes in every older segment
+    monkeypatch.setattr(ann, "_unavailable", lambda b: None)
+    monkeypatch.setattr(ann, "_prefilter", lambda method: None)
+    monkeypatch.setattr(ann, "raw_search", unfiltered_raw_search)
+    for v, f in [(vec("P0007"), None), (vec("P0042"), {"range": {"price": {"gte": 20, "lte": 80}}}),
+                 (vec("P0101"), {"term": {"category": "socks"}}), (vec("P0003"), {"ids": {"values": ["P0004"]}})]:
+        want = ix.search(knn(v, 15, None, f))
+        got = ix.search(knn(v, 15, "ivf_pq", f))
+        assert ids(got) == ids(want)
+        assert np.allclose([h["_score"] for h in got["hits"]["hits"]], [h["_score"] for h in want["hits"]["hits"]],
+                           atol=1e-6)
+        assert got["knn"]["embedding"]["ran"] in ("ivf_pq+postfilter", "exact")
+        if got["knn"]["embedding"]["ran"] == "exact":
+            assert got["knn"]["embedding"]["reason"].startswith("filter:")
+
+
+def test_unfiltered_segment_calls_without_a_filter(monkeypatch, segment):
+    ix = Index(copy.deepcopy(segment))                    # one segment, no deletes, no filter
+    monkeypatch.setattr(ann, "_unavailable", lambda b: None)
+    monkeypatch.setattr(ann, "_prefilter", lambda method: pytest.fail("no filter is needed"))
+    monkeypatch.setattr(ann, "raw_search", unfiltered_raw_search)
+    v = np.linspace(-1, 1, 16)
+    got, want = ix.search(knn(v, 10, "ivf_pq")), ix.search(knn(v, 10))
+    assert ids(got) == ids(want) and got["knn"] == {"embedding": {"requested": "ivf_pq", "ran": "ivf_pq"}}
+
+
+def test_cuvs_failure_runs_exact_with_a_reason(monkeypatch, segment):
+    ix = Index(copy.deepcopy(segment))
+
+    def broken(*a):
+        raise ann.Fallback("cuVS ivf_pq.search failed (cuvs 26.06.00): TypeError: unexpected keyword 'filter'")
+    monkeypatch.setattr(ann, "_unavailable", lambda b: None)
+    monkeypatch.setattr(ann, "_prefilter", lambda method: ("filter", lambda bits: bits))
+    monkeypatch.setattr(ann, "raw_search", broken)
+    v = np.linspace(-1, 1, 16)
+    got, want = ix.search(knn(v, 10, "ivf_pq", {"term": {"category": "socks"}})), \
+        ix.search(knn(v, 10, None, {"term": {"category": "socks"}}))
+    assert ids(got) == ids(want)
+    e = got["knn"]["embedding"]
+    assert e["requested"] == "ivf_pq" and e["ran"] == "exact" and "TypeError" in e["reason"]
 
 
 # ---- on the GPU (Colab)
