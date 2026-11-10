@@ -28,6 +28,11 @@ def _available_ram() -> int:
 class NumpyBackend:
     name = "cpu"
 
+    def __init__(self, accumulate: str = "float64"):
+        if accumulate not in ("float64", "float32"):
+            raise ValueError("accumulate: float64 | float32")
+        self.accumulate = accumulate
+
     # ---- creation and transfer
     def asarray(self, x, dtype=None):
         if hasattr(x, "detach"):            # a torch tensor
@@ -78,6 +83,10 @@ class NumpyBackend:
     def take_along(self, a, idx, axis=-1):
         return np.take_along_axis(a, idx, axis=axis)
 
+    def unique(self, a):
+        """Sorted distinct values."""
+        return np.unique(a)
+
     def searchsorted(self, sorted_a, v, right=False):
         return np.searchsorted(sorted_a, v, side="right" if right else "left")
 
@@ -100,7 +109,12 @@ class NumpyBackend:
         return np.repeat(np.asarray(owners, dtype=np.int64), n), entry
 
     def segment_sum(self, keys, values, n):
-        # bincount accumulates in float64, in entry order: deterministic.
+        # float64: bincount accumulates in float64, in entry order. float32: np.add.at in entry order. Both are
+        # deterministic, and a key's addends keep their order whatever else is in the batch.
+        if self.accumulate == "float32":
+            out = np.zeros(n, np.float32)
+            np.add.at(out, keys, np.asarray(values, np.float32))
+            return out
         return np.bincount(keys, weights=values, minlength=n).astype(np.float32)
 
     def segment_count(self, keys, n):
@@ -110,6 +124,8 @@ class NumpyBackend:
     def matmul(self, a, b, chunk=65_536):
         # float32 inputs, float64 accumulation, float32 result: the same values whatever the batch shape, so
         # search_batch equals search one by one. Chunked over b's columns to bound the float64 copy.
+        if self.accumulate == "float32":     # a float32 GEMM: results may depend on the batch shape
+            return np.matmul(a.astype(np.float32, copy=False), b.astype(np.float32, copy=False))
         a64 = a.astype(np.float64)
         out = np.empty((a.shape[0], b.shape[1]), np.float32)
         for s in range(0, b.shape[1], chunk):

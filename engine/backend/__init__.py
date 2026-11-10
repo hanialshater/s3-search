@@ -58,6 +58,8 @@ class Backend(Protocol):
         """Indices of true entries, one int64 array per axis, in row-major order."""
     def take_along(self, a: Array, idx: Array, axis: int = -1) -> Array: ...
     def searchsorted(self, sorted_a: Array, v: Array, right: bool = False) -> Array: ...
+    def unique(self, a: Array) -> Array:
+        """Sorted distinct values, on the device."""
     def argsort(self, a: Array, descending: bool = False) -> Array:
         """Stable argsort along the last axis (equal keys keep index order)."""
 
@@ -145,16 +147,24 @@ def resolve_device(device: str | None = None) -> str:
 
 
 _CACHE: dict = {}
+ENV_ACCUM = "S3_SEARCH_ACCUM"
 
 
-def get_backend(device: str | None = None) -> Backend:
-    """The backend for a device (one instance per device)."""
+def get_backend(device: str | None = None, accumulate: str | None = None) -> Backend:
+    """The backend for a device (one instance per device and accumulation).
+
+    ``accumulate``: ``"float64"`` (the reference default: BM25F sums and the dense matmul accumulate in float64 and
+    round to float32, so results do not depend on the batch) or ``"float32"`` (an option for GPUs with slow FP64:
+    BM25F stays deterministic and batch-invariant; the dense float32 GEMM may not be batch-invariant). ``None`` reads
+    ``S3_SEARCH_ACCUM``, else float64."""
     device = resolve_device(device)
-    if device not in _CACHE:
+    accumulate = accumulate or os.environ.get(ENV_ACCUM) or "float64"
+    key = (device, accumulate)
+    if key not in _CACHE:
         if device == "cpu":
             from .numpy_backend import NumpyBackend
-            _CACHE[device] = NumpyBackend()
+            _CACHE[key] = NumpyBackend(accumulate)
         else:
             from .torch_backend import TorchBackend
-            _CACHE[device] = TorchBackend(device)
-    return _CACHE[device]
+            _CACHE[key] = TorchBackend(device, accumulate)
+    return _CACHE[key]

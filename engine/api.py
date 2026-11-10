@@ -46,15 +46,16 @@ class Index:
     therefore run one batch at a time (serving batches requests with search_batch).
     """
 
-    def __init__(self, seg, device: str = "cpu"):
-        self._st = IndexState(seg, get_backend(device))
+    def __init__(self, seg, device: str = "cpu", accumulate: str | None = None):
+        """``accumulate``: "float64" (the default reference) or "float32" (docs/INTERFACES.md §0)."""
+        self._st = IndexState(seg, get_backend(device, accumulate))
         self.rankers: dict = {}
         self._lock = threading.RLock()
 
     # ---- construction
     @classmethod
-    def from_segment(cls, path, device: str = "cpu", verify: bool = True) -> "Index":
-        return cls(read_segment(path, verify=verify), device)
+    def from_segment(cls, path, device: str = "cpu", verify: bool = True, accumulate: str | None = None) -> "Index":
+        return cls(read_segment(path, verify=verify), device, accumulate)
 
     @_locked
     def save(self, path) -> Path:
@@ -168,10 +169,10 @@ class Index:
         return [str(st.ids[d]) for d in cand_h[ok]], np.asarray(b.to_numpy(X)[0][ok], np.float32)
 
 
-def build_index(catalogue: pd.DataFrame, mapping: dict, device: str = "cpu") -> Index:
+def build_index(catalogue: pd.DataFrame, mapping: dict, device: str = "cpu", accumulate: str | None = None) -> Index:
     if not isinstance(catalogue, pd.DataFrame):
         raise TypeError("catalogue: a pandas DataFrame")
-    return Index(build_segment(catalogue, mapping), device)
+    return Index(build_segment(catalogue, mapping), device, accumulate)
 
 
 # ---- rankers on disk (docs/INTERFACES.md §5): JSON, no pickle
