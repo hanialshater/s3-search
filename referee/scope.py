@@ -29,10 +29,11 @@ SCOPE = [
     ("match_bool_prefix", "S7-2", True, "match_bool_prefix",
      {"query": {"match_bool_prefix": {"product_title": "red la"}}}),
     # S7-3: exists, ids, post_filter, collapse on a keyword field
-    ("exists", "S7-3", False, "exists", {"query": {"exists": {"field": "product_color"}}}),
-    ("ids", "S7-3", False, "ids", {"query": {"ids": {"values": ["T0001", "T0002"]}}}),
-    ("post_filter", "S7-3", False, "post_filter", {"query": Q, "post_filter": {"term": {"category": "lamp"}}}),
-    ("collapse keyword", "S7-3", False, "collapse", {"query": Q, "collapse": {"field": "category"}}),
+    ("exists", "S7-3", True, "exists", {"query": {"exists": {"field": "product_color"}}}),
+    ("ids", "S7-3", True, "ids", {"query": {"ids": {"values": ["T0001", "T0002"]}}}),
+    ("post_filter", "S7-3", True, "post_filter", {"query": Q, "post_filter": {"term": {"category": "lamp"}}}),
+    ("collapse keyword", "S7-3", True, "collapse", {"query": Q, "collapse": {"field": "category"}}),
+    ("collapse numeric", "S7-3", True, "collapse", {"query": Q, "collapse": {"field": "stock"}}),
     # S7-4: metric and bucket aggregations, one level of sub-aggregations under terms
     *[(f"agg {a}", "S7-4", False, a, {"query": Q, "size": 0, "aggs": {"x": {a: {"field": "price"}}}})
       for a in ("min", "max", "avg", "sum", "stats", "value_count")],
