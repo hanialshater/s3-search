@@ -2,7 +2,7 @@
 
     python -m tools.demo --api http://127.0.0.1:8080            # page on :8000, /indexes/* proxied to the API
     python -m tools.demo --serving-cmd "python -m serving ..."   # start the platform engineer's server first
-    python -m tools.demo --fake                                  # a fake engine (tools/tests/fakes.py), for the page only
+    python -m tools.demo --real [--products N] [--fields]        # start a real serving replica over ESCI-sample (tools/stack.py)
 
 The page calls ``/indexes/{name}/_search`` on its own origin; this server forwards those calls to the API, so the page
 needs no CORS. Open ``http://127.0.0.1:8000/?index=NAME``.
@@ -72,15 +72,18 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m tools.demo", description=__doc__.split("\n\n")[0])
     ap.add_argument("--api", default="http://127.0.0.1:8080", help="the serving API (INTERFACES §7)")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--fake", action="store_true", help="start the fake engine instead of using --api")
+    ap.add_argument("--real", action="store_true", help="start a real serving replica over ESCI-sample instead of --api")
+    ap.add_argument("--products", type=int, default=None, help="with --real: the first N products (default all)")
+    ap.add_argument("--fields", action="store_true", help="with --real: add synthetic price, stock and category")
     ap.add_argument("--serving-cmd", help="a command that starts the serving API; stopped when this exits")
     args = ap.parse_args(argv)
 
-    api, proc, fake = args.api, None, None
-    if args.fake:
-        from tools.tests.fakes import serve_fake
-        fake, api = serve_fake()
-        print(f"fake engine at {api} (not the real engine)")
+    api, proc, stack = args.api, None, None
+    if args.real:
+        from tools.stack import Stack
+        stack = Stack(args.products, args.fields)
+        api = stack.base
+        print(f"real serving replica at {api}")
     elif args.serving_cmd:
         proc = subprocess.Popen(shlex.split(args.serving_cmd))
     srv = make_server(api, args.port)
@@ -93,8 +96,8 @@ def main(argv=None) -> int:
         srv.server_close()
         if proc:
             proc.terminate()
-        if fake:
-            fake.shutdown()
+        if stack:
+            stack.close()
     return 0
 
 

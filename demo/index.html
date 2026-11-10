@@ -10,8 +10,12 @@
 <header>
   <h1>S3 Search</h1>
   <form id="search-form" role="search">
-    <label class="sr" for="q">Search the catalogue</label>
-    <input id="q" type="search" placeholder="Search products" autocomplete="off" autofocus>
+    <div class="search-wrap">
+      <label class="sr" for="q">Search the catalogue</label>
+      <input id="q" type="search" placeholder="Search products" autocomplete="off" autofocus
+             role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggest">
+      <ul id="suggest" role="listbox" aria-label="Suggestions" hidden></ul>
+    </div>
     <button type="submit">Search</button>
   </form>
   <label class="toggle"><input id="explain" type="checkbox"> Explain scores</label>
@@ -20,12 +24,15 @@
 <div class="layout">
   <aside id="filters" aria-label="Filters">
     <div id="dynamic-filters"></div>
-    <label class="sortbox" hidden>Sort <select id="sort"></select></label>
     <button id="clear" type="button">Clear filters</button>
   </aside>
 
   <main>
-    <p id="summary" role="status" aria-live="polite"></p>
+    <div class="bar-row">
+      <p id="summary" role="status" aria-live="polite"></p>
+      <label id="sort-box" hidden>Sort <select id="sort"></select></label>
+      <label id="collapse-box" hidden><input id="collapse" type="checkbox"> One result per brand</label>
+    </div>
     <p id="error" role="alert" hidden></p>
     <ol id="results"></ol>
     <nav id="pager" aria-label="Pages">
