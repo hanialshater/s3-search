@@ -10,4 +10,4 @@ export S3_ENVTEST_BIN="${S3_ENVTEST_BIN:-/tmp/claude-0/envtest/controller-tools/
 for b in etcd kube-apiserver; do
   [ -x "$S3_ENVTEST_BIN/$b" ] || { echo "missing $S3_ENVTEST_BIN/$b (set S3_ENVTEST_BIN)" >&2; exit 2; }
 done
-exec python3 -m pytest deploy/tests/test_envtest.py -q -p no:cacheprovider "$@"
+exec python3 -m pytest deploy/tests -m envtest -q -p no:cacheprovider "$@"

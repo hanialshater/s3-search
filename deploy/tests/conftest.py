@@ -134,3 +134,48 @@ def kube(apiserver) -> Kube:
 @pytest.fixture
 def rec(kube) -> Reconciler:
     return Reconciler(kube)
+
+
+class Operator:
+    """An operator process against the envtest API server; its log is a file, so tests can see who reconciled what."""
+
+    def __init__(self, apiserver, workdir, name, *args):
+        import subprocess
+        import sys
+        self.name, self.log = name, Path(workdir) / f"{name}.log"
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "deploy.s3operator", "--server", apiserver.url, "--token", apiserver.token,
+             "--insecure", "--identity", name, *args],
+            stdout=open(self.log, "w"), stderr=subprocess.STDOUT, cwd=str(DEPLOY.parent))
+
+    def text(self) -> str:
+        return self.log.read_text()
+
+    def reconciles(self, ns: str | None = None) -> int:
+        return sum(1 for line in self.text().splitlines() if " reconcile " in line and (ns is None or f" {ns}/" in line))
+
+    def kill(self) -> None:
+        self.proc.kill()
+        self.proc.wait(10)
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(15)
+            except Exception:  # noqa: BLE001
+                self.proc.kill()
+
+
+@pytest.fixture
+def operators(apiserver, tmp_path):
+    made: list[Operator] = []
+
+    def start(name, *args):
+        op = Operator(apiserver, tmp_path, name, *args)
+        made.append(op)
+        return op
+
+    yield start
+    for op in made:
+        op.stop()
