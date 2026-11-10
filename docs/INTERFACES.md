@@ -422,8 +422,22 @@ Scoring, exactly:
   `rescore`, the first value is the tier (1 inside the rescored window, 0 below it), so the window comes first.
 - `aggregations` is present only when requested. `took_ms` always has `total`, plus each stage that ran; stage names
   are the closed set above plus `encode` (additive).
-- `explain` (when requested) is a list in hit order, Lucene-shaped: `{value, description, details}` per hit, with per
-  term and per field contributions and, under `rescore`, each feature's contribution.
+- `explain` (when requested) is a list in hit order, Lucene-shaped: `{_id, op, value, description, details}` per hit,
+  with per term and per field contributions and, under `rescore`, each feature's contribution. Every node has `op`,
+  which says how its value comes from its `details` (`description` is for people; tools check by `op`):
+  - `"sum"`: the sum of the details' values; `"product"`: their product; `"max"`: the largest;
+  - `"value"`: a leaf, or a value given by the formula in `description`; its details, if any, are inputs, not terms;
+  - `"ranker"`: a learned ranker's score = `base + each feature's contribution`; `details` are the base
+    (`description: "ranker base value"`) then one node per feature with `feature` (its name) and `feature_value`
+    (`null` when absent); they sum to the value (exact path attribution for the GBDT).
+  A node may carry `source`, the tree its value came from (the lexical tree behind the `lex_*` features of a rescored
+  hit; the sub-query behind each RRF term); `source` is not part of the arithmetic. The root's value equals the
+  hit's `_score` (within 1e-4); a rescored hit below the window is a `"value"` node with the first-stage tree as
+  `source`.
+- **Rankers on disk:** `engine.api.save_ranker(model, path, feature_names=None)` and `load_ranker(path)`. JSON, no
+  pickle: `{"format": "s3-ranker", "format_version": 1, "kind": "gbdt", "feature_names": [...] | null,
+  "model": GBDT.to_dict()}`. `load_ranker` also reads a bare `GBDT.to_dict()` JSON (serving's interim format) and
+  refuses other formats or versions with `ValueError`. Register a loaded model with `Index.add_ranker(name, model)`.
 - No hit beyond `total`: an empty page is `{"total": n, "hits": []}`.
 
 ## 6. The plan (DSL → operators) · owner architect
@@ -601,3 +615,12 @@ status:
   `dataplane.indexer.build` and `engine.api.Index` (`from_segment`, `search`, `search_batch`, `patch`, `delete`,
   `set_version`, `.version`, `.n_docs`) exactly as §3 to §5 define them; engine exceptions named `UnsupportedQuery`,
   `InvalidRequest`, `InvalidMapping`, `OverBudget`, `DeviceUnavailable`, `NotHot`, `NoSuchKey`, `CorruptSegment`.
+- 2026-11-10, architect (S5 judgement, defects 2 and 3; additive to section 5): every explain node gains a
+  machine-readable `op` (`sum`, `product`, `max`, `value`, `ranker`), and may carry `source`. A rescored hit is
+  explained as `op: "ranker"`: the ranker's score = base + each feature's contribution, each with its value, the
+  lexical tree kept as the `source` of the `lex_*` features (before, it was one node wrapping the lexical tree, with
+  no contributions). `GBDT.contributions(X)` gives exact path attribution. `engine.api.save_ranker` and
+  `load_ranker` give rankers a JSON file format (`s3-ranker` v1, wrapping `GBDT.to_dict()`, no pickle). Why: section 5
+  promised per-feature contributions, and the tools and serving need to read explanations and rankers without
+  parsing prose or pickles. Checked by `engine/tests/test_explain.py` against the pre-registered prediction (100
+  lexical and 100 rescored explanations sum to the hit's score within 1e-4, on toy).

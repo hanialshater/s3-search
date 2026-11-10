@@ -326,7 +326,11 @@ class Executor:
         timer.lap("features")
         cand_h = b.to_numpy(cand)[0]
         ok = cand_h >= 0
-        pred = np.asarray(ranker.predict(b.to_numpy(X)[0][ok]), np.float32)
+        Xh = np.asarray(b.to_numpy(X)[0][ok], np.float32)
+        pred = np.asarray(ranker.predict(Xh), np.float32)
+        if ctx.get("explain") is not None:
+            ctx["rescore"] = {"ranker": ranker, "row_of": {int(d): i for i, d in enumerate(cand_h[ok])}, "X": Xh,
+                              "pred": pred}
         sel = b.asarray(cand_h[ok], "int64")
         new = b.copy(score)
         tier = b.zeros(N, "float32")

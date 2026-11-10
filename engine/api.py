@@ -27,7 +27,7 @@ from .segment import NumericColumn, read_segment, write_segment
 
 __all__ = ["build_index", "Index", "available_devices", "UnsupportedQuery", "InvalidRequest", "InvalidMapping",
            "OverBudget", "DeviceUnavailable", "NoSuchKey", "CorruptSegment",
-           "NotHot"]
+           "NotHot", "save_ranker", "load_ranker", "RANKER_FORMAT"]
 
 
 def _locked(fn):
@@ -172,3 +172,46 @@ def build_index(catalogue: pd.DataFrame, mapping: dict, device: str = "cpu") -> 
     if not isinstance(catalogue, pd.DataFrame):
         raise TypeError("catalogue: a pandas DataFrame")
     return Index(build_segment(catalogue, mapping), device)
+
+
+# ---- rankers on disk (docs/INTERFACES.md §5): JSON, no pickle
+RANKER_FORMAT, RANKER_FORMAT_VERSION = "s3-ranker", 1
+
+
+def save_ranker(model, path, feature_names: Sequence[str] | None = None) -> Path:
+    """Write a ranker as JSON: ``{"format": "s3-ranker", "format_version": 1, "kind": "gbdt",
+    "feature_names": [...] | null, "model": GBDT.to_dict()}``. Written to ``<path>.tmp`` and renamed."""
+    import json
+    import os
+    from .rank.gbdt import GBDT
+    if not isinstance(model, GBDT):
+        raise TypeError("save_ranker: v1 stores engine.rank.gbdt.GBDT models only")
+    path = Path(path)
+    doc = {"format": RANKER_FORMAT, "format_version": RANKER_FORMAT_VERSION, "kind": "gbdt",
+           "feature_names": list(feature_names) if feature_names is not None else None, "model": model.to_dict()}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, separators=(",", ":")))
+    os.replace(tmp, path)
+    return path
+
+
+def load_ranker(path):
+    """Read a ranker written by ``save_ranker``, or a bare ``GBDT.to_dict()`` JSON (serving's interim format).
+    Returns the model (``predict``, ``contributions``); the stored ``feature_names`` are on ``model.feature_names``."""
+    import json
+    from .rank.gbdt import GBDT
+    doc = json.loads(Path(path).read_text())
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: not a ranker")
+    if "format" in doc:
+        if doc.get("format") != RANKER_FORMAT or doc.get("format_version") != RANKER_FORMAT_VERSION \
+                or doc.get("kind") != "gbdt":
+            raise ValueError(f"{path}: format {doc.get('format')} v{doc.get('format_version')} "
+                             f"kind {doc.get('kind')}; expected {RANKER_FORMAT} v{RANKER_FORMAT_VERSION} gbdt")
+        model, names = GBDT.from_dict(doc["model"]), doc.get("feature_names")
+    elif {"params", "trees", "edges", "base"} <= set(doc):
+        model, names = GBDT.from_dict(doc), None
+    else:
+        raise ValueError(f"{path}: not a ranker")
+    model.feature_names = names
+    return model
