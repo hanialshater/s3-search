@@ -13,6 +13,7 @@ import numpy as np
 
 from ..errors import InvalidRequest, UnsupportedQuery
 from .. import ops
+from .. import ann
 from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Nested, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Term
 
 INF = float("inf")
@@ -55,6 +56,23 @@ def _modify(b, mod: str, x):
     raise ValueError(mod)
 
 
+
+def _knn_methods(b, plan) -> dict:
+    """S9-1, §5: ``{field: {"requested", "ran"}}`` for the plan's knn and neural clauses, a list in request order when
+    several share a field."""
+    out = {}
+    roots = [plan.root] + ([plan.post_filter] if plan.post_filter is not None else [])
+    for n in (m for r in roots for m in walk(r)):
+        if isinstance(n, Dense):
+            e = {"requested": n.method, "ran": ann.ran(b, n.method)}
+            if n.field not in out:
+                out[n.field] = e
+            elif isinstance(out[n.field], list):
+                out[n.field].append(e)
+            else:
+                out[n.field] = [out[n.field], e]
+    return out
+
 class Timer:
     def __init__(self, b):
         self.b, self.laps, self.t0 = b, defaultdict(float), time.perf_counter()
@@ -87,7 +105,7 @@ class Executor:
                     lex[(n.fields, n.idf)].append(n)
                 elif isinstance(n, Dense):
                     dense[n.field].append(n)
-        self.lex_cache, self.dense_cache = {}, {}
+        self.lex_cache, self.dense_cache, self.dense_query = {}, {}, {}
         for (fields, idf_mode), nodes in lex.items():
             nodes = list(dict.fromkeys(nodes))
             F = len(st.text_fields)
@@ -132,6 +150,7 @@ class Executor:
                     sims[:, b.asarray(part.live_slot, "int64")] = sp[:, b.asarray(part.live_local, "int64")]
             for i, n in enumerate(nodes):
                 self.dense_cache[n] = sims[i]
+                self.dense_query[n] = qd[i]
         if dense:
             timer.lap("retrieve")
 
@@ -194,6 +213,9 @@ class Executor:
             valid = st.live
             if node.filter is not None:
                 valid = valid & self.eval(node.filter, ctx)[1]
+            if ann.ran(b, node.method) != "exact":         # S9-1: the docs cuVS finds, scored exactly
+                valid = ann.candidates(b, st, node.field, node.method, dict(node.method_parameters),
+                                       self.dense_query[node], node.k, valid)
             idx, _ = b.topk(sims.reshape(1, N), node.k, valid.reshape(1, N))
             idx = idx[0]
             idx = idx[idx >= 0]
@@ -645,6 +667,9 @@ class Executor:
                     h["fields"] = {plan.collapse: [None if c == 0 else group_keys[c]]}
             t.lap("page")
             resp = {"hits": {"total": total, "hits": hits}, **resp}
+            knn = _knn_methods(b, plan)
+            if knn:
+                resp["knn"] = knn
             if plan.highlight is not None:
                 from ..highlight import highlight_hits
                 for h, hl in zip(hits, highlight_hits(st, plan, ids)):

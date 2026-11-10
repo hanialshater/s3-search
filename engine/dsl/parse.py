@@ -103,6 +103,25 @@ def _fuzzy_opts(spec, p, default=None):
                  _int(spec.get("max_expansions", 50), f"{p}.max_expansions", 1), tr)
 
 
+
+def _knn_method(spec, p):
+    """S9-1: ``method`` (exact | cagra | ivf_pq; exact by default) and ``method_parameters`` (cagra: itopk_size,
+    search_width; ivf_pq: n_probes; positive integers)."""
+    from ..ann import METHODS, SEARCH_PARAMS
+    method = spec.get("method", "exact")
+    if method not in METHODS:
+        raise InvalidRequest(f"{p}.method", "one of " + ", ".join(METHODS))
+    mp = spec.get("method_parameters", {})
+    _obj(mp, f"{p}.method_parameters")
+    allowed = SEARCH_PARAMS.get(method, set())
+    out = []
+    for k in sorted(mp):
+        if k not in allowed:
+            raise InvalidRequest(f"{p}.method_parameters.{k}",
+                                 f"not a parameter of {method}" + (f" (one of {', '.join(sorted(allowed))})" if allowed else ""))
+        out.append((k, _int(mp[k], f"{p}.method_parameters.{k}", 1)))
+    return method, tuple(out)
+
 class Parser:
     # ---- the request
     def request(self, req: dict) -> Request:
@@ -494,24 +513,24 @@ class Parser:
     def q_knn(self, body, path):
         field, spec = _one_field(body, path, "knn")
         p = f"{path}.{field}"
-        _keys(spec, {"vector", "k", "filter", "boost"}, p)
+        _keys(spec, {"vector", "k", "filter", "boost", "method", "method_parameters"}, p)
         vec = spec.get("vector")
         if not isinstance(vec, list) or not vec or any(isinstance(x, bool) or not isinstance(x, (int, float))
                                                        for x in vec):
             raise InvalidRequest(f"{p}.vector", "a non-empty list of numbers")
         flt = self.query(spec["filter"], f"{p}.filter") if "filter" in spec else None
         return QKnn(field, tuple(float(x) for x in vec), _int(spec.get("k", 10), f"{p}.k", 1), flt,
-                    _num(spec.get("boost", 1.0), f"{p}.boost"), path)
+                    _num(spec.get("boost", 1.0), f"{p}.boost"), path, *_knn_method(spec, p))
 
     def q_neural(self, body, path):
         field, spec = _one_field(body, path, "neural")
         p = f"{path}.{field}"
-        _keys(spec, {"query_text", "k", "filter", "boost", "model_id"}, p)
+        _keys(spec, {"query_text", "k", "filter", "boost", "model_id", "method", "method_parameters"}, p)
         if not isinstance(spec.get("query_text"), str):
             raise InvalidRequest(f"{p}.query_text", "a string")
         flt = self.query(spec["filter"], f"{p}.filter") if "filter" in spec else None
         return QNeural(field, spec["query_text"], _int(spec.get("k", 10), f"{p}.k", 1), flt,
-                       _num(spec.get("boost", 1.0), f"{p}.boost"), path)
+                       _num(spec.get("boost", 1.0), f"{p}.boost"), path, *_knn_method(spec, p))
 
     def q_hybrid(self, body, path):
         _keys(body, {"queries"}, path)

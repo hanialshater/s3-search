@@ -48,6 +48,8 @@ class Dense:
     filter: Any = None
     boost: float = 1.0
     path: str = "query"
+    method: str = "exact"                 # S9-1: the requested method; the executor says which ran
+    method_parameters: tuple = ()
 
 
 @dataclass(frozen=True)
