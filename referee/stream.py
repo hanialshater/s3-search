@@ -516,7 +516,11 @@ def main(argv=None) -> int:
     ap.add_argument("--interval", type=float, default=0.05, help="the replica's poll interval (Replica.start)")
     ap.add_argument("--parts", default="stream,bulk,intake")
     ap.add_argument("--out", default="results/judge-s8.json")
+    ap.add_argument("--self-test", action="store_true", help="run the judge's full self-tests on toy, then stop")
     a = ap.parse_args(argv)
+    if a.self_test:
+        import pytest
+        return int(pytest.main(["-q", "-p", "no:cacheprovider", str(Path(__file__).parent / "tests" / "test_stream.py")]))
     from dataplane.updater import Replica
     work = Path(tempfile.mkdtemp(prefix="judge-s8-"))
     res = {"kind": "judge-s8", "label": "CPU, development only", "dataset": "esci-sample",

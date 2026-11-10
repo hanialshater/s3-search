@@ -1,5 +1,8 @@
 """The S8-7 write-stream judge, self-tested on toy before S8-4 lands (no verdicts here).
 
+`referee fast` runs the quick ones; the full runs are marked `slow` and run with the judge:
+`python -m pytest -m slow referee/tests/test_stream.py` (or `python -m referee.stream --self-test`).
+
 - The real updater as it stands (no delta segments yet) makes the judge stop with UpdaterAbsent.
 - A test-only replica with S8-4's documented behaviour (upserts searchable after a poll) runs the whole stream clean.
 - Planted errors are caught: a replica that never applies deletes, and one that answers with a partial result.
@@ -101,22 +104,23 @@ def test_the_current_updater_is_reported_absent(tmp_path):
         if hasattr(rep, "refresh") or "delta" in (rep.stats() or {}):
             pytest.skip("the updater looks like S8-4's: this test is for its absence")
         with pytest.raises(stream.UpdaterAbsent, match="S8-4"):
-            stream.require_s8_updater(st, rep, stream._doc(texts[0]), wait_s=1.0)
+            stream.require_s8_updater(st, rep, stream._doc(texts[0]), wait_s=0.5)
     finally:
         rep.stop()
 
 
-def _run(tmp, **fake):
+def _run(tmp, duration_s=1.5, idle_s=0.4, rate=100, **fake):
     ds, st, seg, base_ids, pool, texts, reqs = _toy_store(tmp)
     rep = RebuildReplica(st, ds.mapping, **fake).start(interval=0.02)
     try:
         stream.require_s8_updater(st, rep, stream._doc(texts[0]), wait_s=2.0)
-        return stream.run_stream(st, rep, ds.mapping, base_ids, st.head(), pool, texts, reqs, rate=100,
-                                 duration_s=1.5, idle_s=0.4, settle_timeout_s=3.0, out_dir=Path(tmp) / "rb")
+        return stream.run_stream(st, rep, ds.mapping, base_ids, st.head(), pool, texts, reqs, rate=rate,
+                                 duration_s=duration_s, idle_s=idle_s, settle_timeout_s=3.0, out_dir=Path(tmp) / "rb")
     finally:
         rep.stop()
 
 
+@pytest.mark.slow
 def test_a_correct_updater_runs_clean(tmp_path):
     r = _run(tmp_path)
     w = r["writes"]
@@ -128,13 +132,15 @@ def test_a_correct_updater_runs_clean(tmp_path):
     assert q["same_version"] and q["differ"] == 0 and q["n"] == 20
 
 
+@pytest.mark.slow
 def test_planted_lost_deletes_are_caught(tmp_path):
     r = _run(tmp_path, drop_deletes=True)
     assert r["writes"]["never_visible"]["delete"] > 0 or r["quiesced"]["differ"] > 0
 
 
 def test_planted_partial_results_are_caught(tmp_path):
-    r = _run(tmp_path, partial_every=3)
+    """The quick one fast keeps: a short stream, and a replica that answers some queries with a partial result."""
+    r = _run(tmp_path, duration_s=0.4, idle_s=0.1, rate=50, partial_every=3)
     assert r["queries"]["n_wrong_totals"] > 0
 
 
@@ -146,6 +152,7 @@ def test_marker_words_survive_the_analyzer():
     assert len({stream.marker(n) for n in range(5000)}) == 5000
 
 
+@pytest.mark.slow
 def test_intake_timings_and_bulk_on_toy(tmp_path):
     ds = loader.load_dataset("toy")
     cat = ds.catalogue.drop(columns=["embedding"])
