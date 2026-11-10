@@ -193,3 +193,23 @@ def test_add_segment_is_atomic_on_a_duplicate():
     with pytest.raises(ValueError):
         ix.replace_segments([], build_segment(dup, mapping()))        # live twice, not tombstoned
     same(ix.search(REQS[0]), before)
+
+
+def test_merge_with_a_key_changed_after_the_snapshot():
+    """The S8-1 merge protocol: a key upserted after the snapshot lives in a newer delta; the merged copy is
+    tombstoned through delete_ids, and the result equals a rebuild."""
+    base, deltas, final = scenario(0)
+    ix = Index(build_segment(base, mapping(), version=1))
+    df0, dels0, v0 = deltas[0]
+    ix.add_segment(build_segment(df0, mapping(), version=v0), version=v0, delete_ids=list(dels0) + list(df0["product_id"]))
+    segs, v = ix.snapshot_segments()
+    merged = merge_segments(segs, version=v)
+    df1, dels1, v1 = deltas[1]
+    ix.add_segment(build_segment(df1, mapping(), version=v1), version=v1, delete_ids=list(dels1) + list(df1["product_id"]))
+    changed = list(dels1) + list(df1["product_id"])
+    old = [s["segment_id"] for s in ix.segments[:2]]
+    ix.replace_segments(old, merged, delete_ids=changed)
+    rebuilt = Index(build_segment(final, mapping(), version=11))
+    assert len(ix.segments) == 2
+    for r in REQS:
+        same(ix.search(r), rebuilt.search(r))
