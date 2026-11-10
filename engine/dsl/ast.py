@@ -9,6 +9,15 @@ from typing import Any, Union
 
 
 @dataclass(frozen=True)
+class Fuzzy:
+    """Fuzziness options of match, multi_match and fuzzy (OpenSearch's defaults)."""
+    fuzziness: Any = None                # None: exact terms
+    prefix_length: int = 0
+    max_expansions: int = 50
+    transpositions: bool = True
+
+
+@dataclass(frozen=True)
 class QMatch:
     field: str
     query: Any
@@ -16,6 +25,35 @@ class QMatch:
     msm: Any = None
     boost: float = 1.0
     path: str = "query.match"
+    fuzzy: Fuzzy = Fuzzy()
+
+
+@dataclass(frozen=True)
+class QFuzzy:
+    field: str
+    value: Any
+    fuzzy: Fuzzy = Fuzzy("AUTO")
+    boost: float = 1.0
+    path: str = "query.fuzzy"
+
+
+@dataclass(frozen=True)
+class QPrefix:
+    field: str
+    value: str
+    boost: float = 1.0
+    path: str = "query.prefix"
+
+
+@dataclass(frozen=True)
+class QMatchBoolPrefix:
+    field: str
+    query: str
+    operator: str = "or"
+    msm: Any = None
+    max_expansions: int = 50
+    boost: float = 1.0
+    path: str = "query.match_bool_prefix"
 
 
 @dataclass(frozen=True)
@@ -28,6 +66,7 @@ class QMultiMatch:
     tie_breaker: float | None = None
     boost: float = 1.0
     path: str = "query.multi_match"
+    fuzzy: Fuzzy = Fuzzy()
 
 
 @dataclass(frozen=True)
@@ -102,7 +141,7 @@ class QHybrid:
     path: str = "query.hybrid"
 
 
-Query = Union[QMatch, QMatchPhrase, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
+Query = Union[QMatch, QMatchPhrase, QFuzzy, QPrefix, QMatchBoolPrefix, QMultiMatch, QBool, QTerm, QRange, QKnn, QNeural, QMatchAll, QHybrid]
 
 
 @dataclass(frozen=True)

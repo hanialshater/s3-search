@@ -12,15 +12,18 @@ M = {"match": {"product_title": "shoes"}}
 
 UNSUPPORTED = [
     # query types outside the subset
-    ({"query": {"fuzzy": {"product_title": "shoe"}}}, "query.fuzzy"),
+    ({"query": {"fuzzy": {"product_title": {"value": "shoe", "rewrite": "constant_score"}}}},
+     "query.fuzzy.product_title.rewrite"),
     ({"query": {"match_phrase_prefix": {"product_title": "re"}}}, "query.match_phrase_prefix"),
     ({"query": {"match_phrase": {"product_title": {"query": "x", "analyzer": "standard"}}}},
      "query.match_phrase.product_title.analyzer"),
-    ({"query": {"match_bool_prefix": {"product_title": "re"}}}, "query.match_bool_prefix"),
+    ({"query": {"match_bool_prefix": {"product_title": {"query": "re", "fuzziness": 1}}}},
+     "query.match_bool_prefix.product_title.fuzziness"),
     ({"query": {"query_string": {"query": "shoe"}}}, "query.query_string"),
     ({"query": {"simple_query_string": {"query": "shoe"}}}, "query.simple_query_string"),
     ({"query": {"wildcard": {"product_title": "sh*"}}}, "query.wildcard"),
-    ({"query": {"prefix": {"product_title": "sh"}}}, "query.prefix"),
+    ({"query": {"prefix": {"product_title": {"value": "sh", "case_insensitive": True}}}},
+     "query.prefix.product_title.case_insensitive"),
     ({"query": {"regexp": {"product_title": "sh.*"}}}, "query.regexp"),
     ({"query": {"exists": {"field": "price"}}}, "query.exists"),
     ({"query": {"ids": {"values": ["P0001"]}}}, "query.ids"),
@@ -33,7 +36,10 @@ UNSUPPORTED = [
     ({"query": {"bool": {"must": [{"wildcard": {"product_title": "sh*"}}]}}}, "query.bool.must[0].wildcard"),
     ({"query": {"bool": {"filter": {"geo_distance": {}}}}}, "query.bool.filter.geo_distance"),
     # options outside the subset
-    ({"query": {"match": {"product_title": {"query": "x", "fuzziness": 2}}}}, "query.match.product_title.fuzziness"),
+    ({"query": {"match": {"product_title": {"query": "x", "fuzzy_rewrite": "x"}}}},
+     "query.match.product_title.fuzzy_rewrite"),
+    ({"query": {"match": {"product_title": {"query": "shoes", "fuzziness": 3}}}}, "query.match.product_title.fuzziness"),
+    ({"query": {"fuzzy": {"price": "3"}}}, "query.fuzzy.price"),
     ({"query": {"match": {"product_title": {"query": "x", "analyzer": "standard"}}}},
      "query.match.product_title.analyzer"),
     ({"query": {"match": {"product_title": {"query": "x", "zero_terms_query": "all"}}}},
@@ -124,7 +130,7 @@ def test_parse_needs_no_index_and_plan_resolves():
     assert r.query.must[0].query == "Running SHOES"           # not analysed yet
     assert r.sort[0].order == "desc" and r.aggs[0].field == "category"
     with pytest.raises(UnsupportedQuery):
-        parse({"query": {"fuzzy": {"x": "y"}}})
+        parse({"query": {"wildcard": {"x": "y"}}})
     parse({"query": {"match": {"no_such_field": "x"}}})       # field names are the planner's business
 
 

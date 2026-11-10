@@ -401,6 +401,10 @@ Index.from_segment(path, device) -> Index
 | `query.knn` | `{field: {"vector": [...], "k": int, "filter": query}}` | exact; `_score = (1 + cos) / 2` (OpenSearch `cosinesimil`); `filter` is a pre-filter |
 | `query.match_all` | `{}` | score 1.0 |
 | `query.match_phrase` (S7-1) | `{field: "text"}` or `{field: {"query", "slop": 0, "boost"}}` | text fields with positions; Lucene's rule: some choice of one position per term with `max(v) - min(v) <= slop`, `v = position - query offset` (stopwords keep their offsets); score = BM25 with the phrase frequency as tf and the sum of the terms' field idf (with slop > 0 the frequency is `sum 1 / (1 + matchLength)` over matching starts, an approximation of Lucene's); on a keyword or numeric field it is a `term` |
+| `query.fuzzy` (S7-2) | `{field: "v"}` or `{field: {"value", "fuzziness": "AUTO", "prefix_length": 0, "max_expansions": 50, "transpositions": true, "boost"}}` | term-level (the value is not analysed); expanded in the field's terms dictionary (`engine/dictionary.py`): Levenshtein, adjacent transpositions count 1, at most 2 edits, `AUTO` = 0 / 1 / 2 edits for 1-2 / 3-5 / 6+ characters (`AUTO:low,high` too), the `max_expansions` most similar terms (ties by term order); text fields: the BM25 scores of the expansions present add (Lucene blends their df; ours does not); keyword fields: a term over the expanded values (constant score); numeric fields refused |
+| `match` / `multi_match` `fuzziness` (S7-2) | `fuzziness`, `prefix_length`, `max_expansions`, `transpositions` | each analysed query term becomes a clause of its expansions in the queried fields' dictionary; `operator` and `minimum_should_match` count clauses; fuzziness that resolves to 0 everywhere is a plain match; `cross_fields` with fuzziness is `InvalidRequest` (as OpenSearch) |
+| `query.prefix` (S7-2) | `{field: "v"}` or `{field: {"value", "boost"}}` | term-level; text fields: every indexed term of the field starting with it; keyword fields: every value starting with it; constant score `1.0 * boost` |
+| `query.match_bool_prefix` (S7-2) | `{field: "text"}` or `{field: {"query", "operator", "minimum_should_match", "max_expansions": 50, "boost"}}` | text fields; analysed terms but the last are BM25 clauses, the last is a prefix clause (its first `max_expansions` terms in term order, constant 1.0); combined like `match` |
 | `query.neural` (S3) | `{field: {"query_text", "k"}}` | encoded by the field's encoder |
 | `query.hybrid` + `rank.rrf` (S1-5, extension) | `{"hybrid": {"queries": [...]}}`, `"rank": {"rrf": {"rank_constant": 60, "window_size": 20000}}` | RRF fusion; `_score` is the RRF score |
 | `rescore` (S1-5, extension) | `{"window_size": 1000, "s3_ranker": {"model": "<name>"}}` | the learned ranker over the top window |
@@ -487,6 +491,8 @@ equal shapes into one batch).
 ```python
 Node = Lexical | Dense | Term | Range | MatchAll | Bool | Hybrid
 Lexical(fields: tuple[tuple[str, float], ...], terms: tuple[str, ...], operator: str, msm: int, idf: "global"|"field", boost: float)
+LexicalGroups(fields, groups: tuple[tuple[str, ...], ...], modes: tuple["sum"|"synonym"|"const", ...], msm, idf, boost)  # S7-2
+Phrase(field, slots: tuple[tuple[str, ...], ...], offsets: tuple[int, ...], slop: int, boost)                           # S7-1
 Dense(field: str, vector: tuple[float, ...] | None, text: str | None, k: int, filter: Node | None, boost: float)
 Term(field: str, values: tuple)            Range(field: str, lo, hi, lo_inc: bool, hi_inc: bool)
 MatchAll(boost: float)                    Bool(must, should, filter, must_not: tuple[Node, ...], msm: int, boost: float)
@@ -683,3 +689,7 @@ status:
 - 2026-11-10, architect (S7-1): section 4 gains optional positions (`text/pos_ptr.npy`, `text/positions.npy`; older
   segments load without them); section 2 gains `_meta.engine.positions` and the position rule; section 5 gains
   `match_phrase` with `slop`. Additive. Why: the founder's feature coverage (S7).
+- 2026-11-10, architect (S7-2): section 5 gains `fuzzy`, fuzziness on `match` and `multi_match`, `prefix` and
+  `match_bool_prefix`, expanded in the terms dictionary with OpenSearch's defaults; section 6 gains the
+  `LexicalGroups` plan node (clauses of alternative terms: "sum", "synonym", "const"), scored by the new
+  `bm25f_groups` operator on the backend. Additive. Why: S7 (typo tolerance and autocomplete).

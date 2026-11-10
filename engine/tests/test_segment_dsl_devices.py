@@ -62,12 +62,12 @@ def test_save_keeps_patches_and_deletes(segment, tmp_path):
 
 
 @pytest.mark.parametrize("req,path", [
-    ({"query": {"fuzzy": {"product_title": "shoe"}}}, "query.fuzzy"),
+    ({"query": {"regexp": {"product_title": "sho.*"}}}, "query.regexp"),
     ({"query": {"bool": {"must": [{"wildcard": {"product_title": "sh*"}}]}}}, "query.bool.must[0].wildcard"),
     ({"query": {"match_all": {}}, "suggest": {}}, "suggest"),
     ({"aggs": {"x": {"avg": {"field": "price"}}}}, "aggs.x.avg"),
     ({"query": {"multi_match": {"query": "x", "type": "phrase"}}}, "query.multi_match.type"),
-    ({"query": {"match": {"product_title": {"query": "x", "fuzziness": 2}}}}, "query.match.product_title.fuzziness"),
+    ({"query": {"match": {"product_title": {"query": "x", "lenient": True}}}}, "query.match.product_title.lenient"),
 ])
 def test_unsupported_named(index, req, path):
     with pytest.raises(UnsupportedQuery) as e:
