@@ -4,25 +4,60 @@ build time, on the host, so it is identical on every device. Vectors are L2-norm
 from __future__ import annotations
 
 import re
-from collections import Counter
 
 import numpy as np
 
 from .analysis import analyze
 
-_CHUNK = 262_144
-
-
 def _sparse_matmul(rows, cols, vals, X, n_out, by="rows"):
-    """``A @ X`` (by="rows": group by row) or ``A.T @ X`` (by="cols") for a COO matrix sorted by the grouping key."""
+    """``A @ X`` (by="rows") or ``A.T @ X`` (by="cols") for a COO matrix: one ``bincount`` per column of X (a
+    contiguous gather and a float64 sum in entry order, so deterministic), which moves far less memory than
+    gathering whole rows of X."""
     key, src = (rows, cols) if by == "rows" else (cols, rows)
-    out = np.zeros((n_out, X.shape[1]), dtype=np.float64)
-    for s in range(0, len(key), _CHUNK):
-        k, c, v = key[s:s + _CHUNK], src[s:s + _CHUNK], vals[s:s + _CHUNK]
-        contrib = v[:, None] * X[c]
-        starts = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
-        out[k[starts]] += np.add.reduceat(contrib, starts, axis=0)
-    return out
+    XT = np.ascontiguousarray(np.asarray(X, np.float64).T)
+    out = np.empty((X.shape[1], n_out), np.float64)
+    for j in range(X.shape[1]):
+        out[j] = np.bincount(key, weights=vals * XT[j][src], minlength=n_out)
+    return out.T
+
+
+def _orthonormal(Y):
+    """An orthonormal basis of Y's columns: Cholesky QR, twice (CholeskyQR2: a small Gram matrix and a triangular
+    solve instead of a tall LAPACK QR); Householder QR if the Gram matrix is not positive definite."""
+    Q = Y
+    for _ in range(2):
+        G = Q.T @ Q
+        try:
+            L = np.linalg.cholesky(G)
+        except np.linalg.LinAlgError:
+            return np.linalg.qr(Y)[0]
+        Q = Q @ np.linalg.inv(L).T                    # L is l x l (small): Q L^-T
+    return Q
+
+
+def _token_ids(texts, word_id: dict, assign):
+    """Analyse every text once: (doc int64[T], term id int64[T]) for its tokens, the same tokens as
+    ``engine.analysis.analyze``. ``word_id`` caches raw word -> id (-1: stopword or unknown); ``assign(token)``
+    gives a token's id (or -1) the first time a word is seen."""
+    from itertools import chain
+
+    from .analysis import _WORD, _token
+    words_per_doc = [_WORD.findall(str(t).lower()) if t is not None and t == t and type(t).__name__ != "NAType"
+                     else [] for t in texts]
+    n = np.fromiter((len(w) for w in words_per_doc), np.int64, len(words_per_doc))
+    words = list(chain.from_iterable(words_per_doc))
+    get = word_id.get
+    ids = [get(w, -2) for w in words]
+    if -2 in ids:
+        for i, x in enumerate(ids):
+            if x == -2:
+                w = words[i]
+                t = _token(w)
+                ids[i] = word_id[w] = -1 if t is None else assign(t)
+    ids = np.asarray(ids, np.int64)
+    docs = np.repeat(np.arange(len(n), dtype=np.int64), n)
+    keep = ids >= 0
+    return docs[keep], ids[keep]
 
 
 class TfidfSvdEncoder:
@@ -31,65 +66,94 @@ class TfidfSvdEncoder:
         self.vocab: dict[str, int] = {}
         self.idf = np.zeros(0, np.float32)
         self.components = np.zeros((0, dim), np.float32)
+        self._word_id: dict[str, int] = {}
 
     @property
     def name(self):
         return f"tfidf-svd-{self.dim}"
 
-    def _coo(self, texts):
-        rows, cols, vals = [], [], []
-        for i, t in enumerate(texts):
-            cnt = Counter(self.vocab[w] for w in analyze(t) if w in self.vocab)
-            if not cnt:
-                continue
-            c = np.fromiter(cnt.keys(), np.int64, len(cnt))
-            v = np.fromiter(cnt.values(), np.float64, len(cnt)) * self.idf[c]
-            v /= np.linalg.norm(v)
-            rows.append(np.full(len(c), i, np.int64)), cols.append(c), vals.append(v)
-        if not rows:
+    def _coo_from_ids(self, docs, ids, n):
+        """L2-normalised TF-IDF rows as COO, sorted by (row, col)."""
+        V = max(len(self.vocab), 1)
+        if len(ids) == 0:
             return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0)
-        return np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+        uk, cnt = np.unique(docs * V + ids, return_counts=True)
+        rows, cols = uk // V, uk % V
+        vals = cnt.astype(np.float64) * self.idf[cols]
+        norm = np.sqrt(np.bincount(rows, weights=vals * vals, minlength=n))
+        return rows, cols, vals / norm[rows]
+
+    def _coo(self, texts):
+        texts = list(texts)
+        vocab = self.vocab
+        docs, ids = _token_ids(texts, self._word_id, lambda t: vocab.get(t, -1))
+        return self._coo_from_ids(docs, ids, len(texts))
+
+    def fit_transform(self, texts) -> np.ndarray:
+        """``fit`` then ``encode`` of the same texts, analysing them once."""
+        rows, cols, vals, n = self._fit(texts)
+        return self._project(rows, cols, vals, n)
 
     def fit(self, texts) -> "TfidfSvdEncoder":
+        self._fit(texts)
+        return self
+
+    def _fit(self, texts):
+        from ._blas import limit_to_affinity
+        limit_to_affinity()
         texts = list(texts)
         n = len(texts)
-        df = Counter()
-        for t in texts:
-            df.update(set(analyze(t)))
-        terms = sorted(df, key=lambda w: (-df[w], w))[: self.max_features]
-        terms.sort()
+        prov: dict[str, int] = {}
+        word_prov: dict[str, int] = {}
+        docs, pids = _token_ids(texts, word_prov, lambda t: prov.setdefault(t, len(prov)))
+        T = max(len(prov), 1)
+        names = sorted(prov, key=prov.get)                      # provisional id -> token
+        df = np.bincount(np.unique(docs * T + pids) % T, minlength=len(prov)) if len(pids) else np.zeros(len(prov))
+        top = sorted(range(len(prov)), key=lambda i: (-df[i], names[i]))[: self.max_features]
+        terms = sorted(names[i] for i in top)
         self.vocab = {w: i for i, w in enumerate(terms)}
-        d = np.array([df[w] for w in terms], dtype=np.float64)
+        remap = np.full(len(prov) + 1, -1, np.int64)
+        for w, i in self.vocab.items():
+            remap[prov[w]] = i
+        d = np.array([df[prov[w]] for w in terms], dtype=np.float64)
         self.idf = (np.log((1 + n) / (1 + d)) + 1.0).astype(np.float32)
+        self._word_id = {w: (int(remap[x]) if x >= 0 else -1) for w, x in word_prov.items()}
+        fid = remap[pids] if len(pids) else pids
+        keep = fid >= 0
+        rows, cols, vals = self._coo_from_ids(docs[keep], fid[keep], n)
         V = len(terms)
-        rows, cols, vals = self._coo(texts)
         self.components = np.zeros((V, self.dim), np.float32)
         l = min(self.dim + 10, n, V)
         if l == 0 or len(vals) == 0:
-            return self
+            return rows, cols, vals, n
         rng = np.random.default_rng(self.seed)
-        by_col = np.argsort(cols, kind="stable")
-        rc, cc, vc = rows[by_col], cols[by_col], vals[by_col]
+        rc, cc, vc = rows, cols, vals                       # bincount needs no sort by column
         Y = _sparse_matmul(rows, cols, vals, rng.standard_normal((V, l)), n, "rows")
         for _ in range(3):                                  # power iterations
-            Qm, _ = np.linalg.qr(Y)
-            Z, _ = np.linalg.qr(_sparse_matmul(rc, cc, vc, Qm, V, "cols"))
+            Qm = _orthonormal(Y)
+            Z = _orthonormal(_sparse_matmul(rc, cc, vc, Qm, V, "cols"))
             Y = _sparse_matmul(rows, cols, vals, Z, n, "rows")
-        Qm, _ = np.linalg.qr(Y)
+        Qm = _orthonormal(Y)
         Bt = _sparse_matmul(rc, cc, vc, Qm, V, "cols")      # (Q^T A)^T, V x l
-        U, S, _ = np.linalg.svd(Bt, full_matrices=False)    # right singular vectors of A are U here
-        k = min(self.dim, U.shape[1])
-        comp = U[:, :k]
+        w, Vv = np.linalg.eigh(Bt.T @ Bt)                   # Bt = U S Vv^T: U = Bt Vv / S (a small eigenproblem)
+        order = np.argsort(-w, kind="stable")
+        w, Vv = np.clip(w[order], 0, None), Vv[:, order]
+        S = np.sqrt(w)
+        k = min(self.dim, int((S > S[0] * 1e-10).sum()) if len(S) and S[0] > 0 else 0)
+        comp = (Bt @ Vv[:, :k]) / S[:k]
         comp *= np.where(comp[np.abs(comp).argmax(axis=0), np.arange(k)] < 0, -1.0, 1.0)  # deterministic sign
         self.components[:, :k] = comp
-        return self
+        return rows, cols, vals, n
+
+    def _project(self, rows, cols, vals, n):
+        out = _sparse_matmul(rows, cols, vals, self.components.astype(np.float64), n, "rows")
+        norm = np.linalg.norm(out, axis=1, keepdims=True)
+        return (out / np.where(norm > 0, norm, 1.0)).astype(np.float32)
 
     def encode(self, texts) -> np.ndarray:
         texts = list(texts)
         rows, cols, vals = self._coo(texts)
-        out = _sparse_matmul(rows, cols, vals, self.components.astype(np.float64), len(texts), "rows")
-        norm = np.linalg.norm(out, axis=1, keepdims=True)
-        return (out / np.where(norm > 0, norm, 1.0)).astype(np.float32)
+        return self._project(rows, cols, vals, len(texts))
 
     encode_docs = encode
     encode_queries = encode
@@ -103,6 +167,7 @@ class TfidfSvdEncoder:
     def from_arrays(cls, a: dict) -> "TfidfSvdEncoder":
         enc = cls(dim=int(a["dim"]))
         enc.vocab = {str(w): i for i, w in enumerate(a["terms"])}
+        enc._word_id = {}
         enc.idf, enc.components = np.asarray(a["idf"], np.float32), np.asarray(a["components"], np.float32)
         return enc
 
