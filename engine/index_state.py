@@ -89,6 +89,7 @@ class IndexState:
         live = seg.live if seg.live is not None else np.full((N + 31) // 32, 0xFFFFFFFF, np.uint32)
         self.live = b.unpack_bits(np.asarray(live), N)
         self._static = None
+        self._value_codes: dict = {}
 
     # ---- the updater's hooks
     def patch(self, field: str, ids, values) -> None:
@@ -105,6 +106,22 @@ class IndexState:
         r = self.b.asarray(rows, "int64")
         self.numerics[field][r] = self.b.asarray(filled)
         self.missing[field][r] = self.b.asarray(miss)
+        self._value_codes.pop(field, None)          # refreshed on next use, for this field only
+
+    def value_codes(self, field: str):
+        """For a numeric field: ``(codes int64[N] on the device, 0 = missing; keys list)``, codes in ascending value
+        order. Computed on the device once per segment and field, and again only after a patch to that field; the
+        distinct values come to the host once (they are the facet keys)."""
+        hit = self._value_codes.get(field)
+        if hit is None:
+            b = self.b
+            vals, miss = self.numerics[field], self.missing[field]
+            uniq = b.unique(vals[~miss])
+            codes = b.where(miss, 0, b.searchsorted(uniq, vals) + 1)
+            dt = self.num_dtype[field]
+            conv = bool if dt == "bool" else int if dt.startswith("int") else float
+            hit = self._value_codes[field] = (b.astype(codes, "int64"), [None] + [conv(v) for v in b.to_numpy(uniq)])
+        return hit
 
     def delete(self, ids) -> None:
         """Ids must be known (the caller checks); already-deleted ids are a no-op."""

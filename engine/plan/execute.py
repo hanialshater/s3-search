@@ -222,13 +222,7 @@ class Executor:
         if field in st.keywords:
             kw = st.keywords[field]
             return kw.codes, kw.values
-        dt = st.num_dtype[field]
-        vals = b.to_numpy(st.numerics[field])
-        miss = b.to_numpy(st.missing[field])
-        uniq = np.unique(vals[~miss])
-        codes = np.where(miss, 0, np.searchsorted(uniq, vals) + 1).astype(np.int64)
-        conv = bool if dt == "bool" else int if dt.startswith("int") else float
-        return b.asarray(codes, "int64"), [None] + [conv(v) for v in uniq]
+        return st.value_codes(field)
 
     # ---- sort keys
     def _keys(self, plan, score, tier=None):
@@ -312,19 +306,21 @@ class Executor:
         idx, _ = b.topk(score.reshape(1, N), min(plan.rescore.window, N), match.reshape(1, N))
         X, cand = candidate_features(self, ctx, idx)
         timer.lap("features")
-        cand_h = b.to_numpy(cand)[0]
-        ok = cand_h >= 0
-        Xh = np.asarray(b.to_numpy(X)[0][ok], np.float32)
-        pred = np.asarray(ranker.predict(Xh), np.float32)
-        if ctx.get("explain") is not None:
-            ctx["rescore"] = {"ranker": ranker, "row_of": {int(d): i for i, d in enumerate(cand_h[ok])}, "X": Xh,
-                              "pred": pred}
-        sel = b.asarray(cand_h[ok], "int64")
+        ok = cand[0] >= 0
+        sel = cand[0][ok]
+        Xd = X[0][ok]
+        if hasattr(ranker, "predict_backend"):            # on the device: no copy to the host
+            pred = ranker.predict_backend(b, Xd)
+        else:                                             # any other model: through the host
+            pred = b.asarray(np.asarray(ranker.predict(b.to_numpy(Xd)), np.float32), "float32")
+        if ctx.get("explain") is not None:                # explain reads features on the host
+            sel_h = b.to_numpy(sel)
+            ctx["rescore"] = {"ranker": ranker, "row_of": {int(d): i for i, d in enumerate(sel_h)},
+                              "X": np.asarray(b.to_numpy(Xd), np.float32), "pred": b.to_numpy(pred)}
         new = b.copy(score)
         tier = b.zeros(N, "float32")
-        if len(pred):
-            new[sel] = b.asarray(pred, "float32")
-            tier[sel] = 1.0
+        new[sel] = pred
+        tier[sel] = 1.0
         timer.lap("rank")
         return new, tier
 
@@ -354,8 +350,7 @@ class Executor:
                 for a in plan.aggs:
                     codes, keys_of = self._facet_codes(a.field)
                     counts = ops.facet_terms(b, codes, match.reshape(1, -1), len(keys_of))
-                    top = ops.top_buckets(b, counts, a.size)[0]
-                    with_value = int(b.to_numpy(counts)[0][1:].sum())
+                    (top, with_value), = ops.top_buckets(b, counts, a.size)
                     aggs[a.name] = {"doc_count_error_upper_bound": 0,
                                     "sum_other_doc_count": with_value - sum(c for _, c in top),
                                     "buckets": [{"key": keys_of[c], "doc_count": n} for c, n in top]}
@@ -363,8 +358,8 @@ class Executor:
                 t.lap("facet")
             keys = self._keys(plan, score, tier)
             after = self._after_to_keys(plan, plan.search_after, tier is not None) if plan.search_after else None
-            ids, rows = ops.page(b, keys, match, plan.from_, plan.size, after)
-            score_h = b.to_numpy(score[b.asarray(np.asarray(ids, np.int64), "int64")]) if ids else []
+            ids, rows, extra = ops.page(b, keys, match, plan.from_, plan.size, after, extra=[score])
+            score_h = [e[0] for e in extra]
             hits = [{"_id": str(st.ids[d]), "_score": float(s),
                      "sort": self._sort_values(plan, r, d, tier is not None)}
                     for d, s, r in zip(ids, score_h, rows)]

@@ -97,6 +97,55 @@ class GBDT:
             out += t["value"][node]
         return out.astype(np.float32)
 
+    def _device_arrays(self, b):
+        """The trees as padded node arrays on ``b``'s device (cached per backend): feature, bin, left, right
+        int64[T, M] and value float64[T, M]; the edges as float64[F, E] padded with +inf."""
+        cache = self.__dict__.setdefault("_dev", {})
+        key = (b.name, getattr(b, "accumulate", None))
+        if key not in cache:
+            T = len(self.trees)
+            M = max((len(t["value"]) for t in self.trees), default=1)
+            arr = {k: np.full((max(T, 1), M), -1 if k != "value" else 0, np.int64 if k != "value" else np.float64)
+                   for k in ("feature", "bin", "left", "right", "value")}
+            for i, t in enumerate(self.trees):
+                for k in arr:
+                    arr[k][i, :len(t[k])] = t[k]
+            E = max((len(e) for e in self.edges), default=0)
+            edges = np.full((len(self.edges), max(E, 1)), np.inf)
+            for f, e in enumerate(self.edges):
+                edges[f, :len(e)] = e
+            dev = {k: b.asarray(v, "float64" if k == "value" else "int64") for k, v in arr.items()}
+            dev["edges"] = b.asarray(edges, "float64")
+            dev["real"] = b.asarray(np.isfinite(edges), "bool")
+            cache[key] = dev
+        return cache[key]
+
+    def predict_backend(self, b, X):
+        """``predict`` on the device: ``X`` float32[n, F] on ``b``'s device → float32[n] there. Binning and tree
+        walks are gathers over the node arrays, one step per depth level; trees are added one at a time in float64,
+        in the same order as ``predict``, so both give the same float32 values."""
+        n = X.shape[0]
+        if n == 0 or not self.trees:
+            return b.full(n, self.base, "float32")
+        d = self._device_arrays(b)
+        x = b.astype(X, "float64")
+        nan = b.isnan(x)
+        ge = (x.reshape(n, x.shape[1], 1) >= d["edges"].reshape(1, *d["edges"].shape)) & \
+            d["real"].reshape(1, *d["real"].shape)                                    # real edges <= x
+        xb = b.where(nan, 0, b.sum(b.astype(ge, "int64"), axis=2) + 1)
+        out = b.full(n, self.base, "float64")
+        rows = b.arange(n)
+        for t in range(len(self.trees)):
+            node = b.zeros(n, "int64")
+            feat, thr, left, right = d["feature"][t], d["bin"][t], d["left"][t], d["right"][t]
+            for _ in range(self.max_depth + 1):
+                f = feat[node]
+                inner = f >= 0
+                go_left = xb[rows, b.where(inner, f, 0)] <= thr[node]
+                node = b.where(inner, b.where(go_left, left[node], right[node]), node)
+            out = out + d["value"][t][node]
+        return b.astype(out, "float32")
+
     def contributions(self, X):
         """Exact per-feature contributions (Saabas path attribution): ``(base float64[n], contrib float64[n, F])``
         with ``base + contrib.sum(1) == predict(X)`` up to float rounding. Each split on a sample's path adds the

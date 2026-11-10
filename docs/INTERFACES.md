@@ -55,6 +55,19 @@ Decision record: `docs/decisions/2026-11-09-gpu-portable-backend.md`.
   50% of available RAM on CPU). Loading checks `device_nbytes + work_nbytes <= budget`; the updater checks
   `2 * device_nbytes + work_nbytes <= budget` (double buffer) before it builds the second copy, on every device, and
   refuses with `engine.backend.OverBudget` otherwise.
+- **What crosses to the host per search** (checked on every device by `engine/tests/test_gpu_paths.py`): the page
+  (doc ids, sort values and scores stacked into one transfer) and, per terms aggregation, its buckets (one transfer);
+  explain may read more. Rescoring stays on the device (`GBDT.predict_backend`: binning and tree walks as gathers, one
+  step per depth level, trees added in the same order as the numpy `predict`, so both give equal float32 values).
+  Numeric fields' value codes (facets) are computed on the device once per segment and field, and again only after a
+  patch to that field. Query-side setup (small query vectors, bounds) may be built on the host.
+- **Accumulation** (`get_backend(device, accumulate=)`, `Index(..., accumulate=)`, or `S3_SEARCH_ACCUM`):
+  `"float64"` is the reference default. `"float32"` is an option for GPUs whose FP64 is slow (T4, L4: 1/32 rate):
+  BM25F's segment sums stay deterministic (the same sort-based kernel) and **batch-invariant** (a doc's addends keep
+  their order whatever else is in the batch); the dense matmul becomes a float32 GEMM, which is **not** promised to
+  be batch-invariant (cuBLAS may choose kernels by shape), so with float32 the `search_batch == [search]` rule holds
+  for lexical requests and holds within `rtol=1e-5` for dense ones. Scores differ from float64 by at most `rtol=1e-5`
+  on the tests. The default does not change until S6 measures the gain in Colab.
 - **torch is optional.** `requirements.txt` stays numpy-only; `requirements-gpu.txt` adds torch for Colab and GPU
   nodes.
 
@@ -396,8 +409,11 @@ Index.from_segment(path, device) -> Index
 Scoring, exactly:
 - BM25F per document: `pseudo_tf = sum_f w_f * tf_f / (1 - b + b * len_f / avg_len_f)`;
   `score = sum_terms idf * pseudo_tf * (k1 + 1) / (k1 + pseudo_tf)`. Single-field `match` is the same with one field and
-  that field's idf (`df_field`): equal to Lucene's BM25 times `(k1 + 1)` (Lucene drops the constant) up to Lucene's
-  lossy length encoding. Query terms are deduplicated.
+  that field's idf (`df_field`). Query terms are deduplicated. **Against OpenSearch** (2.19, default BM25, which keeps
+  the `(k1 + 1)` factor), single-field scores differ by design in three ways, reproduced to 1.4e-7 by the steward's
+  `referee/lucene_model.py`: OpenSearch's N counts only documents that have the field, its avgdl averages over those
+  documents, and it stores field lengths in one byte (lossy above 24 tokens). The engine uses all N documents, the
+  mean over all documents, and exact lengths.
 - **idf:** `match` uses its field's df (`df_field`). `multi_match` uses the global df (the term in any text field of
   the mapping, the segment's `df`), except a `multi_match` naming exactly one field (with a weight above 0), which uses
   that field's df (the prototype's `single_field` rule). Field weights never change the df.
@@ -664,3 +680,9 @@ status:
   (now refused, before an empty answer).
 - 2026-11-10, platform-engineer: RPC serving (S7-7), additive: `rpc` listener, client, Service port 9090.
 - 2026-11-10, platform-engineer: the operator on watches with Lease leader election (S7-7); no spec or status change.
+- 2026-11-10, architect (GPU-friendliness audit): section 0 gains the host-transfer rule (one transfer for the page,
+  one per terms aggregation; rescoring on the device) and the `accumulate` option (float32 keeps BM25F
+  batch-invariant, not the dense GEMM). Section 5 corrected: OpenSearch's default BM25 keeps `(k1 + 1)`; the lexical
+  gap to it is N and avgdl over documents that have the field, and one-byte lengths, by design (the steward's
+  reproduction, `referee/lucene_model.py`). Why: the coordinator's audit (numeric codes recomputed on the host per
+  request, rescoring on the host, FP64 on T4-class GPUs) and the steward's first contact with OpenSearch 2.19.1.

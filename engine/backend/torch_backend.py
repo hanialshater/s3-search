@@ -12,8 +12,10 @@ DTYPES = {"bool": torch.bool, "uint8": torch.uint8, "int32": torch.int32, "int64
 
 
 class TorchBackend:
-    def __init__(self, name: str):
-        self.name = name
+    def __init__(self, name: str, accumulate: str = "float64"):
+        if accumulate not in ("float64", "float32"):
+            raise ValueError("accumulate: float64 | float32")
+        self.name, self.accumulate = name, accumulate
         self.device = torch.device("cuda" if name == "cuda" else "cpu")
 
     # ---- creation and transfer
@@ -79,6 +81,9 @@ class TorchBackend:
     def take_along(self, a, idx, axis=-1):
         return torch.take_along_dim(a, idx, dim=axis)
 
+    def unique(self, a):
+        return torch.unique(a, sorted=True)
+
     def searchsorted(self, sorted_a, v, right=False):
         if not isinstance(v, torch.Tensor):
             v = torch.as_tensor(np.asarray(v), device=self.device, dtype=sorted_a.dtype)
@@ -103,8 +108,11 @@ class TorchBackend:
     def segment_sum(self, keys, values, n):
         # float64 accumulation through index_put_(accumulate=True), whose CUDA kernel is sort-based and
         # deterministic; on CPU it is sequential.
-        out = torch.zeros(n, dtype=torch.float64, device=self.device)
-        out.index_put_((keys,), values.to(torch.float64), accumulate=True)
+        # float32 (the option for T4/L4-class GPUs, where FP64 is slow): the same deterministic kernel in float32;
+        # a key's addends keep their order whatever else is in the batch, so BM25F stays batch-invariant.
+        dt = torch.float32 if self.accumulate == "float32" else torch.float64
+        out = torch.zeros(n, dtype=dt, device=self.device)
+        out.index_put_((keys,), values.to(dt), accumulate=True)
         return out.to(torch.float32)
 
     def segment_count(self, keys, n):
@@ -113,6 +121,8 @@ class TorchBackend:
     # ---- dense
     def matmul(self, a, b, chunk=65_536):
         # float64 accumulation, float32 result (see the numpy backend); a float32 GEMM is an S6 fast path.
+        if self.accumulate == "float32":     # a float32 GEMM: cuBLAS may pick a kernel by batch shape
+            return torch.matmul(a.to(torch.float32), b.to(torch.float32))
         a64 = a.to(torch.float64)
         out = torch.empty((a.shape[0], b.shape[1]), dtype=torch.float32, device=self.device)
         for s in range(0, b.shape[1], chunk):
