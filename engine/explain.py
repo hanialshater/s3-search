@@ -41,7 +41,7 @@ def _lexical(ex, node, doc):
     f_one = next(st.field_index[f] for f, w in node.fields if w > 0) if node.idf == "field" else None
     part, loc = st.owner(doc)                       # the segment that holds this slot's live doc
     for t in node.terms:
-        tid, gid = part.vocab.get(t), st.vocab.get(t)
+        tid, gid = part.vocab.get(t), st.gid(t)
         if tid is None:
             continue
         lo, hi = int(part.host_term_ptr[tid]), int(part.host_term_ptr[tid + 1])

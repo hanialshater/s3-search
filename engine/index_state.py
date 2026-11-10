@@ -37,6 +37,14 @@ class KeywordState:
         self._code_of = None
         self._toks = None
 
+    def clone(self, b) -> "KeywordState":
+        """A copy whose codes may be changed without touching this one (for the copy-on-write index, S8-2c)."""
+        c = _copy.copy(self)
+        c.codes_host = self.codes_host.copy()
+        c.codes = b.copy(self.codes)
+        c.values = list(self.values)
+        return c
+
     @property
     def code_of(self) -> dict:
         if self._code_of is None:
@@ -281,6 +289,7 @@ class IndexState:
             vocab = sorted(set().union(*(p.vocab_list for p in self.parts)))
         self.vocab_list = vocab
         self.vocab = self.parts[0].vocab if len(self.parts) == 1 else {w: i for i, w in enumerate(vocab)}
+        self.G = len(vocab)                     # this state's terms: ids >= G belong to a newer state (S8-2c)
         G = len(vocab)
         df = np.zeros(G, np.float64)
         df_field = np.zeros((G, F), np.float64)
@@ -390,6 +399,11 @@ class IndexState:
     def has_positions(self) -> bool:
         return all(p.host_positions is not None for p in self.parts)
 
+    def gid(self, term: str):
+        """The global id of ``term`` in this state, or None (S8-2c: the shared vocabulary may hold newer terms)."""
+        g = self.vocab.get(term)
+        return g if g is not None and g < self.G else None
+
     def owner(self, slot: int):
         """``(part, local doc)`` of a slot."""
         return self.parts[int(self.slot_part[slot])], int(self.slot_local[slot])
@@ -439,6 +453,41 @@ class IndexState:
         updated incrementally (equal to a rebuild)."""
         self.delete_incremental(ids)
 
+    # ---- copy-on-write (S8-2c): a writer changes a clone and the Index swaps one reference
+    def clone(self, field: str | None = None) -> "IndexState":
+        """A copy a writer may change while searches keep using this one. ``field``: only that hot column will
+        change (a patch), so only it is copied; otherwise every structure a structural change touches in place is
+        copied (the parts are shallow copies with their own live bits, slot maps and posting masks), and the
+        immutable arrays (postings, positions, vectors, segment columns) stay shared."""
+        b = self.b
+        c = _copy.copy(self)
+        c.numerics, c.missing = dict(self.numerics), dict(self.missing)
+        c._value_codes = dict(self._value_codes)
+        c.parts = [_copy.copy(p) for p in self.parts]
+        for p in c.parts:
+            p.numerics, p.missing = dict(p.numerics), dict(p.missing)
+        if field is not None:
+            c.numerics[field], c.missing[field] = b.copy(self.numerics[field]), b.copy(self.missing[field])
+            for p in c.parts:
+                p.numerics[field], p.missing[field] = b.copy(p.numerics[field]), b.copy(p.missing[field])
+            c._value_codes.pop(field, None)
+            return c
+        c._gen = object()                         # parts copy their live bits on first write in this clone
+        c.host_df, c.host_df_field = self.host_df.copy(), self.host_df_field.copy()
+        c.field_len_sum = self.field_len_sum.copy()
+        c.host_live, c.live = self.host_live.copy(), b.copy(self.live)
+        c.slot_part, c.slot_local = self.slot_part.copy(), self.slot_local.copy()
+        c.first_offset, c.ids = self.first_offset.copy(), self.ids.copy()
+        c.host_field_len = self.host_field_len.copy()
+        c.numerics = {f: b.copy(v) for f, v in self.numerics.items()}
+        c.missing = {f: b.copy(v) for f, v in self.missing.items()}
+        c.keywords = {f: kw.clone(b) for f, kw in self.keywords.items()}
+        c.pos = dict(self.pos)
+        # the vocabulary and the known ids are append-only and shared: a state reads only ids < its own G
+        c.encoders = dict(self.encoders)
+        c._exists = dict(self._exists)
+        return c
+
     # ---- incremental changes (S8-2b): no full relayout per refresh
     def _kill(self, slots) -> None:
         """Tombstone the live docs in ``slots`` (an int array): their parts' live bits, the postings mask, the
@@ -450,6 +499,12 @@ class IndexState:
         G = len(self.vocab_list)
         for k in np.unique(self.slot_part[slots]):
             p = self.parts[int(k)]
+            if getattr(p, "_gen", None) is not getattr(self, "_gen", None) or getattr(self, "_gen", None) is None:
+                p.local_live = p.local_live.copy()          # copy-on-write: older states keep theirs
+                p.slot_of_local = p.slot_of_local.copy()
+                if p.post_live is not None:
+                    p.post_live = b.copy(p.post_live)
+                p._gen = getattr(self, "_gen", None)
             sel = slots[self.slot_part[slots] == k]
             locs = self.slot_local[sel]
             posts = p.doc_postings(locs)
@@ -485,6 +540,7 @@ class IndexState:
             for i, w in enumerate(new):
                 self.vocab[w] = base + i
             self.vocab_list.extend(new)
+            self.G = len(self.vocab_list)
             F = len(self.text_fields)
             self.host_df = np.concatenate([self.host_df, np.zeros(len(new))])
             self.host_df_field = np.concatenate([self.host_df_field, np.zeros((len(new), F))])

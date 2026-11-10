@@ -126,7 +126,7 @@ def text_dictionary(st) -> Dictionary:
     """The index's vocabulary (sorted, over all segments), cached on the index state until its next layout."""
     d = getattr(st, "_dictionary", None)
     if d is None:
-        vl = st.vocab_list
+        vl = st.vocab_list[:st.G]
         order = sorted(range(len(vl)), key=vl.__getitem__)
         d = st._dictionary = Dictionary([vl[i] for i in order])
         d.gid_of = np.asarray(order, np.int64)             # dictionary position -> global term id

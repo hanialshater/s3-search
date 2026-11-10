@@ -213,3 +213,43 @@ def test_merge_with_a_key_changed_after_the_snapshot():
     assert len(ix.segments) == 2
     for r in REQS:
         same(ix.search(r), rebuilt.search(r))
+
+
+def test_searches_never_wait_on_writers(monkeypatch):
+    """S8-2c: a writer works on a clone and swaps one reference; a search reads the reference once and needs no
+    lock. With every add_segment made 60 ms slow, searches still answer in a few ms, and each sees one whole state
+    (its result equals the index before or after some add, never a mix)."""
+    import threading
+    import time
+    from engine.index_state import IndexState
+    base, deltas, final = scenario(0)
+    ix = Index(build_segment(base, mapping(), version=1))
+    slow = IndexState.add_part
+
+    def add_part(self, p, delete_ids=()):
+        slow(self, p, delete_ids)
+        time.sleep(0.06)                                        # the writer holds its lock (and its clone) long
+    monkeypatch.setattr(IndexState, "add_part", add_part)
+    req = {"query": {"match": {"product_title": "wool black"}}, "size": 50}
+    states = [ix.search(req)["hits"]]
+    stop = threading.Event()
+
+    def writer():
+        try:
+            for df, dels, v in deltas * 3:
+                ix.add_segment(build_segment(df, mapping(), version=v), version=v,
+                               delete_ids=list(dels) + list(df["product_id"]))
+                states.append(ix.search(req)["hits"])
+        finally:
+            stop.set()
+    t = threading.Thread(target=writer)
+    lat, seen = [], []
+    t.start()
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        seen.append(ix.search(req)["hits"])
+        lat.append(time.perf_counter() - t0)
+    t.join()
+    lat.sort()
+    assert len(lat) > 20 and lat[int(0.99 * (len(lat) - 1))] < 0.03      # never the 60 ms of a write
+    assert all(h in states for h in seen)                                 # whole states only
