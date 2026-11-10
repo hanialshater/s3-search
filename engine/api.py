@@ -120,41 +120,58 @@ class Index:
     def _segment_arrays(self, seg):
         return seg if isinstance(seg, SegmentArrays) else read_segment(seg)
 
+    @_locked
     def add_segment(self, seg, version: int, delete_ids=()) -> None:
         """Atomically: tombstone ``delete_ids`` and the new segment's ids in the older segments (unknown ids are
-        ignored), add the segment, update the global statistics, set the version. Incremental (S8-2b): the new
-        segment's arrays go to the device before the lock is taken; under it, only the delta's docs, terms and
-        values are touched (edited keys keep their slot, new keys take new slots at the end)."""
+        ignored), add the segment, recompute the global statistics, set the version."""
         from .index_state import Part
-        part = Part(self._segment_arrays(seg), self._st.b)      # outside the lock: the device upload
-        with self._lock:
-            st = self._st
-            st.check_part(part)
-            st.add_part(part, delete_ids)
+        st = self._st
+        part = Part(self._segment_arrays(seg), st.b)
+        st.check_part(part)
+        saved = [p.local_live.copy() for p in st.parts]
+        try:
+            st.tombstone(list(delete_ids) + list(part.ids), parts=list(st.parts))
+            st._attach(part)
             st.version = int(version)
+            st._relayout()
+        except Exception:
+            if st.parts and st.parts[-1] is part:
+                st.parts.pop()
+            for p, live in zip(st.parts, saved):
+                p.local_live = live
+            st._relayout()
+            raise
 
+    @_locked
     def replace_segments(self, old_ids, new=None, version: int | None = None, delete_ids=()) -> None:
-        """Atomically replace the segments ``old_ids`` by ``new`` (their merge, or None to drop them).
-        ``delete_ids`` are tombstoned in ``new``; docs of ``new`` that are no longer live in the old segments (changed
-        since the snapshot) stay dead. The merged docs keep their slots, so the order and statistics are those of
-        the live set."""
+        """Atomically replace the segments ``old_ids`` by ``new`` (their merge, or None to drop them): ``new`` takes
+        the place of the first of them; ``delete_ids`` are tombstoned in ``new``."""
         from .index_state import Part
-        part = Part(self._segment_arrays(new), self._st.b) if new is not None else None
-        with self._lock:
-            st = self._st
-            old = [st.part(i) for i in old_ids]
-            if part is not None:
-                st.check_part(part)
-                owned = {q.ids[loc] for q in old for loc in q.live_local.tolist()}
-                clash = [i for i in part.ids[np.flatnonzero(part.local_live)].tolist()
-                         if i in st.pos and i not in owned]
-                if clash:
-                    raise ValueError(f"_id {clash[0]!r} is live in a segment that is not replaced")
-            if part is None and len(old) == len(st.parts):
-                raise ValueError("an index needs at least one segment")
-            st.replace_parts(old, part, delete_ids)
+        st = self._st
+        old = [st.part(i) for i in old_ids]
+        before = list(st.parts)
+        part = None
+        if new is not None:
+            part = Part(self._segment_arrays(new), st.b)
+            st.check_part(part)
+            for i in delete_ids:
+                loc = part.local_of.get(i)
+                if loc is not None:
+                    part.local_live[loc] = False
+        at = min(st.parts.index(p) for p in old) if old else len(st.parts)
+        rest = [p for p in st.parts if p not in old]
+        st.parts = rest[:at] + ([part] if part is not None else []) + rest[at:]
+        if not st.parts:
+            st.parts = before
+            raise ValueError("an index needs at least one segment")
+        try:
             if version is not None:
                 st.version = int(version)
+            st._relayout()
+        except Exception:
+            st.parts = before
+            st._relayout()
+            raise
 
     def remove_segment(self, segment_id: str) -> None:
         self.replace_segments([segment_id], None)

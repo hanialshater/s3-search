@@ -126,18 +126,14 @@ def text_dictionary(st) -> Dictionary:
     """The index's vocabulary (sorted, over all segments), cached on the index state until its next layout."""
     d = getattr(st, "_dictionary", None)
     if d is None:
-        vl = st.vocab_list
-        order = sorted(range(len(vl)), key=vl.__getitem__)
-        d = st._dictionary = Dictionary([vl[i] for i in order])
-        d.gid_of = np.asarray(order, np.int64)             # dictionary position -> global term id
+        d = st._dictionary = Dictionary(list(st.vocab_list))
     return d
 
 
 def field_mask(st, fields) -> np.ndarray:
     """bool[V]: terms indexed in any of ``fields`` of a live document."""
     cols = [st.field_index[f] for f in fields]
-    by_gid = (np.asarray(st.host_df_field)[:, cols] > 0).any(axis=1)
-    return by_gid[text_dictionary(st).gid_of]               # in the dictionary's (sorted) order
+    return (np.asarray(st.host_df_field)[:, cols] > 0).any(axis=1)
 
 
 def keyword_dictionary(kw) -> Dictionary:

@@ -830,16 +830,3 @@ status:
 - 2026-11-10, architect (S7-6): section 2 gains `_meta.engine.synonyms` (query-time, one-word, Solr lines); the
   planner turns a term with synonyms into a "synonym" clause of `LexicalGroups` (section 6). A mapping without
   synonyms plans exactly as before. Additive. Why: S7.
-- 2026-11-10, architect (S8-2b, incremental segments; no contract change): `add_segment`, `replace_segments`,
-  `remove_segment` and `delete` no longer rebuild the index's layout. Slots are append-only in `first_offset` order:
-  an edited key (same `first_offset`) keeps its slot, a new key takes a new slot at the end, a deleted doc leaves a
-  hole (live false) until holes pass half the slots, when one full relayout compacts them (order-preserving). Global
-  term ids are append-only; `df`, `df_field` and the length sums change by the delta's live docs minus the
-  tombstoned docs' terms (a doc -> postings view per segment, built at load); idf and relative lengths are
-  recomputed in O(V) and O(N) numpy; keyword dictionaries take new values by sorted insertion with an old -> new code
-  remap. The new segment's arrays move to the device before the Index lock is taken. A merge's replace keeps the
-  merged docs' slots. An upsert whose `first_offset` is not past every existing one (not a store's) falls back to a
-  full relayout. ESCI-sample, 2 cores, deltas of 100 docs (70 edits, 30 new) plus 10 deletes: add_segment p50
-  22.6 ms (was 417-538 ms in the dataplane-engineer's stream), a merge's replace of 20 deltas 79 ms.
-- 2026-11-10, architect (S7-6 fix): synonym rules with an empty left side, an empty right side or an empty entry
-  (`"lamp =>"`, `"=> light"`, `" , "`), or two `=>`, are `InvalidMapping` naming the rule, as OpenSearch refuses them.
