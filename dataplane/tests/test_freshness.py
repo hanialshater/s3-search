@@ -6,7 +6,7 @@ from dataplane.updater import Replica
 from dataplane.tests.conftest import load
 
 
-def test_freshness_measures_and_equals_a_rebuild(tmp_path, store, catalogue, fake):
+def test_freshness_measures_and_equals_a_rebuild(tmp_path, store, catalogue):
     load(store, catalogue)
     r = Replica(store, build(store, None, tmp_path / "segs"), budget=1 << 40)
     rep = freshness.run(store, r, n_changes=2000, batch=50, interval=0.002, seed=1)
@@ -16,7 +16,7 @@ def test_freshness_measures_and_equals_a_rebuild(tmp_path, store, catalogue, fak
     assert r._thread is None and r._listeners == []
 
 
-def test_freshness_catches_a_replica_that_misses_changes(tmp_path, store, catalogue, fake):
+def test_freshness_catches_a_replica_that_misses_changes(tmp_path, store, catalogue):
     load(store, catalogue)
     r = Replica(store, build(store, None, tmp_path / "segs"), budget=1 << 40)
     real = r._apply

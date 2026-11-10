@@ -16,7 +16,6 @@ onto each new segment).
 | `dataplane.indexer` | `build`, `list_segments`, `latest_segment`, `gc`, `MergePolicy`, `reindex`; `python -m dataplane.indexer` |
 | `dataplane.updater` | `Replica`: `poll`, `swap`, `start`/`stop`, `stats`; `memory_budget` |
 | `dataplane.freshness` | `run`: N hot-field changes, apply-to-visible latency, equality with a rebuild (for B1-4) |
-| `dataplane._engine` | the seam to `engine.build`, `engine.segment`, `engine.api` (tests install a fake) |
+| `dataplane._engine` | the seam to `engine.build`, `engine.segment`, `engine.api` |
 
-Tests: `python -m pytest -q dataplane/tests` (about 1 s). Until `engine.api` lands they run against
-`dataplane/tests/fake_engine.py`, and `test_integration.py` skips.
+Tests: `python -m pytest -q dataplane/tests` (about 2 s), against the real engine.

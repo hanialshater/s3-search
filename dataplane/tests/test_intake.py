@@ -89,10 +89,11 @@ def test_keyword_over_ignore_above_is_kept(mapping):
 # ---- enrichment ----------------------------------------------------------------------------------------------------
 
 def test_hashing_encoder_is_deterministic_and_normalised(mapping):
-    a = enrich([validate(good(), mapping)], mapping)[0]["embedding"]
+    a = enrich([validate(good(), mapping)], mapping, encoder=HashingEncoder(16))[0]["embedding"]
     b = enrich([validate(good(), mapping)], mapping, encoder=HashingEncoder(16))[0]["embedding"]
     assert a.shape == (16,) and np.isclose(np.linalg.norm(a), 1.0) and np.array_equal(a, b)
-    other = enrich([validate(good(product_title="blue lamp"), mapping)], mapping)[0]["embedding"]
+    other = enrich([validate(good(product_title="blue lamp"), mapping)], mapping,
+                   encoder=HashingEncoder(16))[0]["embedding"]
     assert not np.array_equal(a, other)
 
 
@@ -144,7 +145,7 @@ def test_ingest_writes_store_and_rejected(tmp_path, store, catalogue, mapping):
     assert all(set(l) == {"record", "rejection"} for l in lines)
     doc = store.get(["P00000"])[0]
     assert len(doc["embedding"]) == 16 and isinstance(doc["embedding"][0], float)
-    assert store.meta("encoder.embedding") == "hash-16"
+    assert store.meta("encoder.embedding") == "tfidf-svd-16" and store.blob("encoder.embedding")
 
 
 def test_ingest_parquet_round_trip(tmp_path, store, catalogue, mapping):
@@ -155,6 +156,21 @@ def test_ingest_parquet_round_trip(tmp_path, store, catalogue, mapping):
     snap = store.snapshot()
     assert list(snap.product_id) == list(catalogue.product_id)
     assert np.allclose(snap.price.to_numpy(), catalogue.price.to_numpy())
+
+
+def test_the_fitted_encoder_matches_the_engine_and_is_reused(tmp_path, store, catalogue, mapping):
+    from engine.encode import TfidfSvdEncoder, doc_texts
+    catalogue.to_parquet(tmp_path / "a.parquet")
+    ingest(tmp_path / "a.parquet", mapping, store, tmp_path / "rej.jsonl")
+    blob = store.blob("encoder.embedding")
+    inputs = mapping["_meta"]["engine"]["embeddings"]["embedding"]["inputs"]
+    own = TfidfSvdEncoder(16).fit(doc_texts(catalogue, inputs)).encode_docs(doc_texts(catalogue, inputs))
+    first = np.asarray(store.get(["P00007"])[0]["embedding"], np.float32)
+    assert np.array_equal(first, own[7])                      # what build_index would compute, bit for bit
+    catalogue.iloc[[7]].assign(product_id="COPY").to_parquet(tmp_path / "b.parquet")
+    ingest(tmp_path / "b.parquet", mapping, store, tmp_path / "rej.jsonl")    # a later batch: no refit
+    assert store.blob("encoder.embedding") == blob
+    assert np.array_equal(np.asarray(store.get(["COPY"])[0]["embedding"], np.float32), first)
 
 
 def test_ingest_refuses_to_mix_encoders(tmp_path, store, catalogue, mapping):
@@ -178,7 +194,7 @@ def test_change_feed(tmp_path, store, catalogue, mapping):
         {"op": "patch", "_id": "P00000", "fields": {"price": "1.25"}},
         {"op": "patch", "_id": "P00001", "fields": {"category": "x"}},       # not hot
         {"op": "patch", "_id": "NOPE", "fields": {"stock": 1}},              # no such key
-        {"op": "upsert", "_id": "NEW", "doc": {"product_title": "new kettle", "price": 3}},
+        {"op": "upsert", "_id": "NEW", "doc": {"product_title": "acme red kettle", "price": 3}},   # in the fitted vocabulary
         {"op": "patch", "_id": "NEW", "fields": {"stock": 9}},               # live within the batch
         {"op": "delete", "_id": "P00002"},
         {"op": "patch", "_id": "P00002", "fields": {"stock": 1}},            # deleted within the batch
