@@ -1,9 +1,11 @@
-"""S9's GPU measurements, run by the founder in Colab (a CUDA runtime with ``pip install -r requirements-gpu.txt``):
+"""S9's GPU measurements for development, in a CUDA runtime (``pip install -r requirements-gpu.txt``):
 
     python -m colab.s9_gpu_check --out results_s9.json [--only p1,p2,p3] [--p1-dataset esci-us] [--queries 1000]
 
-It writes numbers for the evaluation steward's judges and judges nothing itself. ESCI is read only through
-``referee.loader`` and only the **fit** split (queries and their judgments for nDCG and for training the ranker).
+**Development only; this is not the score of record.** A maker never supplies the numbers its claims are judged on:
+S9's predictions 1 to 3 are judged only by the evaluation steward's S9 cell in ``referee/colab_referee.ipynb``. This
+script lets the architect see the GPU paths work before that run. ESCI is read only through ``referee.loader`` and
+only the **fit** split (queries and their judgments for nDCG and for training the ranker).
 
 - **p1 (S9-1, cuVS):** on ``--p1-dataset`` (ESCI-US by default) with ``tfidf-svd-128`` vectors (fitted on the GPU),
   knn top-10 by ``cagra`` and ``ivf_pq`` at their default search parameters against ``exact``, for the first
@@ -203,7 +205,7 @@ def main(argv=None) -> int:
     res = {"kind": "s9-gpu-check", "commit": _rev(), "device": device, "gpu": _gpu(),
            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "host": {"cpus": os.cpu_count(), "machine": platform.machine(), "python": platform.python_version()},
-           "label": "score candidate (GPU)" if device == "cuda" else "development only"}
+           "label": "development only (not the score of record; S9 is judged by referee/colab_referee.ipynb)"}
     only = set(a.only.split(","))
     if "p1" in only:
         res["p1"] = p1(a.p1_dataset, a.queries, device)
