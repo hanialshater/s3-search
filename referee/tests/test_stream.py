@@ -115,13 +115,16 @@ def _run(tmp, duration_s=1.5, idle_s=0.4, rate=100, **fake):
     try:
         stream.require_s8_updater(st, rep, stream._doc(texts[0]), wait_s=2.0)
         return stream.run_stream(st, rep, ds.mapping, base_ids, st.head(), pool, texts, reqs, rate=rate,
-                                 duration_s=duration_s, idle_s=idle_s, settle_timeout_s=3.0, out_dir=Path(tmp) / "rb")
+                                 duration_s=duration_s, idle_s=idle_s, settle_timeout_s=30.0, out_dir=Path(tmp) / "rb")
     finally:
         rep.stop()
 
 
 @pytest.mark.slow
 def test_a_correct_updater_runs_clean(tmp_path):
+    """Load-tolerant: no timing bound is asserted, and the settle window (30 s) ends as soon as all is visible; the
+    test-only updater rebuilds on every poll, which slows under load (it failed once at load average 1.8 with a
+    3 s window)."""
     r = _run(tmp_path)
     w = r["writes"]
     assert w["changes"] > 100 and sum(w["never_visible"].values()) == 0
@@ -165,3 +168,15 @@ def test_intake_timings_and_bulk_on_toy(tmp_path):
     assert b["all_products"]["all_accounted"], b["all_products"]
     assert b["mixed"]["all_accounted"], b["mixed"]
     assert b["mixed"]["by_op_status"].get("create 409") == 10 and b["mixed"]["by_op_status"].get("update 404") == 10
+
+
+def test_load_guard(monkeypatch):
+    from referee import loadguard
+    monkeypatch.setattr(loadguard, "load1", lambda: 3.0)
+    with pytest.raises(loadguard.Busy, match="quiet moment"):
+        loadguard.wait_for_quiet(wait_s=0.0, poll_s=0.0)
+    s = loadguard.Sampler()
+    s.samples = [3.0, 4.0]
+    assert s.summary()["overloaded"] is (3.5 > loadguard.cpus() + loadguard.OVERLOAD_MARGIN)
+    monkeypatch.setattr(loadguard, "load1", lambda: 0.1)
+    assert loadguard.wait_for_quiet(wait_s=0.0)["load1_at_start"] == 0.1
