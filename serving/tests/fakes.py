@@ -45,6 +45,7 @@ class FakeIndex:
         self.mapping: dict = {}
         self.device_nbytes = 0
         self.batch_sizes: list[int] = []
+        self.rankers: dict = {}
         self.search_calls = 0
         self._lock = threading.Lock()
 
@@ -94,6 +95,9 @@ class FakeIndex:
         for i in ids:
             if i in self.live:
                 self.live[i] = False
+
+    def add_ranker(self, name, model) -> None:
+        self.rankers[name] = model
 
     def set_version(self, version: int) -> None:
         self.version = version
@@ -179,7 +183,10 @@ def fake_ports(delay: float = 0.0, over_budget_on: set | None = None) -> Ports:
         return FakeIndex(json.loads((Path(path) / "docs.json").read_text()), version=m["version"], device=device,
                          delay=delay)
 
-    p = Ports(open_store, ingest, prepare, build_segment, load_index)
+    def load_ranker(path: Path):
+        return json.loads(Path(path).read_text())
+
+    p = Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker)
     p.stores = stores  # type: ignore[attr-defined]
     return p
 
@@ -192,4 +199,4 @@ def write_source(path: Path, n: int = 20) -> str:
 
 
 MAPPING = {"_meta": {"engine": {"id_field": "_id", "hot": ["price", "stock"]}},
-           "properties": {"title": {"type": "text"}, "price": {"type": "float"}, "stock": {"type": "integer"}}}
+           "properties": {"title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}}, "price": {"type": "float"}, "stock": {"type": "integer"}}}
