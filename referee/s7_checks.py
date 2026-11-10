@@ -658,9 +658,11 @@ CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3, "S7-4": ch
 def check_landed_correct(index, ds):
     from referee import scope
     problems = []
+    from referee import s9_checks
+    checks_all = {**CHECKS, **s9_checks.CHECKS}
     for item in scope.landed_items():
-        if item not in CHECKS:
+        if item not in checks_all:
             problems.append(f"{item} is marked landed but referee/s7_checks.py has no correctness check for it")
             continue
-        problems += CHECKS[item](index, ds)
+        problems += checks_all[item](index, ds)
     assert not problems, "; ".join(problems[:8]) + (f"; and {len(problems) - 8} more" if len(problems) > 8 else "")

@@ -85,7 +85,7 @@ SCOPE = [
 
 
 # S7 items that are mapping settings, not request constructs: {item: landed}
-MAPPING_ITEMS = {"S7-6": True}
+MAPPING_ITEMS = {"S7-6": True, "S9-1": False}  # S9-1: an approximate knn method in the mapping (cuVS)
 
 
 def must_refuse(honor_landed: bool = True):
