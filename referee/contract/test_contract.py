@@ -139,8 +139,24 @@ def _boost_mode_ignored(r):
     return r
 
 
+def _build_without_synonyms(cat, mapping, device="cpu"):
+    import copy
+    m = copy.deepcopy(mapping)
+    m["_meta"]["engine"].pop("synonyms", None)
+    return api.build_index(cat, m, device=device)
+
+
+def _build_two_way(cat, mapping, device="cpu"):
+    import copy
+    m = copy.deepcopy(mapping)
+    m["_meta"]["engine"]["synonyms"] = [x.replace("=>", ",") for x in m["_meta"]["engine"].get("synonyms", [])]
+    return api.build_index(cat, m, device=device)
+
+
 def test_correctness_checks_catch_planted_errors(index, ds):
     from referee import s7_checks
+    assert s7_checks.check_s7_6(index, ds, build=_build_without_synonyms), "ignored synonyms must be caught"
+    assert s7_checks.check_s7_6(index, ds, build=_build_two_way), "a one-way rule read both ways must be caught"
     assert s7_checks.check_s7_5(_BadHighlight(index, "extra"), ds), "a highlighted non-query word must be caught"
     assert s7_checks.check_s7_5(_BadHighlight(index, "drop"), ds), "a missing highlight must be caught"
     assert s7_checks.check_s7_5(_Rewrites(index, _boost_mode_ignored), ds), "an ignored boost_mode must be caught"
@@ -167,3 +183,38 @@ def test_devices_agree(ds):
         for r in checks.lexical_requests(ds)[:60]:
             checks.assert_same_ranking(other.search(r), base.search(r), f"{dev} vs cpu: {r['query']}",
                                        tol=checks.DEVICE_RTOL)
+
+
+# ---- synonyms are a mapping setting (S7-6): what a mapping may hold ----------------------------------------------------
+
+_BAD_SYNONYMS = [(42, "not a list"), ([42], "an entry that is not a string"), (["red lamp, light"], "a multi-word entry"),
+                 (["the, lamp"], "an entry that analyses to no token (a stop word)")]
+_BAD_SYNONYMS_DEFECTS = [(["lamp =>"], "a rule with an empty right side (accepted, and makes lamp match nothing)"),
+                         (["=> light"], "a rule with an empty left side"),
+                         ([" , "], "an entry of empty alternatives (OpenSearch rejects the same mapping)")]
+
+
+def _with_synonyms(ds, syn):
+    import copy
+    m = copy.deepcopy(ds.mapping)
+    m["_meta"]["engine"]["synonyms"] = syn
+    return m
+
+
+@pytest.mark.parametrize("syn,what", _BAD_SYNONYMS, ids=[w for _, w in _BAD_SYNONYMS])
+def test_synonym_mappings_refused(syn, what, ds):
+    with pytest.raises(api.InvalidMapping):
+        api.build_index(ds.catalogue, _with_synonyms(ds, syn))
+
+
+@pytest.mark.xfail(strict=True, reason="defect reported 2026-11-10 (steward): accepted instead of InvalidMapping; "
+                                       "remove this mark when the engine refuses it")
+@pytest.mark.parametrize("syn,what", _BAD_SYNONYMS_DEFECTS, ids=[w[:40] for _, w in _BAD_SYNONYMS_DEFECTS])
+def test_synonym_mappings_refused_defects(syn, what, ds):
+    with pytest.raises(api.InvalidMapping):
+        api.build_index(ds.catalogue, _with_synonyms(ds, syn))
+
+
+def test_synonym_mappings_accepted(ds):
+    for syn in ([], ["# only a comment"], ["lamp, light"], "lamp, light", ["kettle => mug", "boots, shoe"]):
+        api.build_index(ds.catalogue, _with_synonyms(ds, syn))

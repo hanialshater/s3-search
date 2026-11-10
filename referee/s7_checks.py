@@ -494,13 +494,159 @@ def check_s7_5(index, ds):
     return problems
 
 
-CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3, "S7-4": check_s7_4, "S7-5": check_s7_5}
+SYNONYMS = ["lamp, light", "boots, shoe", "kettle => mug", "# a comment", "cup, beaker"]
+
+
+def parse_synonyms(lines):
+    """Solr lines -> {analysed term: set of analysed alternatives} (the referee's own reading of INTERFACES section 2)."""
+    alt = {}
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=>" in line:
+            lhs, rhs = line.split("=>")
+            to = {analyze(x)[0] for x in rhs.split(",")}
+            for x in lhs.split(","):
+                alt.setdefault(analyze(x)[0], set()).update(to)
+        else:
+            group = {analyze(x)[0] for x in line.split(",")}
+            for t in group:
+                alt.setdefault(t, set()).update(group)
+    return alt
+
+
+def check_s7_6(index, ds, build=None):
+    """Query-time synonyms (S7-6), on a toy index built with SYNONYMS: match sets and scores (Lucene's SynonymQuery:
+    term frequencies of the alternatives add before saturation, the lowest idf of them), operator and, multi_match
+    and match_bool_prefix sets, phrase slots, highlights marking alternatives, fuzzy and prefix not expanded, and no
+    change at all to queries without a synonym term or to an index with an empty list."""
+    import copy
+    import math
+    import pandas as pd
+    from referee import checks as _checks
+    if build is None:
+        import engine.api
+        build = engine.api.build_index
+    m = copy.deepcopy(ds.mapping)
+    m["_meta"]["engine"]["synonyms"] = list(SYNONYMS)
+    syn = build(ds.catalogue, m)
+    alt = parse_synonyms(SYNONYMS)
+    expand = lambda t: alt.get(t, {t})  # noqa: E731
+    c = ds.catalogue.reset_index(drop=True)
+    ids = list(c["product_id"])
+    problems = []
+    k1, b = 1.2, 0.75
+
+    def field_scores(field, text, operator="or"):
+        toks = [analyze(v) if pd.notna(v) else [] for v in c[field]]
+        n = len(toks)
+        avg = sum(len(t) for t in toks) / n
+        df = lambda term: sum(term in t for t in toks)  # noqa: E731
+        idf = lambda d: math.log1p((n - d + 0.5) / (d + 0.5))  # noqa: E731
+        q = list(dict.fromkeys(analyze(text)))
+        out = {}
+        for i, t in enumerate(toks):
+            score, hit = 0.0, 0
+            for term in q:
+                alts = expand(term)
+                tf = sum(t.count(a) for a in alts)
+                if not tf:
+                    continue
+                hit += 1
+                present = [df(a) for a in alts if df(a) > 0]
+                w = idf(max(present))
+                pseudo = tf / max(1 - b + b * len(t) / avg, 1e-6)
+                score += w * pseudo * (k1 + 1) / (k1 + pseudo)
+            if (hit == len(q) if operator == "and" else hit > 0) and q:
+                out[ids[i]] = score
+        return out
+
+    for text, op in (("light", "or"), ("red light", "or"), ("shoe", "or"), ("waterproof shoe", "and"),
+                     ("kettle", "or"), ("mug", "or"), ("cup", "or"), ("beaker lamp", "or"), ("steel kettle", "or"),
+                     ("red light", "and")):
+        exp = field_scores("product_title", text, op)
+        order = sorted(exp, key=lambda p: (-exp[p], ids.index(p)))
+        want = {"hits": {"total": len(exp), "hits": [{"_id": p, "_score": exp[p]} for p in order]}}
+        got = syn.search({"query": {"match": {"product_title": {"query": text, "operator": op}}}, "size": ALL})
+        try:
+            _checks.assert_same_ranking(got, want, f"synonyms match {text!r} ({op})")
+        except AssertionError as e:
+            problems.append(str(e)[:240])
+
+    def has_any(field, terms):
+        return {p for p, v in zip(ids, c[field]) if pd.notna(v) and set(analyze(v)) & terms}
+
+    for text in ("light", "shoe kettle", "kettle"):
+        q = list(dict.fromkeys(analyze(text)))
+        exp = set()
+        for f in checks_fields():
+            for term in q:
+                exp |= has_any(f, expand(term))
+        total, got = _ids(syn, {"query": {"multi_match": {"query": text, "fields": checks_fields()}}})
+        if got != exp:
+            problems.append(f"synonyms multi_match {text!r}: {len(got)} hits, expected {len(exp)}")
+    for text in ("shoe wa", "light por"):
+        q = analyze(text)
+        exp = {p for p, v in zip(ids, c["product_title"]) if pd.notna(v) and (
+            set(analyze(v)) & set().union(*[expand(t) for t in q[:-1]]) or
+            any(w.startswith(q[-1]) for w in analyze(v)))}
+        total, got = _ids(syn, {"query": {"match_bool_prefix": {"product_title": text}}})
+        if got != exp:
+            problems.append(f"synonyms match_bool_prefix {text!r}: {len(got)} hits, expected {len(exp)}")
+    for text in ("red light", "waterproof shoe", "light red"):
+        q = analyze_positions(text)
+
+        def ok(v, q=q):
+            toks = analyze_positions(v)
+            pos = {}
+            for t, p in toks:
+                pos.setdefault(t, set()).add(p)
+            offs = [p - q[0][1] for _, p in q]
+            starts = set().union(*[pos.get(a, set()) for a in expand(q[0][0])])
+            return any(all(any(s + o in pos.get(a, ()) for a in expand(t)) for (t, _), o in zip(q, offs))
+                       for s in starts)
+        exp = {p for p, v in zip(ids, c["product_title"]) if pd.notna(v) and ok(v)}
+        total, got = _ids(syn, {"query": {"match_phrase": {"product_title": text}}})
+        if got != exp or total != len(exp):
+            problems.append(f"synonyms match_phrase {text!r}: {len(got)} hits, expected {len(exp)}")
+    src = {p: {"product_title": (None if pd.isna(v) else v)} for p, v in zip(ids, c["product_title"])}
+    for text in ("light", "shoe", "red light"):
+        r = syn.search({"query": {"match": {"product_title": text}}, "size": ALL,
+                        "highlight": {"fields": {"product_title": {}}}})
+        terms = {"product_title": set().union(*[expand(t) for t in analyze(text)])}
+        for h in r["hits"]["hits"]:
+            problems += _highlight_problems(h, ["product_title"], terms, src[h["_id"]])[:2]
+    plain = index
+    for req in ({"query": {"fuzzy": {"product_title": "shoe"}}}, {"query": {"prefix": {"product_title": "lig"}}},
+                {"query": {"match": {"product_title": {"query": "shoe", "fuzziness": "AUTO"}}}}):
+        a, bb = syn.search({**req, "size": ALL}), plain.search({**req, "size": ALL})
+        if [h["_id"] for h in a["hits"]["hits"]] != [h["_id"] for h in bb["hits"]["hits"]]:
+            problems.append(f"synonyms must not expand {list(req['query'])[0]}: results differ from the plain index")
+    empty_m = copy.deepcopy(ds.mapping)
+    empty_m["_meta"]["engine"]["synonyms"] = []
+    empty = build(ds.catalogue, empty_m)
+    for r in _checks.lexical_requests(ds)[:80]:
+        for other, name in ((empty, "an empty synonyms list"), (syn, "synonyms")):
+            if name == "synonyms" and any(t in alt for t in analyze(json.dumps(r["query"]))):
+                continue
+            x, y = other.search(r), plain.search(r)
+            if [(h["_id"], h["_score"]) for h in x["hits"]["hits"]] != [(h["_id"], h["_score"]) for h in y["hits"]["hits"]]:
+                problems.append(f"{name} changed a query without a synonym term: {json.dumps(r['query'])[:100]}")
+                break
+    return problems
+
+
+import json  # noqa: E402
+
+CHECKS = {"S7-1": check_s7_1, "S7-2": check_s7_2, "S7-3": check_s7_3, "S7-4": check_s7_4, "S7-5": check_s7_5,
+          "S7-6": check_s7_6}
 
 
 def check_landed_correct(index, ds):
     from referee import scope
     problems = []
-    for item in sorted({e[1] for e in scope.landed()}):
+    for item in scope.landed_items():
         if item not in CHECKS:
             problems.append(f"{item} is marked landed but referee/s7_checks.py has no correctness check for it")
             continue
