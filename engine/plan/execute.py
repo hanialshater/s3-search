@@ -178,19 +178,7 @@ class Executor:
             codes = [kw.code_of[str(v)] for v in node.values if v is not None and str(v) in kw.code_of and str(v)]
             return ops.term_mask(b, kw.codes, np.asarray(codes or [-1], np.int64))
         dt = st.num_dtype[f]
-        vals = []
-        for v in node.values:
-            if dt == "bool":
-                if isinstance(v, str):
-                    v = {"true": True, "false": False}.get(v.lower(), v)
-                if not isinstance(v, bool):
-                    raise InvalidRequest(node.path, f"{v!r} is not a boolean")
-            else:
-                try:
-                    v = float(v)
-                except (TypeError, ValueError):
-                    raise InvalidRequest(node.path, f"{v!r} is not a number") from None
-            vals.append(v)
+        vals = list(node.values)              # the planner converted them to the field's type
         cast = "int32" if dt == "bool" else "float64"
         col = b.astype(st.numerics[f], cast)
         target = b.asarray(np.asarray(vals, dtype=np.float64).astype(cast), cast)

@@ -43,9 +43,9 @@ Status values: open · claimed · in review · done.
 
 | Id | Item | Status | Claimed |
 |---|---|---|---|
-| S3-1 | Parser for the OpenSearch query DSL subset; named errors for anything outside it | open | |
-| S3-2 | Planner onto the S1 operators; batched executor | open | |
-| S3-3 | Pass the B1-5 conformance suite at 98% or better | open | |
+| S3-1 | Parser for the OpenSearch query DSL subset; named errors for anything outside it | in review | architect, 2026-11-10 |
+| S3-2 | Planner onto the S1 operators; batched executor | in review | architect, 2026-11-10 |
+| S3-3 | Pass the B1-5 conformance suite at 98% or better | claimed | architect, 2026-11-10 |
 
 ## S4 · Serving and platform (platform-engineer)
 
