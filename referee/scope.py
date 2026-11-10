@@ -71,6 +71,8 @@ SCOPE = [
     ("highlight fvh", None, False, "highlight",
      {"query": Q, "highlight": {"type": "fvh", "fields": {"product_title": {}}}}),
     ("collapse text field", None, False, "collapse", {"query": Q, "collapse": {"field": "product_title"}}),
+    ("collapse inner_hits", None, False, "collapse",
+     {"query": Q, "collapse": {"field": "category", "inner_hits": {"name": "top", "size": 2}}}),
     ("function_score random_score", None, False, "function_score",
      {"query": {"function_score": {"query": Q, "random_score": {}}}}),
     ("function_score script_score", None, False, "function_score",
