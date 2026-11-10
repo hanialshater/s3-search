@@ -153,7 +153,47 @@ class MergePolicy:
         return waiting > 0 and time.time() - stats.get("loaded_at", time.time()) > self.max_age_s
 
 
-def reindex(store, out_dir: str | Path, replica=None, keep: int = 3) -> Path:
+@dataclass
+class TieredMergePolicy:
+    """Which segments to merge (S8-1 proposal, section 6). Segments are dicts with ``segment_id``, ``live`` and
+    ``n_docs`` (``Index.segments``). Tiers by live docs: ``[floor * factor**k, floor * factor**(k+1))``, the first
+    tier being everything under ``floor * factor``. A tier holding ``merge_factor`` or more segments merges its
+    smallest ``merge_factor``; a segment whose deleted share exceeds ``max_deleted_ratio`` is rewritten alone; above
+    ``max_segments`` the smallest merge first, so query fan-out stays bounded. ``plan`` returns at most one merge,
+    the most urgent (the updater runs one at a time)."""
+    floor: int = 1_000
+    factor: int = 10
+    merge_factor: int = 10
+    max_deleted_ratio: float = 0.25
+    max_segments: int = 16
+
+    def tier(self, live: int) -> int:
+        k, bound = 0, self.floor * self.factor
+        while live >= bound:
+            k += 1
+            bound *= self.factor
+        return k
+
+    def plan(self, segments: list[dict]) -> list[str] | None:
+        segs = sorted(segments, key=lambda s: (s["live"], s["segment_id"]))
+        if len(segs) < 2 and not any(self._expunge(s) for s in segs):
+            return None
+        tiers: dict[int, list[dict]] = {}
+        for s in segs:
+            tiers.setdefault(self.tier(s["live"]), []).append(s)
+        for k in sorted(tiers):
+            if len(tiers[k]) >= self.merge_factor:
+                return [s["segment_id"] for s in tiers[k][:self.merge_factor]]
+        if len(segs) > self.max_segments:
+            return [s["segment_id"] for s in segs[:len(segs) - self.max_segments + 1]]
+        worst = max(segs, key=lambda s: 1 - s["live"] / max(1, s["n_docs"]))
+        return [worst["segment_id"]] if self._expunge(worst) else None
+
+    def _expunge(self, s: dict) -> bool:
+        return s["n_docs"] > 0 and 1 - s["live"] / s["n_docs"] > self.max_deleted_ratio
+
+
+def reindex(store,out_dir: str | Path, replica=None, keep: int = 3) -> Path:
     """Build from the store and, given a replica, swap it onto the new segment; then gc. (§7 ``_reindex``.)"""
     seg = build(store, None, out_dir)
     if replica is not None:

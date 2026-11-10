@@ -313,6 +313,32 @@ class Store:
         df.attrs["version"] = at
         return df
 
+    def delta(self, after: int) -> tuple[int, list[dict], pd.DataFrame]:
+        """What a delta segment needs (S8-4), read in one transaction: ``(head, records, docs)``.
+
+        ``records`` are the change records in ``(after, head]`` without upserts' docs. ``docs`` is the snapshot
+        frame (as ``snapshot``) of the keys upserted in that range that are live at head, ordered by
+        ``first_offset``, with ``attrs["version"] = head``. A key upserted and then deleted in the range is in
+        ``records`` only (its older copy needs a tombstone, and there is nothing to add)."""
+        c = self._conn()
+        c.execute("BEGIN")
+        try:
+            head = self._head(c)
+            recs = self.changes(after, limit=max(1, head - after), docs=False) if head > after else []
+            keys = list(dict.fromkeys(r["_id"] for r in recs if r["op"] == "upsert"))
+            rows = []
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
+                q = (f"SELECT doc, vecf, vec, first_offset, last_offset FROM docs WHERE id IN "
+                     f"({','.join('?' * len(chunk))})")
+                rows += [(self._doc(t, vf, b, lists=False), f, la) for t, vf, b, f, la in c.execute(q, chunk)]
+        finally:
+            c.execute("COMMIT")
+        rows.sort(key=lambda r: r[1])
+        df = self._frame(rows)
+        df.attrs["version"] = head
+        return head, recs, df
+
     def _replay(self, c: sqlite3.Connection, at: int) -> list[tuple[dict, int, int]]:
         state: dict[str, list] = {}
         for off, op, _id, body, vecf, blob in c.execute(
