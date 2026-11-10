@@ -123,17 +123,17 @@ class Dictionary:
 
 
 def text_dictionary(st) -> Dictionary:
-    """The segment's vocabulary (sorted), cached on the index state."""
+    """The index's vocabulary (sorted, over all segments), cached on the index state until its next layout."""
     d = getattr(st, "_dictionary", None)
     if d is None:
-        d = st._dictionary = Dictionary(list(st.seg.text.vocab))
+        d = st._dictionary = Dictionary(list(st.vocab_list))
     return d
 
 
 def field_mask(st, fields) -> np.ndarray:
-    """bool[V]: terms indexed in any of ``fields``."""
+    """bool[V]: terms indexed in any of ``fields`` of a live document."""
     cols = [st.field_index[f] for f in fields]
-    return (np.asarray(st.seg.text.df_field)[:, cols] > 0).any(axis=1)
+    return (np.asarray(st.host_df_field)[:, cols] > 0).any(axis=1)
 
 
 def keyword_dictionary(kw) -> Dictionary:

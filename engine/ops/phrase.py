@@ -23,13 +23,16 @@ def _slot_keys(b, st, field_i: int, term_ids, offset: int):
         return b.zeros(0, "int64")
     pos_ptr, positions = st.positions()
     _, entry = b.csr_expand(st.term_ptr, list(term_ids), [0] * len(term_ids))
+    if getattr(st, "post_live", None) is not None:
+        entry = entry[st.post_live[entry]]
     docs = st.doc_ids[entry]
     doc_of, pidx = b.csr_expand(pos_ptr, entry, docs)
     code = b.astype(positions[pidx], "int64")
     keep = (code >> POS_BITS) == field_i
     p = code[keep] & (SHIFT - 1)
     keys = (doc_of[keep] << V_BITS) | (p - offset + SHIFT)
-    return b.unique(keys) if len(term_ids) > 1 else keys      # one term: already sorted by (doc, position)
+    # one term in one segment is already sorted by (doc, position); slots from several segments are not
+    return b.unique(keys) if len(term_ids) > 1 or getattr(st, "post_live", None) is not None else keys
 
 
 def phrase(b, st, field_i: int, slots, offsets, slop: int):

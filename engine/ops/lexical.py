@@ -21,6 +21,9 @@ def bm25f_groups(b, st, groups, modes, w, bb, k1: float, idf, group_idf=None):
     w, bb = b.asarray(w, "float32"), b.asarray(bb, "float32")
     q_of, entry = b.csr_expand(st.term_ptr, rows, owners)
     t_rep = b.csr_expand(st.term_ptr, rows, rows)[0]
+    if getattr(st, "post_live", None) is not None:          # a segment of a multi-segment index: dead copies out
+        keep = st.post_live[entry]
+        q_of, entry, t_rep = q_of[keep], entry[keep], t_rep[keep]
     docs = st.doc_ids[entry]
     tf = b.astype(st.tf[entry], "float32")
     norm = (1.0 - bb) + bb * st.rel_len[docs]
@@ -79,6 +82,9 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
     for g in groups:
         q_of, entry = b.csr_expand(st.term_ptr, [rows[i] for i in g], [owners[i] for i in g])
         t_rep = b.csr_expand(st.term_ptr, [rows[i] for i in g], [rows[i] for i in g])[0]
+        if getattr(st, "post_live", None) is not None:      # a segment of a multi-segment index: dead copies out
+            keep = st.post_live[entry]
+            q_of, entry, t_rep = q_of[keep], entry[keep], t_rep[keep]
         docs = st.doc_ids[entry]
         tf = b.astype(st.tf[entry], "float32")
         norm = (1.0 - bb) + bb * st.rel_len[docs]

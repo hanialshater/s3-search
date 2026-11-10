@@ -346,6 +346,17 @@ Layout (`seg-<version>-<8 hex>/`):
   `Index.snapshot_segments(segment_ids) -> (segments, version)` (references to immutable arrays, copies of live bits
   and hot columns), `Index.segments` (`[{segment_id, version, n_docs, live, device_nbytes}]`),
   `Index.save_commit(dir) -> Path`, `engine.build.merge_segments(segs, mapping) -> SegmentArrays`.
+- **The commit checksum** (S8-2, the data plane's definition adopted): sha256 of the canonical JSON (sorted keys,
+  separators `,` and `:`) of every field of the commit except `checksum`, with one more key,
+  `"delete_sha256": {segment_id: sha256 of that delete file's bytes}`, hashed but not stored. The engine has its own
+  reader and writer of these bytes (`engine/commit.py`; the engine does not import the data plane); the shared test
+  vector is `engine/tests/test_s8_segments.py::test_commit_checksum_vector` (a commit at version 7 of
+  `seg-5-aaaa0000` and `seg-7-bbbb1111`, the first with the delete file `np.save` of
+  `uint32 [0xFFFFFFFE, 0x00000003]`).
+- **A commit holds deletes, not hot-column patches**: a patch applied after a segment's build lives only in memory,
+  so a replica that loads a commit must replay the log from the oldest segment's version (patches are idempotent),
+  or the data plane must rebuild or merge the segment before committing. (Open with the dataplane-engineer.)
+- `Index.save(path)` writes one segment of the live docs (a merge); `Index.n_docs` is the live count.
 
 The engine side (`engine/api.py`):
 
@@ -766,3 +777,9 @@ status:
   doc order is `first_offset` order by append-only slots; the multi-segment API. Section 5: `sort`'s last element is
   `first_offset` (unchanged for catalogue-built indexes). Why: S8's fast writes need deltas whose results equal a
   rebuild's.
+- 2026-11-10, architect (S8-2): the engine searches an ordered list of segments with global live-only statistics
+  and first_offset slots (`engine/index_state.py`: `Part` per segment, `IndexState._relayout`); `add_segment`,
+  `replace_segments`, `remove_segment`, `snapshot_segments`, `segments`, `from_segments`, `from_commit`,
+  `save_commit`; `engine.build.merge_segments` merges arrays (postings, positions, vectors) without re-analysis;
+  `engine/commit.py` reads and writes the data plane's commit format with its checksum definition. Section 4 records
+  the checksum's bytes, the shared test vector, and that commits do not carry hot-column patches.

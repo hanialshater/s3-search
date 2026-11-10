@@ -23,7 +23,7 @@ from .errors import (CorruptSegment, DeviceUnavailable, InvalidMapping, InvalidR
 from .index_state import IndexState
 from .plan.execute import Executor
 from .plan.plan import plan as make_plan
-from .segment import NumericColumn, read_segment, write_segment
+from .segment import SegmentArrays, read_segment, write_segment
 
 __all__ = ["build_index", "Index", "available_devices", "UnsupportedQuery", "InvalidRequest", "InvalidMapping",
            "OverBudget", "DeviceUnavailable", "NoSuchKey", "CorruptSegment",
@@ -39,16 +39,19 @@ def _locked(fn):
 
 
 class Index:
-    """One segment loaded on one device, searchable, with the updater's hooks (patch, delete, set_version).
+    """An ordered list of segments (one, or a base plus deltas: S8) loaded on one device, searchable, with the
+    updater's hooks (patch, delete, set_version) and the multi-segment hooks (add_segment, replace_segments,
+    remove_segment, snapshot_segments, save_commit).
 
-    Thread-safe: search, search_batch, patch, delete, set_version, save and candidate_features take one re-entrant
-    lock per Index, so a search sees a patch or delete call either entirely or not at all. Searches on one Index
-    therefore run one batch at a time (serving batches requests with search_batch).
+    Thread-safe: every public method that reads or changes the index takes one re-entrant lock per Index, so a
+    search sees a patch, delete, add or replace either entirely or not at all. Searches on one Index therefore run
+    one batch at a time (serving batches requests with search_batch).
     """
 
-    def __init__(self, seg, device: str = "cpu", accumulate: str | None = None):
-        """``accumulate``: "float64" (the default reference) or "float32" (docs/INTERFACES.md §0)."""
-        self._st = IndexState(seg, get_backend(device, accumulate))
+    def __init__(self, seg, device: str = "cpu", accumulate: str | None = None, version: int | None = None):
+        """``seg``: a SegmentArrays, or a list of them (oldest first; without a commit, a key live in several
+        keeps its newest copy). ``accumulate``: "float64" (the default reference) or "float32" (§0)."""
+        self._st = IndexState(seg, get_backend(device, accumulate), version=version)
         self.rankers: dict = {}
         self._lock = threading.RLock()
 
@@ -57,19 +60,129 @@ class Index:
     def from_segment(cls, path, device: str = "cpu", verify: bool = True, accumulate: str | None = None) -> "Index":
         return cls(read_segment(path, verify=verify), device, accumulate)
 
+    @classmethod
+    def from_segments(cls, paths, device: str = "cpu", verify: bool = True, accumulate: str | None = None) -> "Index":
+        return cls([read_segment(p, verify=verify) for p in paths], device, accumulate)
+
+    @classmethod
+    def from_commit(cls, path, device: str = "cpu", verify: bool = True, accumulate: str | None = None) -> "Index":
+        """The index a commit names: its segments (directories named by segment_id, next to the commit file) with
+        the commit's live bitmaps, at the commit's version."""
+        from .commit import read_commit
+        path = Path(path)
+        c = read_commit(path, verify=verify)
+        segs = []
+        for sid in c["segments"]:
+            seg = read_segment(path.parent / sid, verify=verify)
+            if sid in c["live"]:
+                seg.live = np.asarray(c["live"][sid], np.uint32)
+            segs.append(seg)
+        ix = cls.__new__(cls)
+        ix._st = IndexState(segs, get_backend(device, accumulate), version=int(c["version"]), newest_wins=False)
+        ix.rankers, ix._lock = {}, threading.RLock()
+        return ix
+
     @_locked
     def save(self, path) -> Path:
-        """Write the index as a segment (``path``: the segment directory, new or empty), including deletes and
-        hot-field patches applied since it was loaded, at the current ``version``."""
+        """Write the index as one segment (``path``: the segment directory, new or empty): its live docs, with
+        hot-field patches, at the current ``version`` (a merge of all its segments)."""
+        from .build import merge_segments
         st = self._st
-        seg = st.seg
-        b = st.b
-        seg.live = b.pack_bits(st.live) if st.b.name == "cpu" else b.pack_bits(b.to_numpy(st.live))
-        for f in seg.numerics:
-            seg.numerics[f] = NumericColumn(values=np.asarray(b.to_numpy(st.numerics[f])),
-                                            missing=b.pack_bits(b.to_numpy(st.missing[f])))
-        seg.manifest["version"] = st.version
+        seg = merge_segments([p.snapshot() for p in st.parts], version=st.version)
         return write_segment(seg, path)
+
+    @_locked
+    def save_commit(self, out_dir) -> Path:
+        """Write ``commit-<version>.json`` in ``out_dir`` (§4's format and checksum), with a delete file for each
+        segment that has deletes; a segment not yet on disk there is written to ``out_dir/<segment_id>``."""
+        from .commit import write_commit
+        from .index_state import _pack
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        live = {}
+        for p in self._st.parts:
+            d = out / p.segment_id
+            if not (d / "manifest.json").exists():
+                seg = p.seg
+                written = write_segment(_copy_for_write(seg), d)
+                if written.name != p.segment_id:      # write_segment derives the id from the content
+                    p.segment_id = written.name
+            if not p.local_live.all():
+                live[p.segment_id] = _pack(p.local_live)
+        return write_commit(out, self._st.version, [p.segment_id for p in self._st.parts], live)
+
+    # ---- segments (S8)
+    @property
+    def segments(self) -> list[dict]:
+        return [{"segment_id": p.segment_id, "version": p.version, "n_docs": p.n, "live": int(p.local_live.sum()),
+                 "device_nbytes": p.device_nbytes} for p in self._st.parts]
+
+    def _segment_arrays(self, seg):
+        return seg if isinstance(seg, SegmentArrays) else read_segment(seg)
+
+    @_locked
+    def add_segment(self, seg, version: int, delete_ids=()) -> None:
+        """Atomically: tombstone ``delete_ids`` and the new segment's ids in the older segments (unknown ids are
+        ignored), add the segment, recompute the global statistics, set the version."""
+        from .index_state import Part
+        st = self._st
+        part = Part(self._segment_arrays(seg), st.b)
+        st.check_part(part)
+        saved = [p.local_live.copy() for p in st.parts]
+        try:
+            st.tombstone(list(delete_ids) + list(part.ids), parts=list(st.parts))
+            st._attach(part)
+            st.version = int(version)
+            st._relayout()
+        except Exception:
+            if st.parts and st.parts[-1] is part:
+                st.parts.pop()
+            for p, live in zip(st.parts, saved):
+                p.local_live = live
+            st._relayout()
+            raise
+
+    @_locked
+    def replace_segments(self, old_ids, new=None, version: int | None = None, delete_ids=()) -> None:
+        """Atomically replace the segments ``old_ids`` by ``new`` (their merge, or None to drop them): ``new`` takes
+        the place of the first of them; ``delete_ids`` are tombstoned in ``new``."""
+        from .index_state import Part
+        st = self._st
+        old = [st.part(i) for i in old_ids]
+        before = list(st.parts)
+        part = None
+        if new is not None:
+            part = Part(self._segment_arrays(new), st.b)
+            st.check_part(part)
+            for i in delete_ids:
+                loc = part.local_of.get(i)
+                if loc is not None:
+                    part.local_live[loc] = False
+        at = min(st.parts.index(p) for p in old) if old else len(st.parts)
+        rest = [p for p in st.parts if p not in old]
+        st.parts = rest[:at] + ([part] if part is not None else []) + rest[at:]
+        if not st.parts:
+            st.parts = before
+            raise ValueError("an index needs at least one segment")
+        try:
+            if version is not None:
+                st.version = int(version)
+            st._relayout()
+        except Exception:
+            st.parts = before
+            st._relayout()
+            raise
+
+    def remove_segment(self, segment_id: str) -> None:
+        self.replace_segments([segment_id], None)
+
+    @_locked
+    def snapshot_segments(self, segment_ids=None):
+        """``(segments, version)``: SegmentArrays of the named segments (all by default) as they are now, sharing
+        their immutable arrays and copying their live bits and hot columns, for ``engine.build.merge_segments``."""
+        st = self._st
+        parts = st.parts if segment_ids is None else [st.part(i) for i in segment_ids]
+        return [p.snapshot() for p in parts], st.version
 
     # ---- properties
     @property
@@ -78,7 +191,7 @@ class Index:
 
     @property
     def n_docs(self) -> int:
-        return self._st.N
+        return self._st.n_live
 
     @property
     def device(self) -> str:
@@ -94,7 +207,7 @@ class Index:
 
     @property
     def segment_id(self) -> str:
-        return self._st.manifest.get("segment_id", "")
+        return self._st.parts[0].segment_id if len(self._st.parts) == 1 else ""
 
     # ---- search
     def search(self, request: dict) -> dict:
@@ -122,7 +235,7 @@ class Index:
         makes the value missing."""
         if field not in self._st.mapping.hot:
             raise NotHot(f"{field!r} is not a hot field (_meta.engine.hot: {self._st.mapping.hot})")
-        missing = [i for i in ids if i not in self._st.pos]
+        missing = [i for i in ids if i not in self._st.known]
         if missing:
             raise NoSuchKey(f"unknown _id(s): {missing[:5]}")
         if len(ids) != len(values):
@@ -132,7 +245,7 @@ class Index:
     @_locked
     def delete(self, ids: Sequence[str]) -> None:
         """KeyError for ids the segment never held; already-deleted ids are a no-op."""
-        missing = [i for i in ids if i not in self._st.pos]
+        missing = [i for i in ids if i not in self._st.known]
         if missing:
             raise NoSuchKey(f"unknown _id(s): {missing[:5]}")
         self._st.delete(list(ids))
@@ -167,6 +280,14 @@ class Index:
         cand_h = b.to_numpy(cand)[0]
         ok = cand_h >= 0
         return [str(st.ids[d]) for d in cand_h[ok]], np.asarray(b.to_numpy(X)[0][ok], np.float32)
+
+
+def _copy_for_write(seg):
+    """A shallow copy whose manifest write_segment may update without touching the loaded segment's."""
+    import copy
+    c = copy.copy(seg)
+    c.manifest = dict(seg.manifest)
+    return c
 
 
 def build_index(catalogue: pd.DataFrame, mapping: dict, device: str = "cpu", accumulate: str | None = None) -> Index:
