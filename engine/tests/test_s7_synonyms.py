@@ -27,6 +27,10 @@ def test_parse():
     assert s["tee"] == ("shirt",) and s["coat"] == ("jacket", "jean") and "shirt" not in s
     with pytest.raises(InvalidMapping):
         parse_synonyms(["ice cream, gelato"])
+    for bad in ["lamp =>", "=> light", " , ", "lamp, , light", "a => b => c"]:
+        with pytest.raises(InvalidMapping) as e:
+            parse_synonyms([bad])
+        assert repr(bad.split("#")[0].strip()) in str(e.value) or "=>" in bad
 
 
 def brute(index, catalogue, q, op="or"):
