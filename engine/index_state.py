@@ -217,6 +217,8 @@ class IndexState:
         self.N = self.n_live = N
         self.slot_part, self.slot_local, self.ids, self.first_offset = pi, li, ids, fo
         self.pos = {d: s for s, d in enumerate(ids.tolist())}
+        self.first_offset_dev = b.asarray(fo, "int64")
+        self._exists = {}
         self.known = set()
         for p in self.parts:
             self.known.update(p.local_of)
@@ -308,6 +310,23 @@ class IndexState:
             if len(p.live_local):
                 out[b.asarray(p.live_slot, "int64")] = get(p)[b.asarray(p.live_local, "int64")]
         return out
+
+    def exists_mask(self, field: str):
+        """bool[N]: docs with a value in ``field`` (S7-3). Text: at least one token; keyword: a value (an empty or
+        over-long value counts as none); numeric: not missing; vector: a non-zero vector."""
+        b = self.b
+        kind = self.mapping.kind(field)
+        if kind == "numeric":
+            return ~self.missing[field]
+        if field not in self._exists:
+            if kind == "text":
+                m = b.asarray(self.host_field_len[:, self.field_index[field]] > 0, "bool")
+            elif kind == "keyword":
+                m = self.keywords[field].codes > 0
+            else:
+                m = self._gather(lambda p: b.sum(p.vectors[field] * p.vectors[field], axis=1) > 0, "bool")
+            self._exists[field] = m
+        return self._exists[field]
 
     @property
     def has_positions(self) -> bool:
