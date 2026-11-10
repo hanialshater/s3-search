@@ -81,11 +81,28 @@ SCOPE = [
      {"size": 0, "aggs": {"c": {"terms": {"field": "category"}, "aggs": {
          "b": {"terms": {"field": "product_brand.keyword"}, "aggs": {"p": {"avg": {"field": "price"}}}}}}}}),
     ("script_fields", None, False, "script_fields", {"query": Q, "script_fields": {"x": {"script": "1"}}}),
+    # Outside S9's geo and nested scope (S9-4, S9-5 are mapping items below): refused for good
+    ("geo_shape", None, False, "geo_shape", {"query": {"geo_shape": {"location": {"shape": {
+        "type": "envelope", "coordinates": [[-74.1, 40.7], [-73.9, 40.5]]}}}}}),
+    ("geo_polygon", None, False, "geo_polygon", {"query": {"geo_polygon": {"location": {"points": [
+        {"lat": 40, "lon": -74}, {"lat": 41, "lon": -74}, {"lat": 41, "lon": -73}]}}}}),
+    ("geohash_grid agg", None, False, "geohash_grid",
+     {"size": 0, "aggs": {"g": {"geohash_grid": {"field": "location", "precision": 3}}}}),
+    ("geo_bounds agg", None, False, "geo_bounds", {"size": 0, "aggs": {"g": {"geo_bounds": {"field": "location"}}}}),
+    ("geo_distance agg", None, False, "geo_distance",
+     {"size": 0, "aggs": {"g": {"geo_distance": {"field": "location", "origin": "40.5,-74", "ranges": [{"to": 1e4}]}}}}),
+    ("nested inner_hits", None, False, "nested",
+     {"query": {"nested": {"path": "offers", "query": {"range": {"offers.price": {"lt": 100}}}, "inner_hits": {}}}}),
+    ("reverse_nested agg", None, False, "aggs",
+     {"size": 0, "aggs": {"o": {"nested": {"path": "offers"}, "aggs": {"r": {"reverse_nested": {}}}}}}),
 ]
 
 
 # S7 items that are mapping settings, not request constructs: {item: landed}
-MAPPING_ITEMS = {"S7-6": True, "S9-1": False}  # S9-1: an approximate knn method in the mapping (cuVS)
+MAPPING_ITEMS = {"S7-6": True,
+                 "S9-1": False,   # an approximate knn method in the mapping (cuVS)
+                 "S9-4": True,    # geo_point, geo_distance, geo_bounding_box, _geo_distance sort (71a32c4)
+                 "S9-5": True}    # nested documents, the nested query and aggregation (4b09756)
 
 
 def must_refuse(honor_landed: bool = True):

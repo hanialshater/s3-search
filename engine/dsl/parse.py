@@ -12,7 +12,7 @@ import math
 import re
 
 from ..errors import InvalidRequest, UnsupportedQuery
-from .ast import (Agg, Fuzzy, Highlight, QFunctionScore, QBool, QExists, QIds, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
+from .ast import (Agg, Fuzzy, Highlight, QNested, QGeoBox, QGeoDistance, QFunctionScore, QBool, QExists, QIds, QFuzzy, QMatchBoolPrefix, QMatchPhrase, QPrefix, QHybrid, QKnn, QMatch, QMatchAll, QMultiMatch, QNeural, QRange, QTerm, Request, Sort)
 
 MAX_WINDOW = 10_000
 TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_after", "explain", "_source",
@@ -20,7 +20,7 @@ TOP_KEYS = {"query", "aggs", "aggregations", "sort", "from", "size", "search_aft
             "track_total_hits", "rank", "rescore"}
 QUERY_TYPES = ("match", "multi_match", "bool", "term", "terms", "range", "knn", "match_all", "hybrid", "neural",
                "match_phrase", "fuzzy", "prefix", "match_bool_prefix", "exists", "ids",
-               "function_score")
+               "function_score", "geo_distance", "geo_bounding_box", "nested")
 MULTI_MATCH_TYPES = ("best_fields", "most_fields", "cross_fields")
 
 
@@ -207,6 +207,71 @@ class Parser:
         if kind not in QUERY_TYPES:
             raise UnsupportedQuery(f"{path}.{kind}", f"query type {kind!r} is not supported")
         return getattr(self, "q_" + kind)(body, f"{path}.{kind}")
+
+    def q_nested(self, body, path):
+        _keys(body, {"path", "query", "score_mode", "boost"}, path)
+        if not isinstance(body.get("path"), str):
+            raise InvalidRequest(f"{path}.path", "required: the nested field")
+        if "query" not in body:
+            raise InvalidRequest(f"{path}.query", "required")
+        sm = body.get("score_mode", "avg")
+        if sm not in ("avg", "sum", "max", "min", "none"):
+            raise InvalidRequest(f"{path}.score_mode", "avg | sum | max | min | none")
+        return QNested(body["path"], self.query(body["query"], f"{path}.query"), sm,
+                       _num(body.get("boost", 1.0), f"{path}.boost"), path)
+
+    def _geo_field(self, body, path, reserved):
+        from ..geo import BadGeo, parse_point  # noqa: F401
+        _obj(body, path)
+        fields = [k for k in body if k not in reserved]
+        if len(fields) != 1:
+            raise InvalidRequest(path, "exactly one geo_point field")
+        return fields[0]
+
+    def q_geo_distance(self, body, path):
+        from ..geo import BadGeo, parse_distance, parse_point
+        reserved = {"distance", "distance_type", "boost", "validation_method", "_name", "ignore_unmapped"}
+        f = self._geo_field(body, path, reserved)
+        for k in ("validation_method", "_name", "ignore_unmapped"):
+            if k in body:
+                raise UnsupportedQuery(f"{path}.{k}", f"{k!r} is not supported")
+        if body.get("distance_type", "arc") != "arc":
+            raise UnsupportedQuery(f"{path}.distance_type", "only arc distances")
+        if "distance" not in body:
+            raise InvalidRequest(f"{path}.distance", "required")
+        try:
+            lat, lon = parse_point(body[f])
+            meters = parse_distance(body["distance"])
+        except BadGeo as e:
+            raise InvalidRequest(f"{path}.{f}", str(e)) from None
+        return QGeoDistance(f, lat, lon, meters, _num(body.get("boost", 1.0), f"{path}.boost"), path)
+
+    def q_geo_bounding_box(self, body, path):
+        from ..geo import BadGeo, parse_point
+        reserved = {"boost", "validation_method", "type", "_name", "ignore_unmapped"}
+        f = self._geo_field(body, path, reserved)
+        for k in ("validation_method", "type", "_name", "ignore_unmapped"):
+            if k in body:
+                raise UnsupportedQuery(f"{path}.{k}", f"{k!r} is not supported")
+        box = _obj(body[f], f"{path}.{f}")
+        try:
+            if {"top_left", "bottom_right"} == set(box):
+                top, left = parse_point(box["top_left"])
+                bottom, right = parse_point(box["bottom_right"])
+            elif {"top_right", "bottom_left"} == set(box):
+                top, right = parse_point(box["top_right"])
+                bottom, left = parse_point(box["bottom_left"])
+            elif {"top", "left", "bottom", "right"} == set(box):
+                top, left, bottom, right = (float(box[k]) for k in ("top", "left", "bottom", "right"))
+                parse_point({"lat": top, "lon": left}), parse_point({"lat": bottom, "lon": right})
+            else:
+                raise UnsupportedQuery(f"{path}.{f}", "top_left/bottom_right, top_right/bottom_left, or "
+                                                      "top/left/bottom/right (no wkt)")
+        except BadGeo as e:
+            raise InvalidRequest(f"{path}.{f}", str(e)) from None
+        if top < bottom:
+            raise InvalidRequest(f"{path}.{f}", f"top {top} is below bottom {bottom}")
+        return QGeoBox(f, top, left, bottom, right, _num(body.get("boost", 1.0), f"{path}.boost"), path)
 
     def q_exists(self, body, path):
         _keys(body, {"field", "boost"}, path)
@@ -458,7 +523,8 @@ class Parser:
     # ---- aggregations, sort, rescore
     AGG_KEYS = {"terms": {"field", "size"}, "min": {"field"}, "max": {"field"}, "avg": {"field"}, "sum": {"field"},
                 "stats": {"field"}, "value_count": {"field"}, "cardinality": {"field"},
-                "range": {"field", "ranges"}, "histogram": {"field", "interval", "offset", "min_doc_count"}}
+                "range": {"field", "ranges"}, "histogram": {"field", "interval", "offset", "min_doc_count"},
+                "nested": {"path"}}
 
     def aggs(self, body, path, depth=0):
         _obj(body, path)
@@ -474,6 +540,16 @@ class Parser:
                 raise InvalidRequest(p, "an aggregation has exactly one type")
             kind = kinds[0]
             subkey = "aggs" if "aggs" in spec else "aggregations" if "aggregations" in spec else None
+            if kind == "nested":                         # S9-5: a bucket of children; its sub-aggregations
+                t = spec[kind]                           # see the children (terms under it may nest one level)
+                _keys(t, {"path"}, f"{p}.nested")
+                if not isinstance(t.get("path"), str):
+                    raise InvalidRequest(f"{p}.nested.path", "required: the nested field")
+                if depth > 0:
+                    raise UnsupportedQuery(f"{p}.nested", "a nested aggregation at the top level only")
+                sub = self.aggs(spec[subkey], f"{p}.{subkey}", 0) if subkey else ()
+                out.append(Agg(name, t["path"], "nested", (), sub, p))
+                continue
             if subkey is not None and (kind != "terms" or depth > 0):
                 raise UnsupportedQuery(f"{p}.{subkey}", "sub-aggregations only under terms, one level")
             t = spec[kind]
@@ -516,6 +592,9 @@ class Parser:
             p = f"{path}[{i}]"
             if isinstance(it, str):
                 name, spec = it, {}
+            elif isinstance(it, dict) and len(it) == 1 and "_geo_distance" in it:
+                out.append(self._geo_sort(it["_geo_distance"], f"{p}._geo_distance"))
+                continue
             elif isinstance(it, dict) and len(it) == 1:
                 (name, spec), = it.items()
                 spec = {"order": spec} if isinstance(spec, str) else spec
@@ -531,6 +610,37 @@ class Parser:
                                                               "supported)")
             out.append(Sort(name, order, missing, p))
         return tuple(out)
+
+    def _geo_sort(self, spec, p):
+        """``_geo_distance`` sort (S9-4): {field: point, "order", "unit", "distance_type": "arc"}."""
+        from ..geo import UNITS, BadGeo, parse_point
+        reserved = {"order", "unit", "distance_type", "mode", "ignore_unmapped", "validation_method"}
+        _obj(spec, p)
+        for k in ("mode", "ignore_unmapped", "validation_method"):
+            if k in spec:
+                raise UnsupportedQuery(f"{p}.{k}", f"{k!r} is not supported")
+        if spec.get("distance_type", "arc") != "arc":
+            raise UnsupportedQuery(f"{p}.distance_type", "only arc distances")
+        fields = [k for k in spec if k not in reserved]
+        if len(fields) != 1:
+            raise InvalidRequest(p, "exactly one geo_point field")
+        f = fields[0]
+        pt = spec[f]
+        if isinstance(pt, list) and pt and isinstance(pt[0], (list, dict, str)):
+            if len(pt) != 1:
+                raise UnsupportedQuery(f"{p}.{f}", "one point (several points are not supported)")
+            pt = pt[0]
+        try:
+            lat, lon = parse_point(pt)
+        except BadGeo as e:
+            raise InvalidRequest(f"{p}.{f}", str(e)) from None
+        unit = spec.get("unit", "m")
+        if unit not in UNITS:
+            raise InvalidRequest(f"{p}.unit", f"one of {sorted(set(UNITS))}")
+        order = spec.get("order", "asc")
+        if order not in ("asc", "desc"):
+            raise InvalidRequest(f"{p}.order", "asc | desc")
+        return Sort("_geo_distance", order, "_last", p, (f, lat, lon, unit))
 
     def rescore(self, body):
         _keys(body, {"window_size", "s3_ranker"}, "rescore")

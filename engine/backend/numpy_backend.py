@@ -74,6 +74,15 @@ class NumpyBackend:
         """The minimum of all elements (a 0-d array)."""
         return np.asarray(a.min())
 
+    def sin(self, a):
+        return np.sin(a)
+
+    def cos(self, a):
+        return np.cos(a)
+
+    def arcsin(self, a):
+        return np.arcsin(a)
+
     def isnan(self, a):
         return np.isnan(a)
 
@@ -120,6 +129,16 @@ class NumpyBackend:
             np.add.at(out, keys, np.asarray(values, np.float32))
             return out
         return np.bincount(keys, weights=values, minlength=n).astype(np.float32)
+
+    def segment_max(self, keys, values, n, init=float("-inf")):
+        out = np.full(n, init, np.float64)
+        np.maximum.at(out, keys, np.asarray(values, np.float64))
+        return out
+
+    def segment_min(self, keys, values, n, init=float("inf")):
+        out = np.full(n, init, np.float64)
+        np.minimum.at(out, keys, np.asarray(values, np.float64))
+        return out
 
     def segment_count(self, keys, n):
         return np.bincount(keys, minlength=n).astype(np.int32)

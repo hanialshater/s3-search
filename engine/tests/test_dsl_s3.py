@@ -37,10 +37,10 @@ UNSUPPORTED = [
     ({"query": {"function_score": {"field_value_factor": {"field": "category"}}}},
      "query.function_score.field_value_factor.field"),
     ({"query": {"script_score": {"query": M, "script": {"source": "1"}}}}, "query.script_score"),
-    ({"query": {"nested": {"path": "x", "query": M}}}, "query.nested"),
+    ({"query": {"nested": {"path": "x", "query": M, "inner_hits": {}}}}, "query.nested.inner_hits"),
     ({"query": {"more_like_this": {"like": "x"}}}, "query.more_like_this"),
     ({"query": {"bool": {"must": [{"wildcard": {"product_title": "sh*"}}]}}}, "query.bool.must[0].wildcard"),
-    ({"query": {"bool": {"filter": {"geo_distance": {}}}}}, "query.bool.filter.geo_distance"),
+    ({"query": {"bool": {"filter": {"geo_polygon": {}}}}}, "query.bool.filter.geo_polygon"),
     # options outside the subset
     ({"query": {"match": {"product_title": {"query": "x", "fuzzy_rewrite": "x"}}}},
      "query.match.product_title.fuzzy_rewrite"),

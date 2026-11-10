@@ -27,6 +27,9 @@ class Mapping:
     source: bool = True                    # _meta.engine.source (S7-5): keep text fields' raw text, for highlight
     synonyms: dict = field(default_factory=dict)   # S7-6: analysed token -> tuple of alternatives (query time)
 
+    geo: dict = field(default_factory=dict)        # S9-4: geo_point fields
+    nested: dict = field(default_factory=dict)     # S9-5: path -> the children's mapping (a mapping of its own)
+
     def kind(self, name: str) -> str | None:
         if name in self.text:
             return "text"
@@ -36,6 +39,12 @@ class Mapping:
             return "numeric"
         if name in self.vector:
             return "vector"
+        if name in self.geo:
+            return "geo"
+        if name in self.nested:
+            return "nested"
+        if any(name.startswith(p + ".") for p in self.nested):
+            return "in_nested"
         return None
 
 
@@ -52,6 +61,9 @@ def parse_mapping(raw: dict) -> Mapping:
         raise InvalidMapping("properties", "required: a dict of fields")
     eng = (raw.get("_meta") or {}).get("engine") or {}
     text, keyword, numeric, vector = [], {}, {}, {}
+    geo_fields = {}
+    nested_fields = {}
+    eng_raw = (raw.get("_meta") or {}).get("engine") or {}
     for name, spec in props.items():
         path = f"properties.{name}"
         if not isinstance(spec, dict) or "type" not in spec:
@@ -70,6 +82,29 @@ def parse_mapping(raw: dict) -> Mapping:
             keyword[name] = {"source": name, "ignore_above": int(spec.get("ignore_above", 2 ** 31))}
         elif t in NUMERIC_TYPES:
             numeric[name] = NUMERIC_TYPES[t]
+        elif t == "nested":
+            sub = spec.get("properties")
+            for k in spec:
+                if k not in ("type", "properties"):
+                    raise InvalidMapping(f"{path}.{k}", "nested options are not supported")
+            if not isinstance(sub, dict) or not sub:
+                raise InvalidMapping(f"{path}.properties", "a nested field needs properties")
+            child_props = {}
+            for k, ks in sub.items():
+                if not isinstance(ks, dict) or ks.get("type") not in ("text", "keyword", *NUMERIC_TYPES):
+                    raise InvalidMapping(f"{path}.properties.{k}",
+                                         "nested properties are text, keyword or numeric (no nesting, vectors, geo)")
+                child_props[f"{name}.{k}"] = ks
+            child_props["_parent"] = {"type": "long"}
+            nested_fields[name] = {"_meta": {"engine": {"id_field": "_child_id",
+                                                        "positions": bool(eng_raw.get("positions", True)),
+                                                        "source": bool(eng_raw.get("source", True))}},
+                                   "properties": child_props}
+        elif t == "geo_point":
+            for k in spec:
+                if k != "type":
+                    raise InvalidMapping(f"{path}.{k}", "geo_point options are not supported")
+            geo_fields[name] = {}
         elif t == "knn_vector":
             dim = spec.get("dimension")
             if not isinstance(dim, int) or dim <= 0:
@@ -97,7 +132,7 @@ def parse_mapping(raw: dict) -> Mapping:
                    vector=vector, hot=hot, k1=float(bm25.get("k1", 1.2)), b=float(bm25.get("b", 0.75)),
                    embeddings=embeddings, dynamic=str(raw.get("dynamic", "true")).lower(),
                    positions=bool(eng.get("positions", True)), source=bool(eng.get("source", True)),
-                   synonyms=synonyms)
+                   synonyms=synonyms, geo=geo_fields, nested=nested_fields)
 
 
 def parse_synonyms(lines) -> dict:

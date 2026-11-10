@@ -58,6 +58,7 @@ class SegmentArrays:
     encoders: dict[str, dict] = field(default_factory=dict)   # vector field -> encoder arrays (terms, idf, components, dim)
     source: dict[str, np.ndarray] = field(default_factory=dict)  # S7-5, optional: text field -> object[N] raw text
     present: dict[str, np.ndarray] = field(default_factory=dict)  # optional: field -> uint32 bitmap, a stored value
+    nested: dict = field(default_factory=dict)    # S9-5: path -> the children's SegmentArrays (nested/<path>/)
 
     @property
     def n_docs(self) -> int:
@@ -143,6 +144,13 @@ def write_segment(seg: SegmentArrays, path) -> Path:
                          ).to_parquet(tmp / f"src/{f}.parquet", index=False)
     for rel, a in arrays.items():
         np.save(tmp / rel, np.ascontiguousarray(a), allow_pickle=False)
+    if seg.nested:
+        (tmp / "nested").mkdir()
+        for p, child in seg.nested.items():
+            import copy as _cp
+            c = _cp.copy(child)
+            c.manifest = dict(child.manifest)
+            write_segment(c, tmp / "nested" / p)
     files = {}
     for p in sorted(tmp.rglob("*")):
         if p.is_file():
@@ -158,6 +166,8 @@ def write_segment(seg: SegmentArrays, path) -> Path:
         m["source_fields"] = list(seg.source)
     if seg.present:
         m["present_fields"] = list(seg.present)
+    if seg.nested:
+        m["nested_fields"] = list(seg.nested)
     m.update(format=FORMAT, format_version=FORMAT_VERSION, n_docs=seg.n_docs, files=files, version=version,
              nbytes=sum(e["bytes"] for e in files.values()), device_nbytes=device_nbytes(seg),
              checksum=checksum, segment_id=f"seg-{version}-{checksum[:8]}")
@@ -216,6 +226,8 @@ def read_segment(path, verify: bool = True, mmap: bool = False) -> SegmentArrays
             seg.encoders[f] = {"terms": strings(f"vec/{f}.encoder.terms.parquet", "term"),
                                "idf": arr(f"vec/{f}.encoder.idf.npy"),
                                "components": arr(f"vec/{f}.encoder.components.npy"), "dim": spec["dim"]}
+    for p in m.get("nested_fields", []):                 # S9-5: the children, checked with the parent's files
+        seg.nested[p] = read_segment(path / "nested" / p, verify=False, mmap=mmap)
     for f in m.get("present_fields", []):                # optional: which docs have a value (exists)
         seg.present[f] = arr(f"present/{f}.npy")
     for f in m.get("source_fields", []):                 # optional (S7-5)

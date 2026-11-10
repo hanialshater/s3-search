@@ -177,6 +177,35 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
     for f, dt in m.numeric.items():
         series = catalogue[f] if f in catalogue.columns else pd.Series([None] * N, dtype=float)
         seg.numerics[f] = numeric_column(series, dt, pack_bits)
+    from .geo import BadGeo, encode_column, lat_col, lon_col
+    for f in m.geo:                                       # S9-4: Lucene's encoding, as hidden int32 columns
+        col = catalogue[f].tolist() if f in catalogue.columns else [None] * N
+        try:
+            lat_e, lon_e, miss = encode_column(col)
+        except BadGeo as e:
+            raise InvalidMapping(f"properties.{f}", f"a value is not a geo_point: {e}") from None
+        seg.numerics[lat_col(f)] = NumericColumn(values=lat_e, missing=pack_bits(miss))
+        seg.numerics[lon_col(f)] = NumericColumn(values=lon_e, missing=pack_bits(miss))
+    for path, child_raw in m.nested.items():              # S9-5: one row per nested object
+        col = catalogue[path].tolist() if path in catalogue.columns else [None] * N
+        rows = []
+        for d, objs in enumerate(col):
+            if _is_missing(objs) if not isinstance(objs, (list, tuple, np.ndarray, dict)) else False:
+                continue
+            objs = [objs] if isinstance(objs, dict) else list(objs)
+            if len(objs) >= 1 << 16:
+                raise InvalidMapping(f"properties.{path}", "at most 65,535 nested objects per document")
+            for i, o in enumerate(objs):
+                if not isinstance(o, dict):
+                    raise InvalidMapping(f"properties.{path}", f"row {d}: nested values are objects")
+                r = {f"{path}.{k}": v for k, v in o.items()}
+                r.update(_child_id=f"{ids[d]}\x1f{i}", _parent=d, _first_offset=(int(first_offset[d]) << 16) | i)
+                rows.append(r)
+        props = [k for k in child_raw["properties"] if k != "_parent"]
+        child = pd.DataFrame(rows, columns=["_child_id", "_parent", "_first_offset"] + props) if rows else \
+            pd.DataFrame({c: pd.Series([], dtype=object) for c in ["_child_id", "_first_offset"] + props}
+                         ).assign(_parent=pd.Series([], dtype="int64"), _first_offset=pd.Series([], dtype="int64"))
+        seg.nested[path] = build_segment(child, child_raw, version=version)
     vector_fields = {}
     for f, spec in m.vector.items():
         model = None
@@ -223,7 +252,8 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
         "version": int(version), "segment_id": f"seg-{int(version)}-{ident.hexdigest()[:8]}",
         "created": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "analyzer": ANALYZER_VERSION,
         "mapping": m.raw, "mapping_sha256": hashlib.sha256(raw.encode()).hexdigest(), "id_field": id_col,
-        "text_fields": list(m.text), "keyword_fields": list(m.keyword), "numeric_fields": dict(m.numeric),
+        "text_fields": list(m.text), "keyword_fields": list(m.keyword), "numeric_fields": {f: str(np.asarray(c.values).dtype) for f, c in seg.numerics.items()},
+        "geo_fields": list(m.geo), "nested_paths": list(m.nested),
         "vector_fields": vector_fields, "hot": list(m.hot), "bm25": {"k1": m.k1, "b": m.b},
     }
     return seg
@@ -335,6 +365,20 @@ def merge_segments(segs: list[SegmentArrays], mapping: dict | None = None, versi
     for s in segs:
         for f, e in s.encoders.items():
             out.encoders.setdefault(f, e)
+    for path in first.nested:                             # S9-5: children of live parents, re-pointed
+        import copy as _cp
+        kids = []
+        for k, s in enumerate(segs):
+            c = _cp.copy(s.nested[path])
+            c.numerics = dict(c.numerics)
+            par = np.asarray(c.numerics["_parent"].values, np.int64)
+            newp = new_of[k][par] if len(par) else par
+            live = nb.unpack_bits(np.asarray(c.live), c.n_docs) & (newp >= 0)
+            c.numerics["_parent"] = NumericColumn(values=np.where(newp >= 0, newp, 0).astype(np.int64),
+                                                  missing=c.numerics["_parent"].missing)
+            c.live = pack_bits(live)
+            kids.append(c)
+        out.nested[path] = merge_segments(kids, version=version)
     if all(s.present for s in segs):
         for f in first.present:
             col = np.zeros(N, bool)

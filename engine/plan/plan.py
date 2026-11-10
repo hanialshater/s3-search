@@ -14,7 +14,11 @@ from ..analysis import analyze, analyze_with_positions
 from ..dsl import ast as A
 from ..dsl.parse import parse, resolve_msm
 from ..errors import InvalidRequest, UnsupportedQuery
-from .nodes import Bool, Dense, Exists, FunctionScore, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+from .nodes import Bool, Dense, Exists, FunctionScore, GeoBox, GeoDistance, Nested, Ids, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+
+
+class _OutsideNested(Exception):
+    """A leaf names a field under a nested path outside a nested query: OpenSearch answers no docs."""
 
 
 class Planner:
@@ -23,6 +27,10 @@ class Planner:
 
     def _field(self, name, path, kinds):
         k = self.s.mapping.kind(name)
+        if k == "in_nested" and "in_nested" not in kinds:
+            if getattr(self, "_leaf", False):
+                raise _OutsideNested()
+            raise UnsupportedQuery(path, f"field {name!r} is under a nested path: use a nested query or aggregation")
         if k is None:
             raise InvalidRequest(path, f"unknown field {name!r}")
         if k not in kinds:
@@ -65,7 +73,21 @@ class Planner:
 
     # ---- queries
     def node(self, q):
-        return getattr(self, "n_" + type(q).__name__)(q)
+        if type(q).__name__ in ("QBool", "QHybrid", "QFunctionScore", "QNested"):
+            return getattr(self, "n_" + type(q).__name__)(q)
+        self._leaf = True
+        try:
+            return getattr(self, "n_" + type(q).__name__)(q)
+        except _OutsideNested:
+            return Ids((), 1.0, getattr(q, "path", "query"))      # matches nothing, as OpenSearch
+        finally:
+            self._leaf = False
+
+    def n_QNested(self, q):
+        if self.s.mapping.kind(q.path_name) != "nested":
+            raise InvalidRequest(f"{q.path}.path", f"{q.path_name!r} is not a nested field")
+        inner = Planner(self.s.nested[q.path_name]).node(q.query)
+        return Nested(q.path_name, inner, q.score_mode, q.boost, q.path)
 
     def _lexical(self, text, weights, operator, msm, boost, path):
         terms = tuple(dict.fromkeys(analyze(text)))
@@ -156,8 +178,18 @@ class Planner:
         return FunctionScore(self.node(q.query), tuple(fns), q.score_mode, q.boost_mode, q.max_boost, q.min_score,
                              q.boost, q.path)
 
+    def n_QGeoDistance(self, q):
+        self._field(q.field, f"{q.path}.{q.field}", ("geo",))
+        return GeoDistance(q.field, q.lat, q.lon, q.meters, q.boost, q.path)
+
+    def n_QGeoBox(self, q):
+        from ..geo import encode_lat, encode_lat_ceil, encode_lon, encode_lon_ceil
+        self._field(q.field, f"{q.path}.{q.field}", ("geo",))
+        return GeoBox(q.field, encode_lat_ceil(q.bottom), encode_lat(q.top), encode_lon_ceil(q.left),
+                      encode_lon(q.right), q.left > q.right, q.boost, q.path)
+
     def n_QExists(self, q):
-        self._field(q.field, f"{q.path}.field", ("text", "keyword", "numeric", "vector"))
+        self._field(q.field, f"{q.path}.field", ("text", "keyword", "numeric", "vector", "geo"))
         return Exists(q.field, q.boost, q.path)
 
     def n_QIds(self, q):
@@ -291,6 +323,11 @@ class Planner:
                   "cardinality": ("keyword", "numeric")}
 
     def agg(self, a: A.Agg) -> TermsAgg:
+        if a.kind == "nested":
+            if self.s.mapping.kind(a.field) != "nested":
+                raise InvalidRequest(f"{a.path}.nested.path", f"{a.field!r} is not a nested field")
+            child = Planner(self.s.nested[a.field])
+            return TermsAgg(a.name, a.field, 10, "nested", (), tuple(child.agg(x) for x in a.sub))
         kinds = self.AGG_FIELDS.get(a.kind, ("numeric",))
         self._field(a.field, f"{a.path}.{a.kind}.field", kinds)
         if a.kind not in ("terms", "value_count", "cardinality") and self.s.mapping.numeric.get(a.field) == "bool" \
@@ -300,6 +337,11 @@ class Planner:
                         tuple(self.agg(x) for x in a.sub))
 
     def sort_key(self, s: A.Sort) -> SortKey:
+        if s.geo is not None:
+            from ..geo import UNITS
+            f, lat, lon, unit = s.geo
+            self._field(f, f"{s.path}.{f}", ("geo",))
+            return SortKey("_geo_distance", s.order == "desc", True, (f, lat, lon, UNITS[unit]))
         if s.field not in ("_score", "_doc"):
             self._field(s.field, s.path, ("keyword", "numeric"))
         order = s.order or ("desc" if s.field == "_score" else "asc")

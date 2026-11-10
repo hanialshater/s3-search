@@ -221,3 +221,37 @@ def test_exists_counts_values_without_tokens(ds):
     for field, pid in (("product_description", cat["product_id"].iat[0]), ("product_color", cat["product_id"].iat[1])):
         r = idx.search({"query": {"bool": {"filter": [{"exists": {"field": field}}, {"ids": {"values": [pid]}}]}}})
         assert r["hits"]["total"] == 1, f"exists {field}: a value without tokens is not counted"
+
+
+# ---- S9-4 and S9-5: planted errors the brute-force checks must catch ---------------------------------------------------
+
+class _Rewriting:
+    def __init__(self, inner, fn):
+        self.inner, self.fn = inner, fn
+
+    def search(self, r):
+        return self.inner.search(self.fn(r))
+
+
+def _build_rewriting(fn):
+    def build(cat, mapping, device="cpu"):
+        return _Rewriting(api.build_index(cat, mapping, device=device), fn)
+    return build
+
+
+def _km_as_mi(r):
+    import json as _json
+    s = _json.dumps(r)
+    return _json.loads(s.replace('km"', 'mi"')) if "geo_distance" in s else r
+
+
+def _score_mode_sum(r):
+    import json as _json
+    s = _json.dumps(r)
+    return _json.loads(s.replace('"score_mode": "avg"', '"score_mode": "sum"').replace('"score_mode": "max"', '"score_mode": "sum"'))
+
+
+def test_geo_nested_checks_catch_planted_errors(ds):
+    from referee import s9_geo_nested_checks as gn
+    assert gn.check_geo(None, ds, build=_build_rewriting(_km_as_mi)), "a wrong distance unit must be caught"
+    assert gn.check_nested(None, ds, build=_build_rewriting(_score_mode_sum)), "a wrong score_mode must be caught"
