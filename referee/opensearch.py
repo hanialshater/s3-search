@@ -128,13 +128,26 @@ def _convert(resp, took_ms):
     hits = resp["hits"]
     total = hits["total"]["value"] if isinstance(hits["total"], dict) else hits["total"]
     out = {"hits": {"total": int(total), "hits": [
-        {"_id": h["_id"], "_score": h.get("_score"), **({"sort": h["sort"]} if "sort" in h else {})}
+        {"_id": h["_id"], "_score": h.get("_score"), **({"sort": h["sort"]} if "sort" in h else {}),
+         **({"highlight": h["highlight"]} if "highlight" in h else {})}
         for h in hits["hits"]]}, "took_ms": {"total": took_ms, "opensearch": float(resp.get("took", 0))}}
     if "aggregations" in resp:
-        # terms aggregations in the engine's shape; any other aggregation (outside the subset) passed through as is
-        out["aggregations"] = {k: ({"buckets": [{"key": b["key"], "doc_count": b["doc_count"]} for b in v["buckets"]],
-                                    "sum_other_doc_count": v.get("sum_other_doc_count", 0)} if "buckets" in v else v)
-                               for k, v in resp["aggregations"].items()}
+        out["aggregations"] = {k: _agg(v) for k, v in resp["aggregations"].items()}
+    return out
+
+
+def _agg(v):
+    """An aggregation as OpenSearch gives it, with `key_as_string` dropped from buckets and sub-aggregations kept;
+    terms aggregations keep `sum_other_doc_count` (0 when absent)."""
+    if not isinstance(v, dict) or "buckets" not in v:
+        return v
+    buckets = []
+    for b in v["buckets"]:
+        nb = {k: (_agg(x) if isinstance(x, dict) else x) for k, x in b.items() if k != "key_as_string"}
+        buckets.append(nb)
+    out = {"buckets": buckets}
+    if "sum_other_doc_count" in v or "doc_count_error_upper_bound" in v:
+        out["sum_other_doc_count"] = v.get("sum_other_doc_count", 0)
     return out
 
 
