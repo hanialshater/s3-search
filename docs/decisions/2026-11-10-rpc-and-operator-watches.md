@@ -22,3 +22,25 @@ record.
 
 **Limits.** One request at a time per connection (no multiplexing, no TLS, no auth): in-cluster use, like the HTTP port.
 Frames over 64 MB are refused with a named error.
+
+## The operator: watches and a Lease
+
+**Decision.** `deploy/s3operator/controller.py`: watches on `SearchIndex` and on the Deployments and Jobs the operator
+owns (label `managed-by=s3-operator`, mapped to their index by `search.s3.dev/index`) feed a de-duplicating queue; one
+worker reconciles; a resync (default 30 s) enqueues everything as the backstop, which also catches ConfigMap edits (not
+watched). Each watcher lists, then watches from the list's resourceVersion, and relists on error or 410.
+`deploy/s3operator/leader.py`: a `coordination.k8s.io/v1` Lease (`s3-operator`), client-go semantics: a candidate takes
+over after seeing the Lease unchanged for `lease_duration` by its own clock; the holder renews every `retry_period` and
+stops leading if it cannot renew for `renew_deadline`; flags default to 15 s, 10 s, 2 s; a clean stop releases the Lease.
+Only the leader runs a Controller (a new one per term). RBAC adds `watch` and the `leases` rule; the manifest runs 2 replicas.
+
+**Why.** Polling cost a few seconds of latency per change and listed everything every pass; watches make the reaction
+event-time (status changes of an owned Deployment or Job reconcile its index at once). Two replicas without election
+would both write; the Lease makes the standby idle. It is hand-written rather than a library because the stdlib client
+is the decision already taken (`2026-11-09-serving-and-operator.md`).
+
+**Measured (envtest, a real kube-apiserver, default timings; `deploy/tests/test_watches.py`, `test_leader.py`).**
+Spec change to status: p50 60 ms, max 150 ms (resync at 3600 s, so it is the watch). Job finish to status: 109 ms.
+Two replicas: every change reconciled by the leader only (18 reconciles on the leader, 0 on the standby), max 60 ms.
+Kill -9 of the leader: the standby held the Lease after 15.0 s and reconciled the next change 45 ms later. SIGTERM of the
+leader: handover in 1.1 s.
