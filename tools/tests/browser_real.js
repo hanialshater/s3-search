@@ -9,7 +9,7 @@ let PAGE;
   const [url, mode] = process.argv.slice(2);
   const browser = await chromium.launch();
   const page = PAGE = await browser.newPage();
-  page.setDefaultTimeout(8000);
+  page.setDefaultTimeout(30000);  // every wait is on a condition; this only bounds a hang on a loaded machine
   const bad = [], reqs = [];
   page.on("pageerror", (e) => bad.push(String(e)));
   page.on("response", async (r) => { if (r.request().method() === "POST" && r.status() >= 400) bad.push(r.status() + " " + (await r.text()).slice(0, 200)); });
@@ -42,7 +42,8 @@ let PAGE;
   // ---- autocomplete: match_bool_prefix on the title, highlighted, keyboard-selectable
   await page.click("#q");
   await page.type("#q", "run", { delay: 25 });
-  await page.waitForSelector("#suggest li");
+  // wait for the answer to the full text: the list for "r" or "ru" may be on screen first, and a later keystroke replaces it
+  await page.waitForFunction(() => window.__suggest && window.__suggest.text === "run" && document.querySelectorAll("#suggest li").length > 0);
   const sugg = await page.$$eval("#suggest li", (l) => l.map((x) => ({ t: x.textContent, marks: x.querySelectorAll("mark").length })));
   check(sugg.length > 0 && sugg.length <= 6 && sugg.every((s) => s.marks > 0), "suggestions with highlights: " + JSON.stringify(sugg.slice(0, 2)));
   check(sugg.every((s) => !/[⟦⟧]/.test(s.t)), "raw highlight markers leaked into suggestions");

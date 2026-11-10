@@ -26,7 +26,7 @@ N = 1500
 EARTH_M = 6371008.7714
 
 
-def _node(*args, timeout=90):
+def _node(*args, timeout=240):
     node = shutil.which("node")
     if not node:
         pytest.skip("node not available")

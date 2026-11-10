@@ -90,30 +90,49 @@ def catalogue(n: int | None = None, fields: bool = False, geo: bool = False):
 class Stack:
     def __init__(self, n_products: int | None = 4000, fields: bool = False, geo: bool = False, name: str = "esci-sample",
                  port: int | None = None, cores: str | None = None):
-        self.name, self.port = name, port or free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
+        self.name = name
         self.work = Path(tempfile.mkdtemp(prefix="tools-stack-"))
         cat, mapping = catalogue(n_products, fields, geo)
         cat.to_parquet(self.work / "catalogue.parquet", index=False)
-        cmd = [sys.executable, "-m", "serving", "--data-dir", str(self.work / "serving"), "--port", str(self.port),
-               "--device", "cpu"]
-        if cores:
-            cmd = ["taskset", "-c", cores] + cmd
-        self.proc = subprocess.Popen(cmd, cwd=ROOT, env={**os.environ, "S3_SEARCH_DEVICE": "cpu"},
-                                     stdout=subprocess.DEVNULL, stderr=open(self.work / "serving.log", "w"))
+        self.proc = None
         try:
-            for _ in range(300):
-                try:
-                    self.call("GET", "/healthz")
-                    break
-                except OSError:
-                    time.sleep(0.1)
-            else:
-                raise RuntimeError("serving did not start: " + (self.work / "serving.log").read_text()[-500:])
+            self._start(port, cores)
             self.call("PUT", f"/indexes/{name}", {"mapping": mapping, "source": {"path": str(self.work / "catalogue.parquet")}})
         except BaseException:
             self.close()
             raise
+
+    def _start(self, port, cores, attempts: int = 5, deadline_s: float = 180.0) -> None:
+        """Start serving and wait until it answers. A free port found by binding and closing can be taken by another
+        process before serving binds it (or by a neighbour's test): then serving exits at once, and the wait notices
+        that (it watches the process, not a fixed count of tries) and starts again on a new port."""
+        last = ""
+        for _ in range(1 if port else attempts):
+            self.port = port or free_port()
+            self.base = f"http://127.0.0.1:{self.port}"
+            cmd = [sys.executable, "-m", "serving", "--data-dir", str(self.work / "serving"), "--port", str(self.port),
+                   "--device", "cpu"]
+            if cores:
+                cmd = ["taskset", "-c", cores] + cmd
+            log = self.work / "serving.log"
+            self.proc = subprocess.Popen(cmd, cwd=ROOT, env={**os.environ, "S3_SEARCH_DEVICE": "cpu"},
+                                         stdout=subprocess.DEVNULL, stderr=open(log, "w"))
+            t0 = time.time()
+            while time.time() - t0 < deadline_s:
+                if self.proc.poll() is not None:  # exited: most likely the port was taken
+                    last = log.read_text()[-500:]
+                    break
+                try:
+                    self.call("GET", "/healthz", timeout=5)
+                    if self.proc.poll() is None:  # the answer came from our process, not a stranger on the port
+                        return
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            else:
+                self.proc.kill()
+                raise RuntimeError(f"serving did not answer within {deadline_s:.0f} s: " + log.read_text()[-500:])
+        raise RuntimeError("serving did not start: " + last)
 
     def call(self, method: str, path: str, body=None, timeout: float = 600):
         data = None if body is None else json.dumps(body).encode()
@@ -126,6 +145,8 @@ class Stack:
         return self.call("POST", f"/indexes/{self.name}/_search", request)
 
     def close(self) -> None:
+        if self.proc is None:
+            return
         self.proc.terminate()
         try:
             self.proc.wait(10)
