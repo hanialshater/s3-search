@@ -221,3 +221,37 @@ def test_http_content_length_and_chunked_bodies(app):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_real_engine_and_dataplane_bulk(tmp_path):
+    """The real intake rejections and the real store: named reasons, hot patch, delete, refresh=true shows the upsert."""
+    pytest.importorskip("engine.api")
+    pytest.importorskip("dataplane.kv")
+    from pathlib import Path
+    from serving.ports import default_ports
+    deploy = Path(__file__).resolve().parents[2] / "deploy" / "samples"
+    mapping = json.loads((deploy / "toy-mapping.json").read_text())
+    a = create_app(ServingConfig(data_dir=str(tmp_path / "d"), refresh_interval="-1"), default_ports())
+    try:
+        src = {"path": str(deploy / "toy-products.jsonl")}
+        r = a.handle("PUT", "/indexes/toy", json.dumps({"mapping": mapping, "source": src}).encode())
+        assert r.status == 200, r.body
+        body = nd({"index": {"_id": "NEW1"}}, {"product_id": "NEW1", "product_title": "zebra striped umbrella", "price": 4.5, "stock": 2},
+                  {"index": {"_id": "NEW2"}}, {"product_id": "NEW2", "product_title": "bad", "price": "cheap"},
+                  {"index": {"_id": "NEW3"}}, {"product_id": "NEW3", "no_such_field": 1},
+                  {"update": {"_id": "T0001"}}, {"doc": {"price": 1.25}},
+                  {"update": {"_id": "T0002"}}, {"doc": {"product_color": "magenta"}},
+                  {"delete": {"_id": "T0003"}}, {"create": {"_id": "T0004"}}, {"product_id": "T0004", "product_title": "x"})
+        r = a.handle("POST", "/indexes/toy/_bulk?refresh=true", body)
+        out = r.json()
+        assert r.status == 200 and out["forced_refresh"] is True, out
+        got = [(op, b["status"], (b.get("error") or {}).get("s3_reason"))
+               for op, b in (next(iter(i.items())) for i in out["items"])]
+        assert got == [("index", 201, None), ("index", 400, "bad_type"), ("index", 400, "unknown_field"), ("update", 200, None),
+                       ("update", 200, None), ("delete", 200, None), ("create", 409, None)], got
+        q = b'{"query": {"match": {"product_title": "zebra umbrella"}}}'
+        hits = a.handle("POST", "/indexes/toy/_search", q).json()
+        assert [h["_id"] for h in hits["hits"]["hits"]] == ["NEW1"]
+        assert a.manager.get("toy").lag() == 0
+    finally:
+        a.close()

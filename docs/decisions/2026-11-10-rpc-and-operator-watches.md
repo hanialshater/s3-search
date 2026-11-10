@@ -44,3 +44,14 @@ Spec change to status: p50 60 ms, max 150 ms (resync at 3600 s, so it is the wat
 Two replicas: every change reconciled by the leader only (18 reconciles on the leader, 0 on the standby), max 60 ms.
 Kill -9 of the leader: the standby held the Lease after 15.0 s and reconciled the next change 45 ms later. SIGTERM of the
 leader: handover in 1.1 s.
+
+## _bulk and refresh (S8-6)
+
+**Decision.** `POST _bulk` streams NDJSON through `serving/bulk.py` in chunks (default 2000 actions) into
+`dataplane.intake.apply_changes`; the refresh is a hook (`Ports.refresh`) that is a full rebuild until S8-4 provides
+deltas; the background refresher keeps at least 4x the last refresh's cost between refreshes in rebuild mode, so a stream
+of writes cannot keep the index rebuilding more than 20% of the time. **Why a chunk and not the whole body:** a 66 MB body
+is not held in memory, the store's batches stay small, and visibility of patches and deletes follows each chunk.
+**Measured** (2 cores via `taskset`, over HTTP, `python -m serving.bench_bulk`): 48,439 documents (plus a 200-document seed
+index = ESCI-sample's 48,639) in 2.9 to 5.9 s over 6 runs (8,200 to 16,600 docs/s; the 5.9 s run was the first, cold), 0 errors; a following full-rebuild
+refresh 18.7 s.
