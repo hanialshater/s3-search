@@ -14,7 +14,7 @@ from ..analysis import analyze, analyze_with_positions
 from ..dsl import ast as A
 from ..dsl.parse import parse, resolve_msm
 from ..errors import InvalidRequest, UnsupportedQuery
-from .nodes import Bool, Dense, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
+from .nodes import Bool, Dense, LexicalGroups, Phrase, Hybrid, Lexical, MatchAll, Plan, Range, Rescore, SortKey, Term, TermsAgg
 
 
 class Planner:
@@ -61,6 +61,69 @@ class Planner:
         idf = "field" if sum(1 for _, w in fw if w > 0) == 1 else "global"
         return Lexical(fw, terms, min(need, n), idf, boost, path)
 
+    def _ordered(self, weights):
+        order = self.s.field_index
+        fw = tuple(sorted(weights.items(), key=lambda x: order[x[0]]))
+        return fw, ("field" if sum(1 for _, w in fw if w > 0) == 1 else "global")
+
+    def _fuzzy_lexical(self, text, weights, operator, msm, fz, boost, path):
+        """match / multi_match with fuzziness: one group per analysed query term, its expansions in the queried
+        fields' terms dictionary."""
+        from ..dictionary import auto_edits, field_mask, text_dictionary
+        toks = list(dict.fromkeys(analyze(text)))
+        edits = [auto_edits(fz.fuzziness, t, f"{path}.fuzziness") for t in toks]
+        if not any(edits):
+            return None                                   # no edits anywhere: a plain match
+        d = text_dictionary(self.s)
+        allowed = field_mask(self.s, [f for f, w in weights.items() if w > 0])
+        groups = tuple(tuple(d.terms[i] for i in d.fuzzy(t, e, fz.prefix_length, fz.max_expansions,
+                                                         fz.transpositions, allowed)) for t, e in zip(toks, edits))
+        n = len(groups)
+        need = n if operator == "and" else max(1, resolve_msm(msm, n))
+        fw, idf = self._ordered(weights)
+        return LexicalGroups(fw, groups, ("sum",) * n, min(need, n), idf, boost, path)
+
+    def n_QFuzzy(self, q):
+        from ..dictionary import auto_edits, field_mask, keyword_dictionary, text_dictionary
+        p = f"{q.path}.{q.field}"
+        kind = self._field(q.field, p, ("text", "keyword"))
+        value = str(q.value)                              # term-level: not analysed (as OpenSearch)
+        fz = q.fuzzy
+        e = auto_edits(fz.fuzziness, value, f"{p}.fuzziness")
+        if kind == "keyword":
+            kd = keyword_dictionary(self.s.keywords[q.field])
+            vals = tuple(kd.terms[i] for i in kd.fuzzy(value, e, fz.prefix_length, fz.max_expansions,
+                                                       fz.transpositions))
+            return Term(q.field, vals, q.boost, q.path)
+        d = text_dictionary(self.s)
+        terms = tuple(d.terms[i] for i in d.fuzzy(value, e, fz.prefix_length, fz.max_expansions, fz.transpositions,
+                                                   field_mask(self.s, [q.field])))
+        return LexicalGroups(((q.field, 1.0),), (terms,), ("sum",), 1, "field", q.boost, q.path)
+
+    def n_QPrefix(self, q):
+        from ..dictionary import field_mask, text_dictionary
+        p = f"{q.path}.{q.field}"
+        kind = self._field(q.field, p, ("text", "keyword"))
+        if kind == "keyword":                             # every value that starts with it: a code range
+            return Range(q.field, q.value, q.value + "\U0010ffff", True, False, q.boost, q.path)
+        d = text_dictionary(self.s)
+        terms = tuple(d.terms[i] for i in d.prefix(q.value, field_mask(self.s, [q.field])))
+        return LexicalGroups(((q.field, 1.0),), (terms,), ("const",), 1, "field", q.boost, q.path)
+
+    def n_QMatchBoolPrefix(self, q):
+        from ..dictionary import field_mask, text_dictionary
+        self._field(q.field, q.path, ("text",))
+        toks = analyze(q.query)
+        if not toks:
+            return LexicalGroups(((q.field, 1.0),), (), (), 0, "field", q.boost, q.path)
+        d = text_dictionary(self.s)
+        last = tuple(d.terms[i] for i in d.prefix(toks[-1], field_mask(self.s, [q.field]), q.max_expansions))
+        groups = tuple((t,) for t in toks[:-1]) + (last,)
+        n = len(groups)
+        need = n if q.operator == "and" else max(1, resolve_msm(q.msm, n))
+        return LexicalGroups(((q.field, 1.0),), groups, ("sum",) * (n - 1) + ("const",), min(need, n), "field",
+                             q.boost, q.path)
+
     def n_QMatchAll(self, q):
         return MatchAll(q.boost, q.path)
 
@@ -70,6 +133,10 @@ class Planner:
             return Term(q.field, (str(q.query),), q.boost, q.path)
         if kind == "numeric":
             return Term(q.field, (self._numeric_value(q.field, q.query, q.path),), q.boost, q.path)
+        if q.fuzzy.fuzziness is not None:
+            g = self._fuzzy_lexical(str(q.query), {q.field: 1.0}, q.operator, q.msm, q.fuzzy, q.boost, q.path)
+            if g is not None:
+                return g
         return self._lexical(str(q.query), {q.field: 1.0}, q.operator, q.msm, q.boost, q.path)
 
     def n_QMatchPhrase(self, q):
@@ -93,6 +160,13 @@ class Planner:
             for i, (f, w) in enumerate(q.fields):
                 self._field(f, f"{q.path}.fields[{i}]", ("text",))
                 weights[f] = 1.0 if w is None else w
+        if q.fuzzy.fuzziness is not None:
+            if q.type == "cross_fields":
+                raise InvalidRequest(f"{q.path}.fuzziness", "fuzziness is not allowed for type cross_fields "
+                                                            "(as OpenSearch)")
+            g = self._fuzzy_lexical(q.query, weights, q.operator, q.msm, q.fuzzy, q.boost, q.path)
+            if g is not None:
+                return g
         return self._lexical(q.query, weights, q.operator, q.msm, q.boost, q.path)
 
     def n_QBool(self, q):

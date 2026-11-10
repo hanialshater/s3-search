@@ -26,7 +26,8 @@ def make(tmp_path):
 
     def _make(**kw):
         ports = kw.pop("ports", None) or fake_ports()
-        cfg = ServingConfig(data_dir=str(tmp_path / "data"), max_wait_ms=kw.pop("max_wait_ms", 20.0), **kw)
+        cfg = ServingConfig(data_dir=str(tmp_path / "data"), max_wait_ms=kw.pop("max_wait_ms", 20.0),
+                            refresh_interval=kw.pop("refresh_interval", "-1"), **kw)
         app = create_app(cfg, ports)
         made.append(app)
         return app, ports

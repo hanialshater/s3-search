@@ -16,6 +16,20 @@ class Lexical:
 
 
 @dataclass(frozen=True)
+class LexicalGroups:
+    """Clause groups (S7-2, S7-6): each group is a tuple of alternative analysed terms that count as one clause
+    for ``msm``; ``modes[g]`` is "sum" (fuzzy expansions), "synonym" (one term, Lucene's SynonymQuery) or "const"
+    (a prefix: 1.0 where present)."""
+    fields: tuple
+    groups: tuple
+    modes: tuple
+    msm: int
+    idf: str
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
 class Phrase:
     field: str
     slots: tuple             # per slot, its alternative analysed terms (one term, or a synonym set)
@@ -80,7 +94,7 @@ class Hybrid:
     path: str = "query"
 
 
-Node = Union[Lexical, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
+Node = Union[Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,48 @@ from __future__ import annotations
 MAX_POSTINGS_PER_CHUNK = 30_000_000
 
 
+def bm25f_groups(b, st, groups, modes, w, bb, k1: float, idf, group_idf=None):
+    """Score clause groups (S7-2, S7-6): each group is a list of alternative term ids that count as one clause.
+
+    ``modes[g]``: ``"sum"``: the BM25F scores of the group's terms add (expansions of a fuzzy term); ``"synonym"``:
+    the group is one term (Lucene's SynonymQuery): pseudo-tfs add before saturation, with ``group_idf[g]`` (the
+    caller passes the group's lowest idf, i.e. the highest df); ``"const"``: 1.0 where any term is present (a prefix). ``idf``: float32[V] or a field column.
+    Returns ``(scores f32[G,N], present bool[G,N])``: a doc's score per group, and whether the group matched."""
+    G, N = len(groups), st.N
+    scores = b.zeros(G * N, "float32")
+    present = b.zeros(G * N, "int32")
+    owners = [g for g, ts in enumerate(groups) for _ in ts]
+    rows = [t for ts in groups for t in ts]
+    if not rows or N == 0:
+        return scores.reshape(G, N), present.reshape(G, N) > 0
+    w, bb = b.asarray(w, "float32"), b.asarray(bb, "float32")
+    q_of, entry = b.csr_expand(st.term_ptr, rows, owners)
+    t_rep = b.csr_expand(st.term_ptr, rows, rows)[0]
+    docs = st.doc_ids[entry]
+    tf = b.astype(st.tf[entry], "float32")
+    norm = (1.0 - bb) + bb * st.rel_len[docs]
+    norm = b.where(norm > 1e-6, norm, 1e-6)
+    ptf = b.sum(w * tf / norm, axis=1)
+    keys = q_of * N + docs
+    hit = ptf > 0
+    present = present + b.segment_count(keys[hit], G * N)
+    mode_of = b.asarray([{"sum": 0, "synonym": 1, "const": 2}[m] for m in modes], "int64")[q_of]
+    s_sum = (mode_of == 0) & hit
+    if "sum" in modes:
+        imp = idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf)
+        scores = scores + b.segment_sum(keys[s_sum], imp[s_sum], G * N)
+    s_syn = (mode_of == 1) & hit
+    if "synonym" in modes:
+        P = b.segment_sum(keys[s_syn], ptf[s_syn], G * N)
+        gi = b.asarray(group_idf, "float32").reshape(G, 1) + b.zeros((G, N), "float32")
+        syn = b.where(P > 0, gi.reshape(-1) * P * (k1 + 1.0) / (k1 + P), 0.0)
+        scores = scores + syn
+    present = present.reshape(G, N) > 0
+    const = b.asarray([m == "const" for m in modes], "bool").reshape(G, 1)
+    scores = b.where(const & present, 1.0, scores.reshape(G, N))
+    return scores, present
+
+
 def bm25f(b, st, terms, w, bb, k1: float, idf):
     """Score every document for a batch of queries.
 

@@ -324,30 +324,28 @@ def check_knn(index, ds):
                     assert {got[i]["_id"] for i in grp} == {exp[i]["_id"] for i in grp}, f"knn k={k}: tie group"
 
 
-UNSUPPORTED = [
-    ({"query": {"fuzzy": {"product_title": "lamp"}}}, "fuzzy"),
-    ({"query": {"wildcard": {"product_title": "la*"}}}, "wildcard"),
-    ({"query": {"query_string": {"query": "lamp"}}}, "query_string"),
-    ({"query": {"bool": {"must": [{"match_phrase": {"product_title": "red lamp"}}]}}}, "match_phrase"),
-    ({"query": {"match_all": {}}, "highlight": {"fields": {"product_title": {}}}}, "highlight"),
-    ({"query": {"match_all": {}}, "aggs": {"h": {"histogram": {"field": "price", "interval": 10}}}}, "histogram"),
-    ({"query": {"match_all": {}}, "collapse": {"field": "category"}}, "collapse"),
-]
 INVALID = [
     ({"query": {"match_all": {}}, "from": 9_995, "size": 10}, "from + size over 10,000"),
     ({"query": {"match_all": {}}, "size": "ten"}, "size not an int"),
 ]
 
 
-def check_errors(index, api):
-    """Anything outside the subset raises UnsupportedQuery naming its path; malformed requests raise InvalidRequest."""
-    for req, key in UNSUPPORTED:
+def check_errors(index, api, honor_landed=True):
+    """Everything referee/scope.py says must be refused raises UnsupportedQuery naming its path (outside S7, and S7
+    items not marked landed); malformed requests raise InvalidRequest. The table is the only list."""
+    from referee import scope
+    problems = []
+    for name, item, _, frag, req in scope.must_refuse(honor_landed):
         try:
             index.search(req)
         except api.UnsupportedQuery as e:
-            assert key in str(getattr(e, "path", "")), f"{key}: the error's path {getattr(e, 'path', None)!r}"
+            if frag not in str(getattr(e, "path", "")):
+                problems.append(f"{name}: refused, but the error's path {getattr(e, 'path', None)!r} does not name {frag!r}")
         else:
-            raise AssertionError(f"{key}: no UnsupportedQuery")
+            problems.append(f"{name}: answered, not refused" + (
+                f" ({item} is not marked landed in referee/scope.py: the steward marks it when it lands)" if item else
+                " (outside S7: must stay refused)"))
+    assert not problems, "; ".join(problems)
     for req, what in INVALID:
         try:
             index.search(req)
@@ -355,6 +353,19 @@ def check_errors(index, api):
             pass
         else:
             raise AssertionError(f"{what}: no InvalidRequest")
+
+
+def check_landed_are_answered(index, api):
+    """Every construct referee/scope.py marks landed is answered (not refused). Correctness is S7-9's conformance."""
+    from referee import scope
+    problems = []
+    for name, item, _, _, req in scope.landed():
+        try:
+            r = index.search(req)
+            assert isinstance(r.get("hits", {}).get("total"), int), "no hits.total"
+        except api.UnsupportedQuery as e:
+            problems.append(f"{name} ({item}) is marked landed in referee/scope.py but is refused at {e.path!r}")
+    assert not problems, "; ".join(problems)
 
 
 def check_response_shape_and_determinism(index, ds):

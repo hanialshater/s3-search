@@ -101,5 +101,5 @@ is searchable only after a full rebuild. Predictions are in the lab's `company/m
 | S8-3 | Build speed: back under 10 s on ESCI-sample with positions | architect | open | |
 | S8-4 | Data plane: delta segments from the change log every refresh interval, a tiered merge policy, the updater swapping deltas in and merges out | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
 | S8-5 | Intake speed: at least 20,000 docs/s lexical, the encoder fit under 10 s | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
-| S8-6 | `POST _bulk` (NDJSON), refresh interval and index-lag metrics | platform-engineer | open | |
+| S8-6 | `POST _bulk` (NDJSON), refresh interval and index-lag metrics | platform-engineer | in review | platform-engineer 2026-11-10 |
 | S8-7 | The write-stream judge: 200 upserts/s, visibility, equality with a rebuild, query p99 under writes | evaluation-steward | open | |
