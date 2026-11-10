@@ -267,7 +267,7 @@ def _report_on(results_path, run_path, work, tag):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = report.main([str(results_path), "--out", str(work / f"report-{tag}.html"), "--recompute-run",
-                            str(run_path), "--data-dir", str(loader.SAMPLE_DIR)])
+                            str(run_path), "--dataset", "esci-sample"])  # the tool's flag since the S5 fix
     return {"exit_code": code, "output": buf.getvalue().strip().splitlines()[-12:]}
 
 
@@ -446,9 +446,174 @@ def judge_s5b(out_path, variant="esci-sample"):
     return res
 
 
+# ---- re-runs after the fixes (2026-11-10) ---------------------------------------------------------------------------
+
+def _tree_ok(node, tol=1e-4):
+    """The judge's own arithmetic over an explain tree: sum/product/max/ranker nodes against their details."""
+    kids = node.get("details") or []
+    op = node.get("op")
+    v = float(node["value"])
+    close = lambda a, b: abs(a - b) <= tol * max(1.0, abs(b))  # noqa: E731
+    if op in ("sum", "ranker"):
+        ok = close(v, sum(float(k["value"]) for k in kids)) if kids else True
+    elif op == "product":
+        ok = close(v, float(np.prod([float(k["value"]) for k in kids]))) if kids else True
+    elif op == "max":
+        ok = close(v, max(float(k["value"]) for k in kids)) if kids else True
+    else:
+        ok = op == "value"
+    return ok and all(_tree_ok(k, tol) for k in kids if k.get("op") != "value" or k.get("details"))
+
+
+def judge_s5a_rerun(out_path):
+    import engine.api as api
+    from referee import reference
+    from tools import explain
+    from tools.common import engine_search, text_request
+
+    res = {"kind": "judge-s5a-rerun", "label": "CPU, development only", "dataset": "esci-sample"}
+    close = lambda a, b: abs(a - b) <= 1e-4 * max(1.0, abs(b))  # noqa: E731
+    ds = loader.load_dataset("esci-sample")
+    work = Path(tempfile.mkdtemp(prefix="judge-s5a2-"))
+    index = api.build_index(ds.catalogue, ds.mapping, device="cpu")
+    queries = ds.fit[["query_id", "query"]].drop_duplicates("query_id").reset_index(drop=True)
+    judg = loader.fit_judgments(ds)
+
+    # (1) the bench's default run (k=100) and the report recomputing it
+    runs = {}
+    r = bench.run(ds, queries, judg, api, index=index, k=100, latency_queries=200, runs_out=runs)
+    rp, run_p = work / "results.json", work / "run.jsonl"
+    rp.write_text(json.dumps(r, indent=1) + "\n")
+    run_p.write_text("".join(json.dumps({"query_id": q, "ids": ids}) + "\n" for q, ids in runs.items()))
+    rep = _report_on(rp, run_p, work, "k100")
+    rep["referee_quality"] = r["quality"]
+    res["report"] = rep
+    print(f"S5-a re-run, report (bench default k=100): exit {rep['exit_code']}; {rep['output'][-1]}", flush=True)
+
+    rng = np.random.default_rng(HOT_SEED + 7)
+    sample_q = [str(t) for t in queries["query"].iloc[np.sort(rng.choice(len(queries), 200, replace=False))]]
+
+    # (2) 100 lexical explanations
+    ref = reference.build_index(ds.catalogue, ds.mapping)
+    pairs = []
+    for q in sample_q[:100]:
+        req = {**text_request(q, size=100), "explain": True}
+        resp = index.search(req)
+        pairs += [(req, h, e) for h, e in zip(resp["hits"]["hits"], resp["explain"])]
+    lex = {"n": 0, "tree_arithmetic": 0, "root_is_score": 0, "score_is_reference": 0}
+    ref_cache = {}
+    for i in np.random.default_rng(HOT_SEED + 8).permutation(len(pairs))[:100]:
+        req, h, e = pairs[i]
+        key = json.dumps(req["query"], sort_keys=True)
+        if key not in ref_cache:
+            rr = ref.search({"query": req["query"], "size": 10_000})
+            ref_cache[key] = {x["_id"]: x["_score"] for x in rr["hits"]["hits"]}
+        lex["n"] += 1
+        lex["tree_arithmetic"] += _tree_ok(e)
+        lex["root_is_score"] += close(float(e["value"]), float(h["_score"]))
+        lex["score_is_reference"] += close(float(h["_score"]), float(ref_cache[key].get(h["_id"], float("nan"))))
+    res["explain_lexical"] = lex
+
+    # (3) 100 rescored explanations (base + per-feature contributions)
+    from engine.rank.features import feature_names_for  # noqa: F401  (names come from the tree)
+    from engine.rank.train import train_ranker
+    model = train_ranker(index, ds.fit, lambda q: text_request(q), window=200, max_queries=300)
+    index.add_ranker("judge", model)
+    resc = {"n": 0, "base_plus_contrib_is_score": 0, "root_is_score": 0, "predict_on_tree_features_is_score": 0,
+            "nodes_per_tree": None}
+    rpairs = []
+    for q in sample_q[100:150]:
+        req = {**text_request(q, size=100), "rescore": {"window_size": 100, "s3_ranker": {"model": "judge"}},
+               "explain": True}
+        resp = index.search(req)
+        rpairs += [(h, e) for h, e in zip(resp["hits"]["hits"], resp["explain"])]
+    bad = []
+    for i in np.random.default_rng(HOT_SEED + 9).permutation(len(rpairs))[:100]:
+        h, e = rpairs[i]
+        kids = e.get("details") or []
+        feats = [k for k in kids if "feature" in k]
+        resc["n"] += 1
+        resc["nodes_per_tree"] = len(kids)
+        s = float(h["_score"])
+        ok1 = e.get("op") == "ranker" and close(sum(float(k["value"]) for k in kids), s)
+        ok2 = close(float(e["value"]), s)
+        x = np.array([[np.nan if k["feature_value"] is None else k["feature_value"] for k in feats]], np.float32)
+        ok3 = close(float(model.predict(x)[0]), s)
+        resc["base_plus_contrib_is_score"] += ok1
+        resc["root_is_score"] += ok2
+        resc["predict_on_tree_features_is_score"] += ok3
+        if not (ok1 and ok2 and ok3) and len(bad) < 3:
+            bad.append({"_id": h["_id"], "score": s, "root": e["value"], "sum": sum(float(k["value"]) for k in kids)})
+    resc["examples_failing"] = bad
+    res["explain_rescored"] = resc
+    # the maker's tool, for information
+    res["tool_sample_check_lexical"] = {k: v for k, v in explain.sample_check(engine_search(index), sample_q[:100],
+                                                                               n=100, seed=1).items() if k != "failures"}
+    all_lex = lex["tree_arithmetic"] == lex["root_is_score"] == lex["score_is_reference"] == lex["n"] == 100
+    all_res = resc["base_plus_contrib_is_score"] == resc["root_is_score"] == resc["n"] == 100
+    res["verdict"] = "held" if rep["exit_code"] == 0 and all_lex and all_res else "wrong"
+    print(f"S5-a re-run, lexical: {lex}", flush=True)
+    print(f"S5-a re-run, rescored: { {k: v for k, v in resc.items() if k != 'examples_failing'} }", flush=True)
+    print(f"S5-a re-run, the tool's own sample_check: {res['tool_sample_check_lexical']} -> {res['verdict']}",
+          flush=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps(res, indent=1, default=str) + "\n")
+    return res
+
+
+def judge_s2_neural(out_path):
+    """S2 re-run: a data-plane segment of encoder-made vectors answers neural queries, and its top 100 for 500 fit
+    queries equal engine.api.build_index's on the same catalogue."""
+    import engine.api as api
+    from dataplane import indexer, intake
+    from dataplane.kv import Store
+    res = {"kind": "judge-s2-neural", "label": "CPU, development only", "dataset": "esci-sample"}
+    ds = loader.load_dataset("esci-sample")
+    m = copy.deepcopy(ds.mapping)
+    m["properties"]["embedding"] = {"type": "knn_vector", "dimension": 128,
+                                    "method": {"name": "hnsw", "space_type": "cosinesimil", "engine": "lucene"}}
+    m["_meta"]["engine"]["embeddings"] = {"embedding": {"model": "tfidf-svd-128",
+                                                        "inputs": ["product_title", "product_brand", "product_color"]}}
+    work = Path(tempfile.mkdtemp(prefix="judge-s2n-"))
+    src = work / "c.parquet"
+    ds.catalogue.to_parquet(src, index=False)
+    st = Store(work / "s.sqlite", m)
+    t = time.perf_counter()
+    rep = intake.ingest(src, m, st, work / "rej.jsonl")
+    res["ingest"] = {"s": time.perf_counter() - t, "report": repr(rep)}
+    t = time.perf_counter()
+    seg = indexer.build(st, m, work / "seg")
+    res["reindex_s"] = time.perf_counter() - t
+    res["segment_vector_fields"] = json.loads((seg / "manifest.json").read_text()).get("vector_fields")
+    a = api.Index.from_segment(seg)
+    t = time.perf_counter()
+    b = api.build_index(ds.catalogue, m)
+    res["engine_build_index_s"] = time.perf_counter() - t
+    q = ds.fit[["query_id", "query"]].drop_duplicates("query_id")
+    rng = np.random.default_rng(HOT_SEED + 10)
+    texts = [str(x) for x in q["query"].iloc[np.sort(rng.choice(len(q), 500, replace=False))]]
+    reqs = [{"query": {"neural": {"embedding": {"query_text": x, "k": 100}}}, "size": 100} for x in texts]
+    refused = 0
+    for r in reqs[:20]:
+        try:
+            a.search(r)
+        except ValueError:
+            refused += 1
+    cmp_n = compare_all(a, b, reqs) if not refused else None
+    res["neural"] = {"refused_of_first_20": refused, "compare_500": cmp_n}
+    res["verdict"] = "held" if not refused and cmp_n["differ"] == 0 else "wrong"
+    print(f"S2 re-run (neural): segment vector_fields {res['segment_vector_fields']}; refused {refused} of 20; "
+          f"{None if cmp_n is None else cmp_n['differ']} of 500 differ (max |score diff| "
+          f"{None if cmp_n is None else cmp_n['max_abs_score_diff']}); intake {res['ingest']['s']:.1f} s, "
+          f"reindex {res['reindex_s']:.1f} s -> {res['verdict']}", flush=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps(res, indent=1, default=str) + "\n")
+    return res
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee.judge")
-    ap.add_argument("what", choices=("s2", "s4b", "s5a", "s5b"))
+    ap.add_argument("what", choices=("s2", "s4b", "s5a", "s5b", "s5a-rerun", "s2-neural"))
     ap.add_argument("--variant", default="esci-sample", choices=("esci-sample", "esci-sample+fields"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
@@ -456,7 +621,8 @@ def main(argv=None) -> int:
     if a.what == "s5b":
         judge_s5b(out, a.variant)
     else:
-        {"s2": judge_s2, "s4b": judge_s4b, "s5a": judge_s5a}[a.what](out)
+        {"s2": judge_s2, "s4b": judge_s4b, "s5a": judge_s5a, "s5a-rerun": judge_s5a_rerun,
+         "s2-neural": judge_s2_neural}[a.what](out)
     return 0
 
 

@@ -101,3 +101,19 @@ def test_concurrent_writers_keep_offsets_gapless(store):
         t.join()
     offs = [c["offset"] for c in store.changes(0, docs=False)]
     assert offs == list(range(1, 161)) and store.count() == 160
+
+
+def test_delta_reads_the_range_and_the_live_upserts_at_head(store):
+    store.apply([up("a"), up("b"), up("c")])
+    v = store.head()
+    store.apply([up("b", price=2.0), {"op": "patch", "_id": "b", "fields": {"stock": 7}},
+                 up("d"), {"op": "delete", "_id": "d"},                   # upserted then deleted: a tombstone only
+                 {"op": "patch", "_id": "a", "fields": {"price": 5.0}},   # a patch to an older key: not in docs
+                 up("e")])
+    head, recs, docs = store.delta(v)
+    assert head == store.head() == v + 6 and [r["offset"] for r in recs] == list(range(v + 1, head + 1))
+    assert all("doc" not in r for r in recs)
+    assert list(docs.product_id) == ["b", "e"] and docs.attrs["version"] == head
+    assert list(docs._first_offset) == [2, head] and docs.stock[0] == 7 and docs.price[0] == 2.0
+    h2, recs2, docs2 = store.delta(head)
+    assert (h2, recs2, len(docs2)) == (head, [], 0)

@@ -248,20 +248,11 @@ def ingest(path: str | Path, mapping: dict | Mapping, store, rejected: str | Pat
            encoder: Encoder | dict | None = None, chunk: int = 2000) -> IntakeReport:
     """A batch file into the store as one atomic batch of upserts. Within the file, the first valid record of an id
     wins; later ones are rejected (``duplicate_id_in_batch``). When a vector field's encoder must be fitted and the
-    store holds no fitted one, a first pass over the file fits it on every accepted doc (as ``build_index`` fits on
-    the catalogue), and the fitted encoder is kept in the store once the batch commits."""
+    store holds no fitted one, the accepted docs are held in memory (one read of the file), the encoder is fitted on
+    all of them (as ``build_index`` fits on the catalogue), and it is kept in the store once the batch commits."""
     m = as_mapping(mapping)
     encs = _store_encoders(store, m, encoder)
     fitted_here = {vf for vf, enc in encs.items() if needs_fit(enc)}
-    if fitted_here:
-        texts: dict[str, list[str]] = {vf: [] for vf in fitted_here}
-        for doc in _accepted(path, m, lambda record, rej: None):
-            for vf in fitted_here:
-                texts[vf].append(doc_text(doc, m.embeddings[vf]["inputs"]))
-        for vf in fitted_here:
-            if texts[vf]:
-                encs[vf].fit(texts[vf])
-        fitted_here = {vf for vf in fitted_here if not needs_fit(encs[vf])}
     reasons: Counter = Counter()
     accepted = 0
     rpath = _rejected_path(rejected)
@@ -271,6 +262,15 @@ def ingest(path: str | Path, mapping: dict | Mapping, store, rejected: str | Pat
         def reject(record, rej):
             reasons[rej.reason] += 1
             _write_rejection(rfh, record, rej)
+
+        source: Iterable[dict] = _accepted(path, m, reject)
+        if fitted_here:
+            docs = list(source)          # the fit needs every accepted doc before the first is encoded
+            for vf in fitted_here:
+                if docs:
+                    encs[vf].fit([doc_text(d, m.embeddings[vf]["inputs"]) for d in docs])
+            fitted_here = {vf for vf in fitted_here if not needs_fit(encs[vf])}
+            source = docs
 
         def upserts() -> Iterator[dict]:
             nonlocal accepted
@@ -284,7 +284,7 @@ def ingest(path: str | Path, mapping: dict | Mapping, store, rejected: str | Pat
                 buf.clear()
                 return out
 
-            for doc in _accepted(path, m, reject):
+            for doc in source:
                 buf.append(doc)
                 if len(buf) >= chunk:
                     yield from flush()

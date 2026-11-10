@@ -537,11 +537,43 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
 | `POST /indexes/{name}/_reindex` | `{}` → `{"segment_id", "version"}`: build from the store, swap |
 | `GET /indexes/{name}/versions` | → `[{"segment_id", "version", "created", "live": bool}]` |
 | `POST /indexes/{name}/_rollback` | `{"segment_id"}` → `{"segment_id", "version"}`: swap to a kept segment, replay the log after it |
+| `POST /indexes/{name}/_bulk` | OpenSearch NDJSON (`index`, `create`, `update` with a partial `doc` / `doc_as_upsert` / `upsert`, `delete`; `?refresh=false\|true\|wait_for`) → `{"took", "errors", "items": [{op: {"_index", "_id", "status", "result", "_seq_no"} \| {..., "error": {"type", "reason", "s3_reason", "field"}}}]}`; see **Bulk** below |
+| `POST /indexes/{name}/_refresh` | `{}` → `{"refreshed", "segment_id", "version"}`: make every stored upsert visible now |
+| `GET`, `PUT /indexes/{name}/_settings` | `{"index": {"refresh_interval": "1s"}}` (`500ms`, `5s`, `2m`, `-1` = no background refresh); default `S3_SERVING_REFRESH_INTERVAL` = `1s`; stored in `<index>/settings.json` |
 | `GET /indexes/{name}/_mapping` | → `{name: {"mappings": <the mapping>, "s3_fields": {field: {"type", "searchable", "filterable", "facetable", "sortable", "dense", "hot"[, "dimension"]}}}}`; sub-fields appear as `f.keyword`. Facetable = keyword; filterable and sortable = keyword and numeric/boolean; searchable = text |
 | `POST /indexes/{name}/_rankers` | `{"name", "path"}` → `{"name", "rankers": [...]}`: loads a ranker file (the JSON of `GBDT.to_dict()`; `engine.api` has no save/load of its own, so this is interim) from under the serving data dir into `Index.add_ranker`; kept across swaps. At startup: `S3_SERVING_RANKERS=name=path,...` |
 | `GET /indexes`, `GET /indexes/{name}` | what is loaded: segment id, version, docs, device, cache counters |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | liveness; ready once every configured index has a segment loaded (503 while loading or draining); Prometheus text (below) |
 
+- **RPC.** `python -m serving --rpc-port N` (`S3_SERVING_RPC_PORT`) also listens for length-prefixed JSON frames
+  (`serving/rpc.py`, `docs/decisions/2026-11-10-rpc-and-operator-watches.md`): request `{"id", "method", "path", "body",
+  "headers"}`, response `{"id", "status", "body", "headers"}`, with the same method and path as the HTTP route and the
+  same `App.handle`, so responses equal HTTP's (checked on the 200 conformance requests). Client: `serving.rpc.RpcClient`.
+  The `SearchIndex` Service also exposes port 9090 as `rpc`.
+- **Bulk** (`serving/bulk.py`). The body is streamed (Content-Length or chunked), grouped into chunks of `bulk_chunk`
+  actions (default 2000), and each chunk is planned, applied to the store as one atomic batch through
+  `dataplane.intake.apply_changes` (bad records are rejected one by one) and replayed onto the live index before the next
+  chunk is read: memory is one chunk plus the item list. Every action has an item, in order. Semantics as OpenSearch:
+  `index` 201 created / 200 updated; `create` 409 `version_conflict_engine_exception` if the id exists; `update` merges a
+  partial `doc` (hot fields only: an in-place patch; else the merged document is stored whole), 404
+  `document_missing_exception` unless `doc_as_upsert`/`upsert`, `noop` for an empty doc; `delete` 200 `deleted` / 404
+  `not_found`; a missing `_id` on `index`/`create` is generated. A data-plane rejection becomes status 400 (404 for
+  `no_such_key`) with `error.type` from the reason (`bad_type`, `dims_mismatch`, `too_long` → `mapper_parsing_exception`;
+  `unknown_field` → `strict_dynamic_mapping_exception`; `not_hot` → `illegal_argument_exception`; `missing_id`,
+  `malformed`, `bad_op` → `action_request_validation_exception`), `error.s3_reason` the named reason and `error.field`.
+  Unsupported: `script`, versioning, routing, pipelines. An unparseable action line ends the request with 400 and the
+  items already applied; a store failure marks its chunk 5xx and stops. Not available over RPC.
+- **Refresh.** A write is durable and its patches and deletes visible at once; an upsert becomes visible at the next
+  refresh. `refresh=false` leaves it to the background refresher (every `refresh_interval`, only when something is
+  pending; with the full-rebuild backend also at least 4x the last refresh's cost apart); `true` refreshes before
+  returning (`"forced_refresh": true`); `wait_for` returns when a refresh covers the write (forces one if the interval
+  is `-1` or it takes too long). **The hook:** `serving.ports.Ports.refresh(managed_index) -> {"segment_id", "version"}`;
+  while it is `None` a refresh is a full rebuild from the store and a swap (18.7 s on ESCI-sample); when the data plane's
+  delta segments land (S8-4) it supplies the hook and refresh becomes a delta (it runs under the admin lock and may call
+  `managed_index._swap_in(new_index, segment_id, "refresh")`).
+- **Write metrics:** `s3_index_lag` (store head minus the highest offset fully visible, so upserts waiting for a refresh
+  count), `s3_index_pending_upserts`, `s3_refresh_ms`, `s3_bulk_requests_total{refresh}`, `s3_bulk_items_total{op,outcome}`,
+  `s3_bulk_rejected_total{reason}`, `s3_bulk_items_per_second` (last request), `s3_bulk_ms`.
 - **Batching.** `_search` requests are queued per index; a worker sends up to `max_batch` of them (default 32) to one
   `Index.search_batch`, waiting at most `max_wait_ms` (default 2.0) after the first arrives. `_msearch` is one
   `search_batch` itself. If a batch raises, its requests are retried singly so a bad request fails alone.
@@ -609,6 +641,10 @@ status:
 - **It never assumes a GPU.** Only when `device: cuda` does it add `nvidia.com/gpu` limits from `resources`, a
   `nodeSelector` (`nvidia.com/gpu.present: "true"`) and the `nvidia.com/gpu` toleration. One `Dockerfile` with
   `ARG BASE=cpu|cuda` selects the base image and `requirements-gpu.txt`.
+- The operator runs on watches (SearchIndex, and the Deployments and Jobs it owns) with a periodic resync as the backstop,
+  and elects a leader with a `coordination.k8s.io/v1` Lease `s3-operator` (flags `--lease-duration 15 --renew-deadline 10
+  --retry-period 2`; `--no-leader-elect` for a single replica); the manifest runs 2 replicas. Decision record
+  `docs/decisions/2026-11-10-rpc-and-operator-watches.md`.
 - CRD: `deploy/crd/searchindex.yaml`; operator manifests: `deploy/manifests/operator.yaml`; samples:
   `deploy/samples/`; image: `deploy/Dockerfile` (`ARG BASE=cpu|cuda`, built from the repository root).
 - Tests: the reconciler against a real kube-apiserver and etcd (envtest binaries at
@@ -680,6 +716,8 @@ status:
   a boundary disagreement with OpenSearch (and with a pandas mask) on float fields. No request that S1 answered is
   answered differently except a float field's exact-boundary term or range, and a fractional term on an integer field
   (now refused, before an empty answer).
+- 2026-11-10, platform-engineer: RPC serving (S7-7), additive: `rpc` listener, client, Service port 9090.
+- 2026-11-10, platform-engineer: the operator on watches with Lease leader election (S7-7); no spec or status change.
 - 2026-11-10, architect (GPU-friendliness audit): section 0 gains the host-transfer rule (one transfer for the page,
   one per terms aggregation; rescoring on the device) and the `accumulate` option (float32 keeps BM25F
   batch-invariant, not the dense GEMM). Section 5 corrected: OpenSearch's default BM25 keeps `(k1 + 1)`; the lexical
@@ -689,6 +727,7 @@ status:
 - 2026-11-10, architect (S7-1): section 4 gains optional positions (`text/pos_ptr.npy`, `text/positions.npy`; older
   segments load without them); section 2 gains `_meta.engine.positions` and the position rule; section 5 gains
   `match_phrase` with `slop`. Additive. Why: the founder's feature coverage (S7).
+- 2026-11-10, platform-engineer: `_bulk`, `_refresh`, `_settings` (refresh_interval), `?refresh=` on `_bulk` and `_docs`, write metrics and the `Ports.refresh` / `Ports.apply_changes` hooks (S8-6), additive. Needs from the dataplane-engineer: `Ports.refresh` implemented on delta segments (S8-4).
 - 2026-11-10, architect (S7-2): section 5 gains `fuzzy`, fuzziness on `match` and `multi_match`, `prefix` and
   `match_bool_prefix`, expanded in the terms dictionary with OpenSearch's defaults; section 6 gains the
   `LexicalGroups` plan node (clauses of alternative terms: "sum", "synonym", "const"), scored by the new

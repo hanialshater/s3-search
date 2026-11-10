@@ -84,6 +84,22 @@ Added by the coordinator, 2026-11-10, on the founder's ask for good feature cove
 | S7-4 | Metric and bucket aggregations: `min`, `max`, `avg`, `sum`, `stats`, `value_count`, `cardinality` (exact), `range`, `histogram`, one level of sub-aggregations under `terms` | architect | claimed | architect, 2026-11-10 |
 | S7-5 | `highlight` (plain, on text fields) and `function_score` with `field_value_factor` and `weight` | architect | claimed | architect, 2026-11-10 |
 | S7-6 | Synonyms in the analyzer, defined in the mapping (query-time) | architect | claimed | architect, 2026-11-10 |
-| S7-7 | RPC serving next to HTTP; the operator on watches and a leader-election Lease | platform-engineer | open | |
+| S7-7 | RPC serving next to HTTP; the operator on watches and a leader-election Lease | platform-engineer | in review | platform-engineer 2026-11-10 |
 | S7-8 | Demo: autocomplete, highlights, multi-select facets with `post_filter`, sort control, collapse by brand | tools-engineer | open | |
 | S7-9 | Conformance families for S7's features, recorded against OpenSearch | evaluation-steward | open | |
+
+## S8 · Fast writes (dataplane-engineer, architect, platform-engineer, evaluation-steward)
+
+Added by the coordinator, 2026-11-10, on the founder's ask that writes be fast. Baseline (2 cores, ESCI-sample):
+lexical intake 14,439 docs/s; build from the store 18.1 s (10.7 s before S7-1's positions); a new or edited document
+is searchable only after a full rebuild. Predictions are in the lab's `company/milestones.json` (S8).
+
+| Id | Item | Owner | Status | Claimed |
+|---|---|---|---|---|
+| S8-1 | The multi-segment contract (§4, §5): a base plus delta segments, global corpus statistics, tombstones, merge; proposal by the dataplane-engineer, ruled by the architect | dataplane-engineer, architect | claimed | dataplane-engineer, 2026-11-10 |
+| S8-2 | Engine: search over base plus deltas with statistics equal to a rebuild's; `Index.add_segment`, `remove_segment` | architect | open | |
+| S8-3 | Build speed: back under 10 s on ESCI-sample with positions | architect | open | |
+| S8-4 | Data plane: delta segments from the change log every refresh interval, a tiered merge policy, the updater swapping deltas in and merges out | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
+| S8-5 | Intake speed: at least 20,000 docs/s lexical, the encoder fit under 10 s | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
+| S8-6 | `POST _bulk` (NDJSON), refresh interval and index-lag metrics | platform-engineer | in review | platform-engineer 2026-11-10 |
+| S8-7 | The write-stream judge: 200 upserts/s, visibility, equality with a rebuild, query p99 under writes | evaluation-steward | open | |

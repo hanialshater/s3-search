@@ -60,6 +60,12 @@ class BadChange(StoreError):
     """A malformed change: unknown op, missing or over-long id, a bad value."""
 
 
+_UPSERT_DOC = ("INSERT INTO docs VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET doc = excluded.doc, "
+               "vecf = excluded.vecf, vec = excluded.vec, last_offset = excluded.last_offset")
+_INSERT_LOG = "INSERT INTO log VALUES (?, 'upsert', ?, ?, ?, ?, ?)"
+_dumps = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False, default=json_safe).encode
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -175,11 +181,22 @@ class Store:
         """Commit a batch atomically. Returns ``(first, last)`` offsets; ``(0, 0)`` for an empty batch."""
         c = self._conn()
         c.execute("BEGIN IMMEDIATE")
+        doc_rows: list[tuple] = []     # consecutive upserts, written with executemany
+        log_rows: list[tuple] = []
+
+        def flush():
+            if doc_rows:
+                c.executemany(_UPSERT_DOC, doc_rows)
+                c.executemany(_INSERT_LOG, log_rows)
+                doc_rows.clear()
+                log_rows.clear()
+
         try:
             head = self._head(c)
             off = head
             hot = set(self.mapping.hot)
             id_field = self.mapping.id_field
+            now = utc_now()            # one commit time for the batch, unless a record carries its own ts
             for ch in changes:
                 op = ch.get("op")
                 if op not in OPS:
@@ -192,18 +209,19 @@ class Store:
                 if len(_id.encode("utf-8")) > ID_MAX_BYTES:
                     raise BadChange(f"{op}: _id over {ID_MAX_BYTES} bytes")
                 off += 1
-                ts = ch.get("ts") or utc_now()
+                ts = ch.get("ts") or now
                 if op == "upsert":
                     doc = dict(ch.get("doc") or {})
                     doc[id_field] = _id
                     plain, vecf, blob = self._split(doc)
-                    text = json.dumps(plain, separators=(",", ":"), ensure_ascii=False, default=json_safe)
-                    row = c.execute("SELECT first_offset FROM docs WHERE id = ?", (_id,)).fetchone()
-                    first = off if row is None else row[0]
-                    c.execute("INSERT OR REPLACE INTO docs VALUES (?, ?, ?, ?, ?, ?)",
-                              (_id, text, vecf, blob, first, off))
-                    c.execute("INSERT INTO log VALUES (?, 'upsert', ?, ?, ?, ?, ?)", (off, _id, text, vecf, blob, ts))
-                elif op == "patch":
+                    text = _dumps(plain)
+                    doc_rows.append((_id, text, vecf, blob, off, off))   # first_offset kept on conflict
+                    log_rows.append((off, _id, text, vecf, blob, ts))
+                    if len(doc_rows) >= 1000:
+                        flush()
+                    continue
+                flush()                # a patch or delete reads the docs table as it stands
+                if op == "patch":
                     fields = ch.get("fields")
                     if not isinstance(fields, dict) or not fields:
                         raise BadChange(f"patch {_id!r}: needs a non-empty 'fields' object")
@@ -230,6 +248,7 @@ class Store:
                 else:
                     c.execute("DELETE FROM docs WHERE id = ?", (_id,))
                     c.execute("INSERT INTO log VALUES (?, 'delete', ?, NULL, NULL, NULL, ?)", (off, _id, ts))
+            flush()
             c.execute("COMMIT")
         except BaseException:
             c.execute("ROLLBACK")
@@ -293,6 +312,32 @@ class Store:
         df = self._frame(rows)
         df.attrs["version"] = at
         return df
+
+    def delta(self, after: int) -> tuple[int, list[dict], pd.DataFrame]:
+        """What a delta segment needs (S8-4), read in one transaction: ``(head, records, docs)``.
+
+        ``records`` are the change records in ``(after, head]`` without upserts' docs. ``docs`` is the snapshot
+        frame (as ``snapshot``) of the keys upserted in that range that are live at head, ordered by
+        ``first_offset``, with ``attrs["version"] = head``. A key upserted and then deleted in the range is in
+        ``records`` only (its older copy needs a tombstone, and there is nothing to add)."""
+        c = self._conn()
+        c.execute("BEGIN")
+        try:
+            head = self._head(c)
+            recs = self.changes(after, limit=max(1, head - after), docs=False) if head > after else []
+            keys = list(dict.fromkeys(r["_id"] for r in recs if r["op"] == "upsert"))
+            rows = []
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
+                q = (f"SELECT doc, vecf, vec, first_offset, last_offset FROM docs WHERE id IN "
+                     f"({','.join('?' * len(chunk))})")
+                rows += [(self._doc(t, vf, b, lists=False), f, la) for t, vf, b, f, la in c.execute(q, chunk)]
+        finally:
+            c.execute("COMMIT")
+        rows.sort(key=lambda r: r[1])
+        df = self._frame(rows)
+        df.attrs["version"] = head
+        return head, recs, df
 
     def _replay(self, c: sqlite3.Connection, at: int) -> list[tuple[dict, int, int]]:
         state: dict[str, list] = {}

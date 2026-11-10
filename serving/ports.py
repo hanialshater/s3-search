@@ -26,6 +26,14 @@ class Ports:
     load_index: Callable[[Path, str], Any]
     # load_ranker(path) -> model with predict(X) (for Index.add_ranker); a JSON file written by GBDT.to_dict()
     load_ranker: Callable[[Path], Any] | None = None
+    # apply_changes(changes, mapping, store) -> report with .accepted, .first_offset, .last_offset and .rejected
+    # [(change, Rejection)]: one atomic batch with per-record rejection (dataplane.intake.apply_changes)
+    apply_changes: Callable[[list[dict], dict, Any], Any] | None = None
+    # refresh(managed_index) -> {"segment_id"?, "version"}: make every stored upsert visible by a delta refresh. None
+    # until the data plane's delta segments land (S8-4); then refresh() is a full rebuild and swap. The hook runs under
+    # the index's admin lock and may use managed_index.index, .root, .segments_dir, ._get_store() and
+    # ._swap_in(new_index, segment_id, "refresh").
+    refresh: Callable[[Any], dict] | None = None
 
 
 def default_ports() -> Ports:
@@ -71,7 +79,11 @@ def default_ports() -> Ports:
         from engine.rank.gbdt import GBDT
         return GBDT.from_dict(json.loads(Path(path).read_text()))
 
-    return Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker)
+    def apply_changes(changes: list[dict], mapping: dict, store):
+        from dataplane.intake import apply_changes as _apply
+        return _apply(changes, mapping, store)
+
+    return Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker, apply_changes)
 
 
 def read_manifest(segment_dir: Path) -> dict:

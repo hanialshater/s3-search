@@ -114,4 +114,12 @@ def standard() -> Metrics:
     m.describe("s3_swaps_total", "counter", "Segment swaps by index and kind (load, reindex, rollback)")
     m.describe("s3_patches_total", "counter", "Hot-field patches applied to the live index")
     m.describe("s3_queue_depth", "gauge", "Requests waiting in the scheduler by index")
+    m.describe("s3_index_lag", "gauge", "Store head minus the highest offset fully visible in the live index, by index")
+    m.describe("s3_index_pending_upserts", "gauge", "Upserts stored but not yet visible (waiting for a refresh), by index")
+    m.describe("s3_refresh_ms", "histogram", "Time a refresh took (ms), by index")
+    m.describe("s3_bulk_requests_total", "counter", "_bulk requests by index and refresh mode")
+    m.describe("s3_bulk_items_total", "counter", "_bulk actions by index, op and outcome (ok, error)")
+    m.describe("s3_bulk_rejected_total", "counter", "_bulk actions rejected, by index and named reason")
+    m.describe("s3_bulk_items_per_second", "gauge", "Actions per second of the last _bulk request, by index")
+    m.describe("s3_bulk_ms", "histogram", "Time per _bulk request (ms)", (50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000))
     return m
