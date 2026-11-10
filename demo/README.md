@@ -13,6 +13,12 @@ sortable, and the page renders only those.
   ignore only its own selection.
 - **Numeric fields** (when the mapping has them): min/max inputs, a `range` facet, a `histogram`, and a sort control
   (relevance, low to high, high to low). ESCI-sample as served has none, and the page then shows none.
+- **Geo** (S9-7; only when `s3_fields` has a `geo_point` field): a place, lat/lon and a radius in km; "only within this
+  distance" adds a `geo_distance` clause to `post_filter`; "Nearest to the place" sorts by `_geo_distance` and shows each
+  hit's distance.
+- **Nested facets** (S9-7; only when the mapping has a `nested` field): one nested aggregation per path gives the keyword
+  sub-fields as checkboxes and numeric ones as range chips (counts are offers, not products); the selection is one
+  `nested` query per path in `post_filter`, so the chosen seller and price must hold in the same offer.
 - **Collapse by brand** (`collapse` on `product_brand.keyword`; pages by from/size, as `search_after` is refused).
 - **Pagination:** Next sends `search_after` (the last hit's `sort`, verbatim), Previous sends `from`/`size`. Explain
   toggle sends `explain: true`. The page shows server and browser times and the page-1 p95.

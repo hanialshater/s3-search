@@ -19,8 +19,12 @@ const OPEN = "⟦", CLOSE = "⟧";
 const NUMERIC_TYPES = new Set(["float", "double", "half_float", "scaled_float", "integer", "long", "short", "byte"]);
 const TITLE = "product_title";
 
-const state = { q: "", sel: {}, ranges: {}, sort: "", collapse: false, page: 1, explain: false, last: null, pendingAfter: null };
-let schema = { text: [], title: false, facets: [], numerics: [], brand: null };
+const state = { q: "", sel: {}, ranges: {}, nsel: {}, nrange: {}, geo: { on: false, lat: "", lon: "", km: "" }, sort: "",
+                collapse: false, page: 1, explain: false, last: null, pendingAfter: null };
+let schema = { text: [], title: false, facets: [], numerics: [], brand: null, geo: null, nested: [] };
+// A few places to measure from (the synthetic catalogue's locations cluster around cities like these).
+const PLACES = [["New York", 40.71, -74.01], ["Los Angeles", 34.05, -118.24], ["London", 51.51, -0.13], ["Paris", 48.86, 2.35],
+                ["Tokyo", 35.68, 139.69], ["Sydney", -33.87, 151.21]];
 const latencies = [];            // browser round trips of page-1 searches (ms)
 const suggestRtt = [], suggestKey = []; // autocomplete: fetch round trip, and keystroke to rendered list (ms)
 let seq = 0, sseq = 0;
@@ -37,13 +41,24 @@ const niceStep = (span, parts) => {
 function schemaFromCapabilities(caps, mapping) {
   const idField = (((mapping || {})._meta || {}).engine || {}).id_field;
   const boosts = { product_title: 3, product_brand: 2 };
-  const out = { text: [], title: false, facets: [], numerics: [], brand: null };
+  const out = { text: [], title: false, facets: [], numerics: [], brand: null, geo: null, nested: [] };
   const label = (f) => f.replace(/^product_/, "").replace(/\.keyword$/, "");
   for (const [field, c] of Object.entries(caps || {})) {
     if (field === idField) continue;
+    if (c.type === "geo_point" && !out.geo) { out.geo = { field, label: field }; continue; }
     if (c.searchable) { out.text.push(boosts[field] ? `${field}^${boosts[field]}` : field); if (field === TITLE) out.title = true; }
     if (c.facetable && c.filterable) out.facets.push({ field, label: label(field) });
     if (NUMERIC_TYPES.has(c.type) && c.filterable && c.sortable) out.numerics.push({ field, label: label(field), min: null, max: null, interval: 1, ranges: [] });
+  }
+  // nested paths: their sub-fields are in the mapping, not in s3_fields. keyword -> a terms facet, numeric -> a range.
+  for (const [path, prop] of Object.entries((mapping || {}).properties || {})) {
+    if (prop.type !== "nested") continue;
+    const subs = [];
+    for (const [sub, sp] of Object.entries(prop.properties || {})) {
+      if (sp.type === "keyword") subs.push({ sub, field: `${path}.${sub}`, kind: "keyword" });
+      else if (NUMERIC_TYPES.has(sp.type)) subs.push({ sub, field: `${path}.${sub}`, kind: "number", min: null, max: null, ranges: [] });
+    }
+    if (subs.length) out.nested.push({ path, subs });
   }
   const brand = out.facets.find((f) => f.field === "product_brand.keyword") || out.facets.find((f) => f.label === "brand");
   out.brand = brand ? brand.field : null;
@@ -69,6 +84,20 @@ async function discoverSchema() {
     }
     sch.numerics = sch.numerics.filter((n) => n.min != null);
   }
+  for (const nd of sch.nested) { // the same for numeric sub-fields of a nested path, through a nested aggregation
+    const nums = nd.subs.filter((x) => x.kind === "number");
+    if (!nums.length) continue;
+    const r = await post({ size: 0, query: { match_all: {} }, aggs: { n: { nested: { path: nd.path },
+      aggs: Object.fromEntries(nums.map((x) => [x.sub, { stats: { field: x.field } }])) } } });
+    for (const x of nums) {
+      const st = r.ok && r.body.aggregations && r.body.aggregations.n && r.body.aggregations.n[x.sub];
+      if (!st || st.min == null) continue;
+      x.min = st.min; x.max = st.max;
+      const e = niceStep(st.max - st.min, 4), lo = Math.floor(st.min / e) * e;
+      x.ranges = [{ to: lo + e }, { from: lo + e, to: lo + 2 * e }, { from: lo + 2 * e, to: lo + 3 * e }, { from: lo + 3 * e }];
+    }
+    nd.subs = nd.subs.filter((x) => x.kind === "keyword" || x.min != null);
+  }
   return sch;
 }
 
@@ -92,6 +121,26 @@ function groupClauses(s, sch, except = null) {
     if (r.max !== "" && r.max != null && !isNaN(+r.max)) range.lte = +r.max;
     if (n.field !== except && Object.keys(range).length) out.push({ range: { [n.field]: range } });
   }
+  const g = s.geo;
+  if (sch.geo && except !== "geo" && g.on && g.lat !== "" && g.lon !== "" && +g.km > 0) {
+    out.push({ geo_distance: { distance: `${+g.km}km`, [sch.geo.field]: { lat: +g.lat, lon: +g.lon } } });
+  }
+  for (const nd of sch.nested) { // one nested query per path, so the chosen seller and price must hold in the same offer
+    if (nd.path === except) continue;
+    const conds = [];
+    for (const x of nd.subs) {
+      if (x.kind === "keyword") {
+        const sel = s.nsel[x.field];
+        if (sel && sel.size) conds.push({ terms: { [x.field]: [...sel] } });
+      } else {
+        const r = s.nrange[x.field] || {}, range = {};
+        if (r.min !== "" && r.min != null && !isNaN(+r.min)) range.gte = +r.min;
+        if (r.max !== "" && r.max != null && !isNaN(+r.max)) range.lte = +r.max;
+        if (Object.keys(range).length) conds.push({ range: { [x.field]: range } });
+      }
+    }
+    if (conds.length) out.push({ nested: { path: nd.path, query: { bool: { filter: conds } }, score_mode: "none" } });
+  }
   return out;
 }
 
@@ -103,6 +152,15 @@ const groupAggs = (sch, only = null) => {
     aggs[`${n.field}:histogram`] = { histogram: { field: n.field, interval: n.interval, min_doc_count: 0 } };
     aggs[`${n.field}:range`] = { range: { field: n.field, ranges: n.ranges } };
   }
+  for (const nd of sch.nested) {
+    if (only && only !== nd.path) continue;
+    const sub = {};
+    for (const x of nd.subs) {
+      if (x.kind === "keyword") sub[x.sub] = { terms: { field: x.field, size: 10 } };
+      else sub[`${x.sub}:range`] = { range: { field: x.field, ranges: x.ranges } };
+    }
+    aggs[`nested:${nd.path}`] = { nested: { path: nd.path }, aggs: sub };
+  }
   return aggs;
 };
 
@@ -113,7 +171,9 @@ function buildRequest(s, page, after, sch = schema) {
   const req = { query: { match_all: {} }, size: SIZE, _source: true, aggs: groupAggs(sch) };
   req.query = textQuery(s, sch);
   if (post.length) req.post_filter = { bool: { filter: post } };
-  if (s.sort) { const [field, order] = s.sort.split(":"); req.sort = [{ [field]: { order } }, "_score"]; }
+  if (s.sort === "geo" && sch.geo && s.geo.lat !== "" && s.geo.lon !== "") {
+    req.sort = [{ _geo_distance: { [sch.geo.field]: { lat: +s.geo.lat, lon: +s.geo.lon }, order: "asc", unit: "km" } }, "_score"];
+  } else if (s.sort && s.sort !== "geo") { const [field, order] = s.sort.split(":"); req.sort = [{ [field]: { order } }, "_score"]; }
   if (s.collapse && sch.brand) req.collapse = { field: sch.brand };
   if (s.q.trim() && sch.title) {
     req.highlight = { fields: { [TITLE]: { number_of_fragments: 0 } }, pre_tags: [OPEN], post_tags: [CLOSE] };
@@ -126,7 +186,7 @@ function buildRequest(s, page, after, sch = schema) {
 /** post_filter makes every facet ignore all selections. To make a facet ignore only its *own* (the OpenSearch
  *  dashboards behaviour) the page asks again, aggregations only, for each group when some other group has a selection. */
 function correctionRequests(s, sch = schema) {
-  const groups = [...sch.facets.map((f) => f.field), ...sch.numerics.map((n) => n.field)];
+  const groups = [...sch.facets.map((f) => f.field), ...sch.numerics.map((n) => n.field), ...sch.nested.map((n) => n.path)];
   const out = [];
   for (const g of groups) {
     const others = groupClauses(s, sch, g);
@@ -193,13 +253,58 @@ function buildControls() {
     fs.dataset.field = n.field;
     box.append(fs);
   }
+  for (const nd of schema.nested) { // facets over a nested path: choices are offers, counted as offers
+    const fs = el("fieldset", { className: "nested" }, el("legend", { textContent: `${nd.path} (counts are ${nd.path})` }));
+    fs.dataset.path = nd.path;
+    for (const x of nd.subs) {
+      if (x.kind === "keyword") {
+        state.nsel[x.field] = new Set();
+        const opts = el("div", { className: "opts" });
+        opts.dataset.field = x.field;
+        fs.append(el("div", { className: "sub" }, el("b", { textContent: x.sub }), opts));
+      } else {
+        state.nrange[x.field] = { min: "", max: "" };
+        const mk = (kind) => {
+          const inp = el("input", { type: "number", min: "0", step: "any", id: `${x.field}-${kind}` });
+          inp.inputMode = "decimal";
+          inp.addEventListener("change", () => { state.nrange[x.field][kind] = inp.value; resetAndSearch(); });
+          return el("label", {}, `${x.sub} ${kind === "min" ? "min" : "max"} `, inp);
+        };
+        const ch = el("div", { className: "ranges" });
+        ch.dataset.field = x.field;
+        fs.append(mk("min"), mk("max"), ch);
+      }
+    }
+    box.append(fs);
+  }
+  if (schema.geo) {
+    const g = state.geo;
+    [g.lat, g.lon, g.km] = [String(PLACES[0][1]), String(PLACES[0][2]), "50"];
+    const num = (id, key, label, step) => {
+      const inp = el("input", { type: "number", id, step, value: g[key] });
+      inp.addEventListener("change", () => { g[key] = inp.value; if (g.on || state.sort === "geo") resetAndSearch(); });
+      return el("label", {}, `${label} `, inp);
+    };
+    const place = el("select", { id: "geo-place" }, ...PLACES.map(([n, la, lo], i) => el("option", { value: String(i), textContent: n })));
+    place.addEventListener("change", () => {
+      const [, la, lo] = PLACES[+place.value];
+      g.lat = String(la); g.lon = String(lo); $("geo-lat").value = g.lat; $("geo-lon").value = g.lon;
+      if (g.on || state.sort === "geo") resetAndSearch();
+    });
+    const on = el("input", { type: "checkbox", id: "geo-on" });
+    on.addEventListener("change", () => { g.on = on.checked; resetAndSearch(); });
+    box.append(el("fieldset", { id: "geo-box" }, el("legend", { textContent: "Near a place" }),
+      el("label", {}, "From ", place), num("geo-lat", "lat", "Lat", "any"), num("geo-lon", "lon", "Lon", "any"),
+      num("geo-km", "km", "Within (km)", "any"), el("label", {}, on, " Only within this distance")));
+  }
   const sel = $("sort");
   sel.replaceChildren(el("option", { value: "", textContent: "Relevance" }));
   for (const n of schema.numerics) {
     sel.append(el("option", { value: `${n.field}:asc`, textContent: `${n.label}, low to high` }),
                el("option", { value: `${n.field}:desc`, textContent: `${n.label}, high to low` }));
   }
-  $("sort-box").hidden = schema.numerics.length === 0;
+  if (schema.geo) sel.append(el("option", { value: "geo", textContent: "Nearest to the place" }));
+  $("sort-box").hidden = schema.numerics.length === 0 && !schema.geo;
   $("collapse-box").hidden = !schema.brand;
 }
 
@@ -250,9 +355,44 @@ function renderNumeric(n, aggs) {
   }));
 }
 
+function renderNested(nd, agg) {
+  agg = agg || {};
+  for (const x of nd.subs) {
+    if (x.kind === "keyword") {
+      const box = document.querySelector(`.opts[data-field="${CSS.escape(x.field)}"]`);
+      if (!box) continue;
+      box.replaceChildren();
+      const chosen = state.nsel[x.field];
+      const buckets = new Map((((agg[x.sub] || {}).buckets) || []).map((b) => [String(b.key), b.doc_count]));
+      for (const k of chosen) if (!buckets.has(k)) buckets.set(k, 0);
+      for (const [key, count] of buckets) {
+        const cb = el("input", { type: "checkbox", checked: chosen.has(key) });
+        cb.dataset.facet = x.field; cb.dataset.value = key;
+        cb.addEventListener("change", () => { cb.checked ? chosen.add(key) : chosen.delete(key); resetAndSearch(); });
+        box.append(el("label", {}, cb, el("span", { textContent: key }), el("span", { className: "count", textContent: String(count) })));
+      }
+    } else {
+      const ch = document.querySelector(`.ranges[data-field="${CSS.escape(x.field)}"]`);
+      if (!ch) continue;
+      ch.replaceChildren(...(((agg[`${x.sub}:range`] || {}).buckets) || []).map((b) => {
+        const label = b.from == null ? `Under ${fmtNum(b.to)}` : b.to == null ? `${fmtNum(b.from)} and up` : `${fmtNum(b.from)} to ${fmtNum(b.to)}`;
+        const btn = el("button", { type: "button", className: "chip", textContent: `${label} (${b.doc_count})` });
+        btn.addEventListener("click", () => {
+          state.nrange[x.field] = { min: b.from == null ? "" : String(b.from), max: b.to == null ? "" : String(b.to) };
+          document.getElementById(`${x.field}-min`).value = state.nrange[x.field].min;
+          document.getElementById(`${x.field}-max`).value = state.nrange[x.field].max;
+          resetAndSearch();
+        });
+        return btn;
+      }));
+    }
+  }
+}
+
 function renderAggs(aggs, only = null) {
   for (const f of schema.facets) if (!only || only === f.field) renderTerms(f, aggs[f.field]);
   for (const n of schema.numerics) if (!only || only === n.field) renderNumeric(n, aggs);
+  for (const nd of schema.nested) if (!only || only === nd.path) renderNested(nd, aggs[`nested:${nd.path}`]);
 }
 
 function explainText(n, depth = 0) {
@@ -273,6 +413,8 @@ function renderHits(body) {
     title.append(frag ? highlighted(frag) : document.createTextNode(src[TITLE] || h._id));
     li.append(title);
     const bits = [src.product_brand, src.product_color, src.category, src.price != null ? "$" + src.price : null].filter(Boolean);
+    if (state.sort === "geo" && schema.geo && typeof (h.sort || [])[0] === "number") bits.push(`${h.sort[0].toFixed(1)} km away`);
+    if (Array.isArray(src.offers)) bits.push(`${src.offers.length} offers` + (src.offers.length ? ` from $${Math.min(...src.offers.map((o) => o.price))}` : ""));
     li.append(el("div", { className: "meta", textContent: bits.join(" · ") }));
     li.append(el("div", { className: "score", textContent: `${h._id} · score ${Number(h._score).toFixed(4)}` +
       (h.fields && state.collapse ? " · top hit for this brand" : "") }));
@@ -396,8 +538,11 @@ $("sort").addEventListener("change", (e) => { state.sort = e.target.value; reset
 $("collapse").addEventListener("change", (e) => { state.collapse = e.target.checked; resetAndSearch(); });
 $("clear").addEventListener("click", () => {
   for (const s of Object.values(state.sel)) s.clear();
-  for (const r of Object.values(state.ranges)) { r.min = ""; r.max = ""; }
-  for (const i of document.querySelectorAll("#dynamic-filters input[type=number]")) i.value = "";
+  for (const r of [...Object.values(state.ranges), ...Object.values(state.nrange)]) { r.min = ""; r.max = ""; }
+  for (const s of Object.values(state.nsel)) s.clear();
+  state.geo.on = false;
+  if ($("geo-on")) $("geo-on").checked = false;
+  for (const i of document.querySelectorAll("#dynamic-filters fieldset:not(#geo-box) input[type=number]")) i.value = "";
   resetAndSearch();
 });
 // Next uses search_after (the last hit's `sort`, passed back verbatim); collapse refuses it, so it pages by from/size.

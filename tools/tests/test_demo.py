@@ -20,10 +20,10 @@ N_PRODUCTS = 1500
 
 
 def _serve(fields):
-    try:
-        st = Stack(N_PRODUCTS, fields=fields)
-    except Exception as e:  # noqa: BLE001 - esci-sample not built here, serving not startable
-        pytest.skip(f"no real stack: {e}")
+    from referee import loader
+    if not loader.available("esci-sample"):
+        pytest.skip("esci-sample is not built here")
+    st = Stack(N_PRODUCTS, fields=fields)  # a failure to start is a failure, not a skip
     srv = demo.make_server(st.base, port=0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield st, f"http://127.0.0.1:{srv.server_address[1]}/"
