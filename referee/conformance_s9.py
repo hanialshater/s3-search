@@ -154,27 +154,33 @@ def _rel(a, b, tol):
     return abs(float(a) - float(b)) <= tol * max(1e-300, abs(float(b)))
 
 
-def _agg_diffs(g, e, path=""):
+def _agg_diffs(g, e, spec, path=""):
+    """Aggregations against OpenSearch's, by the rules: doc_count, bucket keys and counts, min/max/value_count
+    exactly; sum and avg within 1e-6 relative. `spec` is the request's aggs, which says each aggregation's type."""
     out = []
-    for k, ev in (e or {}).items():
-        gv = (g or {}).get(k) if isinstance(g, dict) else None
-        p = f"{path}.{k}" if path else k
-        if isinstance(ev, dict):
-            if gv is None:
-                out.append(f"{p}: missing")
-                continue
-            if "buckets" in ev:
-                gb, eb = gv.get("buckets", []), ev["buckets"]
-                if [(x.get("key"), x.get("doc_count")) for x in gb] != [(y.get("key"), y.get("doc_count")) for y in eb]:
-                    out.append(f"{p}: buckets differ")
-            elif "value" in ev:
-                tol = 1e-6 if any(s in p for s in (".p", ".s")) and not isinstance(ev["value"], int) else 0
-                if not _rel(gv.get("value"), ev.get("value"), max(tol, 0 if "count" in p else tol)):
-                    out.append(f"{p}: {gv.get('value')} != {ev.get('value')}")
-            else:
-                if ev.get("doc_count") != gv.get("doc_count"):
-                    out.append(f"{p}.doc_count: {gv.get('doc_count')} != {ev.get('doc_count')}")
-                out += _agg_diffs(gv, {kk: vv for kk, vv in ev.items() if isinstance(vv, dict)}, p)
+    for name, ev in (e or {}).items():
+        if not isinstance(ev, dict):
+            continue
+        gv = (g or {}).get(name) if isinstance(g, dict) else None
+        p = f"{path}.{name}" if path else name
+        sp = (spec or {}).get(name, {})
+        kind = next((k for k in sp if k not in ("aggs", "aggregations")), None)
+        if gv is None:
+            out.append(f"{p}: missing")
+            continue
+        if "buckets" in ev:
+            if [(x.get("key"), x.get("doc_count")) for x in gv.get("buckets", [])] != \
+                    [(y.get("key"), y.get("doc_count")) for y in ev["buckets"]]:
+                out.append(f"{p}: buckets differ")
+        elif "value" in ev:
+            tol = 1e-6 if kind in ("sum", "avg") else 0
+            if not _rel(gv.get("value"), ev.get("value"), tol):
+                out.append(f"{p} ({kind}): {gv.get('value')} != {ev.get('value')}")
+        else:  # a nested (single-bucket) aggregation
+            if ev.get("doc_count") != gv.get("doc_count"):
+                out.append(f"{p}.doc_count: {gv.get('doc_count')} != {ev.get('doc_count')}")
+            out += _agg_diffs(gv, {k: v for k, v in ev.items() if isinstance(v, dict)},
+                              sp.get("aggs") or sp.get("aggregations") or {}, p)
     return out
 
 
@@ -207,7 +213,7 @@ def judge(index, recorded, suite) -> dict:
                     if not _rel(x["_score"], y["_score"], 1e-6):
                         d.append(f"{x['_id']}: score {x['_score']} != {y['_score']}")
                         break
-            d += _agg_diffs(ge.get("aggregations"), ee.get("aggregations"))
+            d += _agg_diffs(ge.get("aggregations"), ee.get("aggregations"), s["request"].get("aggs") or {})
             row["diffs"] = d
         row["passed"] = not row["diffs"]
         rows.append(row)
