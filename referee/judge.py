@@ -611,9 +611,80 @@ def judge_s2_neural(out_path):
     return res
 
 
+def judge_s7p5(out_path):
+    """S7 prediction 5: the demo page on ESCI-sample as served, in headless Chromium, against a real serving replica
+    through the demo's own server (python -m tools.demo); 100 sampled fit queries; behind the quiet gate. The
+    browser part and its clocks are in referee/judge_s7p5.js."""
+    import os
+    import socket
+    import subprocess
+    from referee import loadguard
+    res = {"kind": "judge-s7p5", "label": "CPU, development only", "dataset": "esci-sample as served"}
+    try:
+        res["load_at_start"] = loadguard.wait_for_quiet()
+    except loadguard.Busy as e:
+        res["not_judged"] = str(e)
+        Path(out_path).write_text(json.dumps(res, indent=1) + "\n")
+        print(res["not_judged"])
+        return res
+    ds = loader.load_dataset("esci-sample")
+    work = Path(tempfile.mkdtemp(prefix="judge-s7p5-"))
+    src = work / "catalogue.parquet"
+    ds.catalogue.to_parquet(src, index=False)
+    with loadguard.Sampler() as sampler:
+        srv = Server(work / "serving")
+        demo = None
+        try:
+            srv.call("PUT", "/indexes/esci-sample", {"mapping": ds.mapping, "source": {"path": str(src)}})
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            demo = subprocess.Popen(["taskset", "-c", "0,1", sys.executable, "-m", "tools.demo", "--api", srv.base,
+                                     "--port", str(port)], cwd=Path(__file__).resolve().parent.parent,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.0)
+            q = ds.fit[["query_id", "query"]].drop_duplicates("query_id")
+            rng = np.random.default_rng(HOT_SEED + 11)
+            texts = [str(t) for t in q["query"].iloc[np.sort(rng.choice(len(q), 100, replace=False))]]
+            qp, out_js = work / "queries.json", work / "browser.json"
+            qp.write_text(json.dumps(texts))
+            npm_root = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True).stdout.strip()
+            t = time.perf_counter()
+            p = subprocess.run(["taskset", "-c", "0,1", "node", str(Path(__file__).with_name("judge_s7p5.js")),
+                                f"http://127.0.0.1:{port}/?index=esci-sample", str(qp), str(out_js)],
+                               env={**os.environ, "NODE_PATH": npm_root}, capture_output=True, text=True, timeout=3600)
+            res["browser_s"] = time.perf_counter() - t
+            if p.returncode:
+                res["browser_error"] = p.stderr[-1500:]
+            else:
+                res["browser"] = json.loads(out_js.read_text())
+        finally:
+            if demo is not None:
+                demo.terminate()
+            srv.close()
+    res["load_during_run"] = sampler.summary()
+    b = res.get("browser") or {}
+    ac, p1 = (b.get("autocomplete_ms_judge") or {}).get("p95"), (b.get("page1_ms_judge") or {}).get("p95")
+    clean = bool(b) and not b.get("first_load_error") and b.get("errors") == 0 and not b.get("page_errors")
+    features = bool(b) and b["highlights"]["searches_requesting"] == b["searches"] == 100 and \
+        b["multi_select"]["with_post_filter"] == b["multi_select"]["done"] > 0
+    if res["load_during_run"]["overloaded"]:
+        res["verdict"] = "not judged (busy during the run)"
+    else:
+        res["verdict"] = "held" if (clean and features and ac is not None and ac < 150 and p1 is not None and p1 < 300) \
+            else "wrong"
+    res["verdict_inputs"] = {"autocomplete_p95_ms": ac, "page1_p95_ms": p1, "errors": b.get("errors"),
+                             "searches": b.get("searches"), "features_used": features}
+    print(json.dumps({k: res.get(k) for k in ("verdict", "verdict_inputs", "load_at_start", "load_during_run")}, indent=1))
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps(res, indent=1, default=str) + "\n")
+    return res
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee.judge")
-    ap.add_argument("what", choices=("s2", "s4b", "s5a", "s5b", "s5a-rerun", "s2-neural"))
+    ap.add_argument("what", choices=("s2", "s4b", "s5a", "s5b", "s5a-rerun", "s2-neural", "s7p5"))
     ap.add_argument("--variant", default="esci-sample", choices=("esci-sample", "esci-sample+fields"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
@@ -622,7 +693,7 @@ def main(argv=None) -> int:
         judge_s5b(out, a.variant)
     else:
         {"s2": judge_s2, "s4b": judge_s4b, "s5a": judge_s5a, "s5a-rerun": judge_s5a_rerun,
-         "s2-neural": judge_s2_neural}[a.what](out)
+         "s2-neural": judge_s2_neural, "s7p5": judge_s7p5}[a.what](out)
     return 0
 
 
