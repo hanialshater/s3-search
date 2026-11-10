@@ -105,3 +105,20 @@ is searchable only after a full rebuild. Predictions are in the lab's `company/m
 | S8-5 | Intake speed: at least 20,000 docs/s lexical, the encoder fit under 10 s | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
 | S8-6 | `POST _bulk` (NDJSON), refresh interval and index-lag metrics | platform-engineer | in review | platform-engineer 2026-11-10 |
 | S8-7 | The write-stream judge: 200 upserts/s, visibility, equality with a rebuild, query p99 under writes | evaluation-steward | open | |
+
+## S9 · GPU-friendly coverage (architect, evaluation-steward, tools-engineer)
+
+Added by the coordinator, 2026-11-10. The founder: GPU-friendly features only, drop HNSW, use cuVS and cuML; budget
+$400 (the lab's `search-floor-s9` line). Predictions are in the lab's `company/milestones.json` (S9), written before the
+work started. cuVS and cuML are optional backends, testable only in the founder's Colab; on CPU, exact knn and the numpy
+encoder stay the reference and the fallback.
+
+| Id | Item | Owner | Status | Claimed |
+|---|---|---|---|---|
+| S9-1 | cuVS approximate knn: CAGRA and IVF-PQ, filtered; built per segment, rebuilt on merge; exact knn as the CPU fallback, the method named in the response | architect | open | |
+| S9-2 | The tfidf-svd encoder fitted and applied with cuML on the GPU; the fitted encoder stored as now | architect | open | |
+| S9-3 | GBDT inference on the GPU (cuML FIL or XGBoost), equal to the reference within 1e-5 | architect | open | |
+| S9-4 | Geo: the `geo_point` type, `geo_distance`, `geo_bounding_box`, `_geo_distance` sort | architect | open | |
+| S9-5 | Nested documents: the `nested` type, the `nested` query with `score_mode`, the `nested` aggregation | architect | open | |
+| S9-6 | Conformance families for geo and nested against OpenSearch 2.19; the Colab judges for S9-1 to S9-3 | evaluation-steward | open | |
+| S9-7 | Demo: a geo filter and nested facets | tools-engineer | open | |
