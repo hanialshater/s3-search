@@ -33,6 +33,16 @@ class NotHot(ValueError):
     pass
 
 
+class Rej:
+    def __init__(self, _id, reason, field, detail):
+        self._id, self.reason, self.field, self.detail = _id, reason, field, detail
+
+
+class Report:
+    def __init__(self, accepted, first, last, rejected):
+        self.accepted, self.first_offset, self.last_offset, self.rejected = accepted, first, last, rejected
+
+
 class FakeIndex:
     HOT = ("price", "stock")
 
@@ -135,7 +145,7 @@ class FakeStore:
     def get(self, ids):
         return [dict(self.docs[i]) if i in self.docs else None for i in ids]
 
-    def changes(self, after: int, limit: int = 10_000):
+    def changes(self, after: int, limit: int = 10_000, docs: bool = True):
         return self.log[after:after + limit]
 
 
@@ -183,10 +193,22 @@ def fake_ports(delay: float = 0.0, over_budget_on: set | None = None) -> Ports:
         return FakeIndex(json.loads((Path(path) / "docs.json").read_text()), version=m["version"], device=device,
                          delay=delay)
 
+    def apply_changes(changes, mapping, store):
+        rejected, ok = [], []
+        for ch in changes:
+            if ch["op"] == "upsert" and not isinstance(ch["doc"].get("title", ""), str):
+                rejected.append((ch, Rej(ch["_id"], "bad_type", "title", "title must be a string")))
+            elif ch["op"] == "patch" and not set(ch["fields"]) <= {"price", "stock"}:
+                rejected.append((ch, Rej(ch["_id"], "not_hot", next(iter(ch["fields"])), "not hot")))
+            else:
+                ok.append(ch)
+        first, last = store.apply(ok) if ok else (0, 0)
+        return Report(len(ok), first, last, rejected)
+
     def load_ranker(path: Path):
         return json.loads(Path(path).read_text())
 
-    p = Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker)
+    p = Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker, apply_changes)
     p.stores = stores  # type: ignore[attr-defined]
     return p
 
