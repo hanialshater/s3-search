@@ -211,10 +211,9 @@ def test_synonym_mappings_accepted(ds):
         api.build_index(ds.catalogue, _with_synonyms(ds, syn))
 
 
-@pytest.mark.xfail(strict=True, reason="defect found by S7-9 (steward, 2026-11-10): exists skips values that analyse "
-                                       "to no token; OpenSearch counts every non-null value. Remove this mark when fixed")
 def test_exists_counts_values_without_tokens(ds):
-    """exists on a text field matches a document whose value analyses to no token (stop words, punctuation)."""
+    """exists on a text field matches a document whose value analyses to no token (stop words, punctuation). Found by
+    S7-9 on ESCI-sample; fixed in 8d6344f."""
     cat = ds.catalogue.copy()
     cat.loc[cat.index[0], "product_description"] = "the and of"
     cat.loc[cat.index[1], "product_color"] = "-"

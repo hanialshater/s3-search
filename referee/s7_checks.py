@@ -142,6 +142,18 @@ def check_s7_3(index, ds):
         total, got = _ids(index, {"query": {"exists": {"field": field}}})
         if got != exp or total != len(exp):
             problems.append(f"exists {field}: {len(got)} hits, expected {len(exp)}")
+    # exists follows the stored value, as OpenSearch does: values that analyse to no token still exist.
+    import engine.api as _api
+    tc = c.copy()
+    tc.loc[0, "product_description"], tc.loc[1, "product_color"], tc.loc[2, "product_bullet_point"] = "the and of", "-", "!!"
+    tidx = _api.build_index(tc, ds.mapping)
+    for field in ("product_description", "product_color", "product_bullet_point", "product_color.keyword"):
+        col = field.split(".")[0]
+        exp = {p for p, v in zip(ids, tc[col]) if pd.notna(v)}
+        total, got = _ids(tidx, {"query": {"exists": {"field": field}}})
+        if got != exp or total != len(exp):
+            problems.append(f"exists {field} with token-less values: {len(got)} hits, expected {len(exp)}; "
+                            f"missing {sorted(exp - got)[:3]}")
     want = [ids[3], ids[77], "NO-SUCH-ID", ids[150]]
     total, got = _ids(index, {"query": {"ids": {"values": want}}})
     if got != set(want) - {"NO-SUCH-ID"} or total != 3:

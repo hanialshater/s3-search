@@ -209,6 +209,16 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
     raw = json.dumps(m.raw, sort_keys=True, default=str)
     ident = hashlib.sha256((raw + "\x00".join(ids[:1000]) + f"|{N}|{version}|{len(text.vocab)}").encode())
     seg.source = source
+    # which docs have a value, for exists: the stored value, not its tokens (a value of stop words or punctuation
+    # still exists, as OpenSearch counts it); a keyword over ignore_above is not indexed, so it does not exist
+    for f in m.text:
+        col = catalogue[f].tolist() if f in catalogue.columns else [None] * N
+        seg.present[f] = pack_bits(np.array([not _is_missing(v) for v in col], bool))
+    for f, spec in m.keyword.items():
+        src = spec["source"]
+        col = catalogue[src].tolist() if src in catalogue.columns else [None] * N
+        seg.present[f] = pack_bits(np.array([not _is_missing(v) and len(str(v)) <= spec["ignore_above"] for v in col],
+                                            bool))
     seg.manifest = {
         "version": int(version), "segment_id": f"seg-{int(version)}-{ident.hexdigest()[:8]}",
         "created": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "analyzer": ANALYZER_VERSION,
@@ -325,6 +335,13 @@ def merge_segments(segs: list[SegmentArrays], mapping: dict | None = None, versi
     for s in segs:
         for f, e in s.encoders.items():
             out.encoders.setdefault(f, e)
+    if all(s.present for s in segs):
+        for f in first.present:
+            col = np.zeros(N, bool)
+            for k, s in enumerate(segs):
+                sel = np.flatnonzero(si == k)
+                col[sel] = nb.unpack_bits(np.asarray(s.present[f]), s.n_docs)[li[sel]]
+            out.present[f] = pack_bits(col)
     if all(s.source for s in segs):
         for f in first.source:
             col = np.empty(N, dtype=object)
@@ -340,4 +357,5 @@ def merge_segments(segs: list[SegmentArrays], mapping: dict | None = None, versi
     out.manifest.pop("files", None)
     out.manifest.pop("checksum", None)
     out.manifest.pop("source_fields", None)
+    out.manifest.pop("present_fields", None)
     return out

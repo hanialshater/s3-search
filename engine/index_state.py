@@ -139,6 +139,7 @@ class Part:
         self.keyword_codes = {f: np.asarray(c.codes, np.int64) for f, c in seg.keywords.items()}
         self.keyword_values = {f: list(c.values) for f, c in seg.keywords.items()}
         self.vectors = {f: b.asarray(np.asarray(v, np.float32), "float32") for f, v in seg.vectors.items()}
+        self.present = {f: b.unpack_bits(np.asarray(v), self.n) for f, v in seg.present.items()}
         self.host_pos_ptr, self.host_positions = t.pos_ptr, t.positions
         self._positions = None
         self.device_nbytes = device_nbytes(seg)
@@ -374,7 +375,9 @@ class IndexState:
         if kind == "numeric":
             return ~self.missing[field]
         if field not in self._exists:
-            if kind == "text":
+            if kind in ("text", "keyword") and all(field in p.present for p in self.parts):
+                m = self._gather(lambda p: p.present[field], "bool")      # the stored value (segments since S7-9)
+            elif kind == "text":
                 m = b.asarray(self.host_field_len[:, self.field_index[field]] > 0, "bool")
             elif kind == "keyword":
                 m = self.keywords[field].codes > 0
