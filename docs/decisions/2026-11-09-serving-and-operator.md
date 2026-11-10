@@ -53,6 +53,11 @@ develop Kubernetes here). The contract is `docs/INTERFACES.md` §7. Adds no depe
   one Kubernetes field, already part of the pod's status, and survives as long as the pod does; the operator copies it
   into `status.segments`, so it only needs it once.
 
+9. **PyYAML stays out of `requirements.txt`** (decided 2026-11-10): the envtest and manifest tests use it and skip
+   without it, so CI needs no new dependency. The kind workflow installs it for the unit step.
+10. **Rankers** load from the JSON of `GBDT.to_dict()` (no pickle: the route takes a path over HTTP), confined to the
+    serving data dir, until the architect defines a model format in `engine.api`.
+
 **Alternatives.** FastAPI and uvicorn for serving (rejected for now, see 2); an event-driven operator with watches
 (rejected: a few seconds of reconcile latency is invisible next to an index build, and polling survives a restart
 with no state); a Helm chart instead of an operator (cannot compare a build result with the live segment, or roll

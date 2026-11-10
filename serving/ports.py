@@ -24,6 +24,8 @@ class Ports:
     build_segment: Callable[[Any, dict, Path], Path]
     # load_index(segment_dir, device) -> Index (engine.api.Index.from_segment)
     load_index: Callable[[Path, str], Any]
+    # load_ranker(path) -> model with predict(X) (for Index.add_ranker); a JSON file written by GBDT.to_dict()
+    load_ranker: Callable[[Path], Any] | None = None
 
 
 def default_ports() -> Ports:
@@ -64,7 +66,12 @@ def default_ports() -> Ports:
         from engine.api import Index
         return Index.from_segment(path, device=device)
 
-    return Ports(open_store, ingest, prepare, build_segment, load_index)
+    def load_ranker(path: Path):
+        # engine.api has no ranker save/load; the model class has to_dict/from_dict, so a ranker file is its JSON.
+        from engine.rank.gbdt import GBDT
+        return GBDT.from_dict(json.loads(Path(path).read_text()))
+
+    return Ports(open_store, ingest, prepare, build_segment, load_index, load_ranker)
 
 
 def read_manifest(segment_dir: Path) -> dict:

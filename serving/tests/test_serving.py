@@ -288,6 +288,42 @@ def test_source_from_the_store(idx):
     assert "_source" not in call(app, "POST", "/indexes/shop/_search", {"size": 1})[1]["hits"]["hits"][0]
 
 
+# ---- mapping and rankers ----------------------------------------------------------------------------------------
+def test_mapping_route_tells_what_is_facetable_filterable_sortable(idx):
+    app, _ = idx
+    st, body, _ = call(app, "GET", "/indexes/shop/_mapping")
+    assert st == 200 and body["shop"]["mappings"]["properties"]["price"] == {"type": "float"}
+    f = body["shop"]["s3_fields"]
+    assert f["title"]["searchable"] and not f["title"]["facetable"]
+    assert f["title.keyword"]["facetable"] and f["title.keyword"]["sortable"] and f["title.keyword"]["filterable"]
+    assert f["price"]["sortable"] and f["price"]["filterable"] and f["price"]["hot"] and not f["price"]["facetable"]
+    assert call(app, "GET", "/indexes/ghost/_mapping")[0] == 404
+
+
+def test_ranker_loads_survives_swap_and_is_confined_to_data_dir(idx, tmp_path):
+    app, _ = idx
+    mi = app.manager.get("shop")
+    (tmp_path / "data" / "g.json").write_text('{"model": 1}')
+    st, body, _ = call(app, "POST", "/indexes/shop/_rankers", {"name": "gbdt", "path": "g.json"})
+    assert st == 200 and body == {"name": "gbdt", "rankers": ["gbdt"]} and mi.index.rankers["gbdt"] == {"model": 1}
+    call(app, "POST", "/indexes/shop/_reindex", {})
+    assert "gbdt" in mi.index.rankers and call(app, "GET", "/indexes/shop")[1]["rankers"] == ["gbdt"]
+    for bad in ({"name": "x", "path": "../../etc/passwd"}, {"name": "x", "path": "missing.json"}, {"path": "g.json"}):
+        assert call(app, "POST", "/indexes/shop/_rankers", bad)[0] == 400
+
+
+def test_startup_rankers_are_added_on_preload(make, tmp_path):
+    app, ports = make()
+    create(app, tmp_path)
+    (tmp_path / "data" / "g.json").write_text("{}")
+    r = create_app(ServingConfig(data_dir=str(tmp_path / "data"), preload=[("shop", None)], rankers={"g": "g.json"}), ports)
+    try:
+        r.preload()
+        assert "g" in r.manager.get("shop").index.rankers
+    finally:
+        r.close()
+
+
 # ---- health, metrics, preload -----------------------------------------------------------------------------------
 def test_health_ready_metrics(make, tmp_path):
     app, _ = make()

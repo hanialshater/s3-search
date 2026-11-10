@@ -495,6 +495,8 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
 | `POST /indexes/{name}/_reindex` | `{}` → `{"segment_id", "version"}`: build from the store, swap |
 | `GET /indexes/{name}/versions` | → `[{"segment_id", "version", "created", "live": bool}]` |
 | `POST /indexes/{name}/_rollback` | `{"segment_id"}` → `{"segment_id", "version"}`: swap to a kept segment, replay the log after it |
+| `GET /indexes/{name}/_mapping` | → `{name: {"mappings": <the mapping>, "s3_fields": {field: {"type", "searchable", "filterable", "facetable", "sortable", "dense", "hot"[, "dimension"]}}}}`; sub-fields appear as `f.keyword`. Facetable = keyword; filterable and sortable = keyword and numeric/boolean; searchable = text |
+| `POST /indexes/{name}/_rankers` | `{"name", "path"}` → `{"name", "rankers": [...]}`: loads a ranker file (the JSON of `GBDT.to_dict()`; `engine.api` has no save/load of its own, so this is interim) from under the serving data dir into `Index.add_ranker`; kept across swaps. At startup: `S3_SERVING_RANKERS=name=path,...` |
 | `GET /indexes`, `GET /indexes/{name}` | what is loaded: segment id, version, docs, device, cache counters |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | liveness; ready once every configured index has a segment loaded (503 while loading or draining); Prometheus text (below) |
 
@@ -615,6 +617,7 @@ status:
   `dataplane.indexer.build` and `engine.api.Index` (`from_segment`, `search`, `search_batch`, `patch`, `delete`,
   `set_version`, `.version`, `.n_docs`) exactly as §3 to §5 define them; engine exceptions named `UnsupportedQuery`,
   `InvalidRequest`, `InvalidMapping`, `OverBudget`, `DeviceUnavailable`, `NotHot`, `NoSuchKey`, `CorruptSegment`.
+- 2026-11-10, platform-engineer: added `GET /indexes/{name}/_mapping` (field capabilities for the demo page) and `POST /indexes/{name}/_rankers` (+ `S3_SERVING_RANKERS`); `GET /indexes` info lists `rankers`. Additive. Asks the architect for a ranker save/load in `engine.api`.
 - 2026-11-10, architect (S5 judgement, defects 2 and 3; additive to section 5): every explain node gains a
   machine-readable `op` (`sum`, `product`, `max`, `value`, `ranker`), and may carry `source`. A rescored hit is
   explained as `op: "ranker"`: the ranker's score = base + each feature's contribution, each with its value, the
