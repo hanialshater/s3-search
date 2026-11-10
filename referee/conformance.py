@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -94,7 +95,7 @@ def _outcome(index, req):
         return {"error": type(e).__name__}
 
 
-def compare(got, exp, family, against="reference") -> list:
+def compare(got, exp, family, against="reference", os_scores=True) -> list:
     """Differences between two outcomes; [] means the request passes."""
     if "error" in exp or "error" in got:
         unsupported = {"UnsupportedQuery", "InvalidRequest", "opensearch_error"}
@@ -113,12 +114,7 @@ def compare(got, exp, family, against="reference") -> list:
     gh, eh = g["hits"]["hits"], e["hits"]["hits"]
     gi, ei = [h["_id"] for h in gh], [h["_id"] for h in eh]
     if against == "opensearch":
-        if family in ("filter", "sort"):
-            if gi != ei:
-                out.append("ids differ")
-        elif ei and len(set(gi) & set(ei)) < 0.9 * len(ei):
-            out.append(f"only {len(set(gi) & set(ei))} of {len(ei)} ids in common")
-        return out
+        return out + compare_hits_os(gh, eh, os_scores)
     if len(gi) != len(ei):
         return out + [f"{len(gi)} hits != {len(ei)}"]
     sorted_by_score = "sort" not in g.get("_request", {})
@@ -133,6 +129,107 @@ def compare(got, exp, family, against="reference") -> list:
                 out.append(f"ids differ at rank {grp[0]}")
                 break
     return out
+
+
+OS_TOL = 1e-3   # relative: Lucene stores field lengths in one byte (lossy beyond short fields) and sums in float32
+
+
+def compare_hits_os(gh, eh, scores=True) -> list:
+    """Hits against OpenSearch's. With scores: per rank within OS_TOL, ids equal except inside tie groups (scores within
+    OS_TOL; a group cut by the page may show different members). With a field sort OpenSearch returns `_score: null`:
+    ids must then be equal exactly (both tie-break by index order, which is catalogue order on one shard)."""
+    gi, ei = [h["_id"] for h in gh], [h["_id"] for h in eh]
+    if len(gi) != len(ei):
+        return [f"{len(gi)} hits != {len(ei)}"]
+    if not scores:  # Lucene's BM25 differs by design (see lucene_model.py): compare which hits, not their order
+        return [] if set(gi) == set(ei) else [f"{len(set(gi) ^ set(ei))} ids differ (as sets)"]
+    if any(h.get("_score") is None for h in eh):
+        return [] if gi == ei else ["ids differ (field sort)"]
+    for i, (x, y) in enumerate(zip(gh, eh)):
+        if not checks._close(x["_score"], y["_score"], OS_TOL):
+            return [f"rank {i}: score {x['_score']} != {y['_score']}"]
+    if gi != ei:
+        for grp in checks._groups([h["_score"] for h in eh], OS_TOL):
+            if {gi[i] for i in grp} != {ei[i] for i in grp} and grp[-1] != len(ei) - 1:
+                return [f"ids differ at rank {grp[0]}"]
+    return []
+
+
+# ---- recordings of OpenSearch's answers -----------------------------------------------------------------------------
+
+RECORDING = Path(__file__).resolve().parent / "conformance" / f"opensearch-2.19-toy-v{SUITE_VERSION}.jsonl.gz"
+
+
+def record(os_index, suite, path=RECORDING, meta=None) -> Path:
+    """Replay the suite against OpenSearch and write its answers: one JSON line per request (gzip)."""
+    import gzip
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps({"meta": {**(meta or {}), "suite_version": SUITE_VERSION,
+                                      "suite_sha256": suite_sha256(suite)}}) + "\n")
+        for s in suite:
+            try:
+                r = os_index.search(s["request"])
+                r.pop("took_ms", None)
+                o = {"ok": r}
+            except ValueError as e:
+                o = {"error": "opensearch_error", "reason": str(e)[:300]}
+            fh.write(json.dumps({"id": s["id"], "family": s["family"], **o}, sort_keys=True) + "\n")
+    return path
+
+
+class Recorded:
+    """OpenSearch's recorded answers behind `search`, looked up by request."""
+
+    def __init__(self, suite, path=RECORDING):
+        import gzip
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            lines = [json.loads(x) for x in fh if x.strip()]
+        self.meta = lines[0]["meta"]
+        if self.meta["suite_sha256"] != suite_sha256(suite):
+            raise ValueError("the recording is of a different suite")
+        by_id = {x["id"]: x for x in lines[1:]}
+        self._by_req = {json.dumps(s["request"], sort_keys=True): by_id[s["id"]] for s in suite}
+
+    def search(self, req):
+        x = self._by_req[json.dumps(req, sort_keys=True)]
+        if "error" in x:
+            raise ValueError(x["reason"])
+        return json.loads(json.dumps(x["ok"]))
+
+
+def run_suite_os(index, recorded, suite, os_scores=True) -> dict:
+    """The engine (or reference) against OpenSearch's recorded answers. Per family; the `unsupported` family passes
+    when the engine refuses with UnsupportedQuery (OpenSearch answers those: they are outside the subset by design);
+    families with os=False (multi_match: OpenSearch's best/most/cross_fields are not BM25F) are compared and shown
+    but left out of the pass rate."""
+    results = []
+    for s in suite:
+        req = s["request"]
+        g = _outcome(index, req)
+        e = _outcome(recorded, req)
+        if s["family"] == "unsupported":
+            diffs = [] if g.get("error") in ("UnsupportedQuery", "InvalidRequest") else [f"engine answered: {g}"[:200]]
+        elif "error" in e:
+            diffs = [f"OpenSearch refused: {e.get('error')}"]
+        elif "error" in g:
+            diffs = [f"engine refused: {g['error']}"]
+        else:
+            diffs = compare(g, e, s["family"], "opensearch", os_scores or s["family"] in ("sort", "filter", "knn", "knn_filter"))
+        results.append({"id": s["id"], "family": s["family"], "os": s["os"], "passed": not diffs, "diffs": diffs[:3]})
+    counted = [r for r in results if r["os"]]
+    by_family: dict = {}
+    for r in results:
+        f = by_family.setdefault(r["family"] + ("" if r["os"] else " (informational)"), [0, 0])
+        f[0] += r["passed"]
+        f[1] += 1
+    passed = sum(r["passed"] for r in counted)
+    return {"kind": "conformance", "against": "opensearch (recorded)", "recording": recorded.meta,
+            "suite_version": SUITE_VERSION, "suite_sha256": suite_sha256(suite), "n": len(counted), "passed": passed,
+            "pass_rate": passed / len(counted) if counted else None,
+            "by_family": {k: f"{a}/{b}" for k, (a, b) in sorted(by_family.items())},
+            "failures": [r for r in results if not r["passed"]][:40]}
 
 
 def run_suite(index, expected, suite=None, against="reference") -> dict:
@@ -165,15 +262,36 @@ def run_suite(index, expected, suite=None, against="reference") -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee conformance")
     ap.add_argument("--engine", default="engine", choices=("engine", "reference"))
-    ap.add_argument("--against", default="reference", choices=("reference", "opensearch"))
+    ap.add_argument("--against", default="reference", choices=("reference", "recorded", "opensearch"),
+                    help="recorded: OpenSearch's committed answers; opensearch: a live server (S3_SEARCH_OPENSEARCH_URL)")
+    ap.add_argument("--record", action="store_true", help="replay the suite on a live OpenSearch and write the recording")
+    ap.add_argument("--os-scores", default="strict", choices=("strict", "sets"),
+                    help="against OpenSearch: strict compares BM25 scores (1e-3); sets compares the hit sets of scored "
+                         "families (Lucene's BM25 differs by design, lucene_model.py)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", default="results/conformance.json")
     a = ap.parse_args(argv)
     from referee.bench import get_api
     ds = loader.load_dataset("toy")
+    suite = build_suite(ds)
+    if a.record:
+        from referee import opensearch
+        p = record(opensearch.build_index(ds.catalogue, ds.mapping), suite,
+                   meta={"server": "OpenSearch 2.19.1 (Lucene 9.12.1), single node, one shard", "dataset": "toy",
+                         "analyzer": os.environ.get("S3_SEARCH_OS_ANALYZER") or "s3_english (referee/opensearch.py)"})
+        print(f"recorded {len(suite)} answers -> {p}")
+        return 0
     index = get_api(a.engine).build_index(ds.catalogue, ds.mapping, device=a.device)
-    expected = get_api(a.against).build_index(ds.catalogue, ds.mapping, device="cpu")
-    rep = run_suite(index, expected, build_suite(ds), a.against)
+    if a.against in ("recorded", "opensearch"):
+        expected = Recorded(suite) if a.against == "recorded" else \
+            get_api("opensearch").build_index(ds.catalogue, ds.mapping)
+        if a.against == "opensearch":
+            expected.meta = {"live": True}
+        rep = run_suite_os(index, expected, suite, a.os_scores == "strict")
+        rep["os_scores"] = a.os_scores
+    else:
+        rep = run_suite(index, get_api(a.against).build_index(ds.catalogue, ds.mapping, device="cpu"), suite,
+                        a.against)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(rep, indent=1) + "\n")
     print(f"conformance v{SUITE_VERSION} ({a.engine} vs {a.against}, {a.device}): {rep['passed']}/{rep['n']} "
