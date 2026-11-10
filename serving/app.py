@@ -239,7 +239,7 @@ def make_server(app: App, host: str | None = None, port: int | None = None) -> T
     return Server((host if host is not None else app.cfg.host, app.cfg.port if port is None else port), Handler)
 
 
-def serve_forever(app: App, server: ThreadingHTTPServer) -> None:
+def serve_forever(app: App, server: ThreadingHTTPServer, extra: tuple = ()) -> None:
     """Run until SIGTERM/SIGINT; on the signal, fail readiness, wait ``drain_seconds`` for the endpoint to be removed
     from the Service, then stop. This is what keeps a rolling update from dropping in-flight queries."""
     import signal
@@ -248,6 +248,8 @@ def serve_forever(app: App, server: ThreadingHTTPServer) -> None:
         def _shutdown():
             app.draining = True
             time.sleep(app.cfg.drain_seconds)
+            for x in extra:
+                x.shutdown()
             server.shutdown()
         threading.Thread(target=_shutdown, daemon=True).start()
 
@@ -255,4 +257,6 @@ def serve_forever(app: App, server: ThreadingHTTPServer) -> None:
     signal.signal(signal.SIGINT, stop)
     server.serve_forever()
     server.server_close()
+    for x in extra:
+        x.server_close()
     app.close()

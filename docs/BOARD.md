@@ -84,6 +84,6 @@ Added by the coordinator, 2026-11-10, on the founder's ask for good feature cove
 | S7-4 | Metric and bucket aggregations: `min`, `max`, `avg`, `sum`, `stats`, `value_count`, `cardinality` (exact), `range`, `histogram`, one level of sub-aggregations under `terms` | architect | open | |
 | S7-5 | `highlight` (plain, on text fields) and `function_score` with `field_value_factor` and `weight` | architect | open | |
 | S7-6 | Synonyms in the analyzer, defined in the mapping (query-time) | architect | open | |
-| S7-7 | RPC serving next to HTTP; the operator on watches and a leader-election Lease | platform-engineer | open | |
+| S7-7 | RPC serving next to HTTP; the operator on watches and a leader-election Lease | platform-engineer | claimed | platform-engineer 2026-11-10 |
 | S7-8 | Demo: autocomplete, highlights, multi-select facets with `post_filter`, sort control, collapse by brand | tools-engineer | open | |
 | S7-9 | Conformance families for S7's features, recorded against OpenSearch | evaluation-steward | open | |
