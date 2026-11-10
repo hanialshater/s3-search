@@ -81,6 +81,12 @@ SCOPE = [
      {"size": 0, "aggs": {"c": {"terms": {"field": "category"}, "aggs": {
          "b": {"terms": {"field": "product_brand.keyword"}, "aggs": {"p": {"avg": {"field": "price"}}}}}}}}),
     ("script_fields", None, False, "script_fields", {"query": Q, "script_fields": {"x": {"script": "1"}}}),
+    # S9-1: knn's method and method_parameters (6d1f7f4); without cuVS they run as exact and say so
+    ("knn method cagra", "S9-1", True, "method",
+     {"query": {"knn": {"embedding": {"vector": [0.1] * 16, "k": 3, "method": "cagra"}}}}),
+    ("knn method ivf_pq with method_parameters", "S9-1", True, "method",
+     {"query": {"knn": {"embedding": {"vector": [0.1] * 16, "k": 3, "method": "ivf_pq",
+                                      "method_parameters": {"n_probes": 8}}}}}),
     # Outside S9's geo and nested scope (S9-4, S9-5 are mapping items below): refused for good
     ("geo_shape", None, False, "geo_shape", {"query": {"geo_shape": {"location": {"shape": {
         "type": "envelope", "coordinates": [[-74.1, 40.7], [-73.9, 40.5]]}}}}}),
@@ -100,7 +106,6 @@ SCOPE = [
 
 # S7 items that are mapping settings, not request constructs: {item: landed}
 MAPPING_ITEMS = {"S7-6": True,
-                 "S9-1": False,   # an approximate knn method in the mapping (cuVS)
                  "S9-4": True,    # geo_point, geo_distance, geo_bounding_box, _geo_distance sort (71a32c4)
                  "S9-5": True}    # nested documents, the nested query and aggregation (4b09756)
 

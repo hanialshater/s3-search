@@ -4,8 +4,8 @@ Written 2026-11-10 before any GPU result existed (owner: evaluation-steward, P6)
     python -m referee.gpu_judges [--out=results-s9.json] [--queries=2000]
 
 - **p1** (cuVS ANN): ESCI-US with the mapping's tfidf-svd-128 embeddings and a deterministic integer `s9_bucket` (a
-  hash of the product id, 0-9; `s9_bucket == 0` keeps about 10%). Two indexes on `cuda`: exact (the default method)
-  and one per approximate method (`cagra`, `ivf_pq`, at their default parameters). For `--queries` fit query texts,
+  hash of the product id, 0-9; `s9_bucket == 0` keeps about 10%). One index on `cuda`,
+  searched with each method on the request (`exact`, `cagra`, `ivf_pq`, at their default parameters; INTERFACES §5). For `--queries` fit query texts,
   a `neural` knn request (k 10), unfiltered for CAGRA and IVF-PQ and with the bucket pre-filter for filtered CAGRA;
   recall@10 = mean |approx top 10 ∩ exact top 10| / 10. Bars: CAGRA 0.95, filtered CAGRA 0.90, IVF-PQ 0.90. The
   response must name the method that ran (`s9_checks.method_reported`); if it says exact knn ran, the method is "not
@@ -83,32 +83,29 @@ def p1_ann(n_queries=2000, dataset="esci-us"):
            "bucket_share": float(np.mean(np.asarray(cat["s9_bucket"]) == 0))}
     flt = {"term": {"s9_bucket": 0}}
 
-    def req(text, filtered):
-        spec = {"query_text": text, "k": 10}
+    def req(text, filtered, method):
+        # INTERFACES section 5 (S9-1, 6d1f7f4): the method is on the request, at its default parameters here
+        spec = {"query_text": text, "k": 10, "method": method}
         if filtered:
             spec["filter"] = flt
         return {"query": {"neural": {"embedding": spec}}, "size": 10}
 
-    def ids(index, filtered):
+    def ids(filtered, method):
         res, ran = [], set()
         for i in range(0, len(texts), 64):
-            for r in index.search_batch([req(t, filtered) for t in texts[i:i + 64]]):
+            for r in exact.search_batch([req(t, filtered, method) for t in texts[i:i + 64]]):
                 res.append([h["_id"] for h in r["hits"]["hits"]])
                 rep = method_reported(r)
                 ran.add(rep[0] if rep else None)
         return res, ran
 
-    truth = {False: ids(exact, False)[0], True: ids(exact, True)[0]}
+    truth = {False: ids(False, "exact")[0], True: ids(True, "exact")[0]}
     for method, filtered, bar, key in (("cagra", False, 0.95, "cagra"), ("cagra", True, 0.90, "cagra_filtered"),
                                        ("ivf_pq", False, 0.90, "ivf_pq")):
         try:
             t = time.perf_counter()
-            idx = out.setdefault("_built", {}).get(method)
-            if idx is None:
-                idx = api.build_index(cat, _with_embeddings(base, method), device=DEV)
-                out["_built"][method] = idx
-                out[f"build_{method}_s"] = time.perf_counter() - t
-            got, ran = ids(idx, filtered)
+            got, ran = ids(filtered, method)
+            out[f"search_{key}_s"] = time.perf_counter() - t  # includes building the method's index on first use
             rec = float(np.mean([len(set(a) & set(b)) / max(1, len(b)) for a, b in zip(got, truth[filtered])]))
             entry = {"recall@10": rec, "bar": bar, "method_reported": sorted(map(str, ran))}
             if ran != {method}:
@@ -118,7 +115,6 @@ def p1_ann(n_queries=2000, dataset="esci-us"):
             out[key] = entry
         except Exception as e:  # noqa: BLE001
             out[key] = {"verdict": f"not judged: {type(e).__name__}: {e}", "trace": traceback.format_exc()[-800:]}
-    out.pop("_built", None)
     return out
 
 

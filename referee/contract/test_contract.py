@@ -255,3 +255,20 @@ def test_geo_nested_checks_catch_planted_errors(ds):
     from referee import s9_geo_nested_checks as gn
     assert gn.check_geo(None, ds, build=_build_rewriting(_km_as_mi)), "a wrong distance unit must be caught"
     assert gn.check_nested(None, ds, build=_build_rewriting(_score_mode_sum)), "a wrong score_mode must be caught"
+
+
+class _NoKnnField:
+    """Planted: answers knn but leaves out the response's knn.<field> (the method that ran)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def search(self, r):
+        out = self.inner.search(r)
+        out.pop("knn", None)
+        return out
+
+
+def test_s9_1_check_catches_a_silent_method(index, ds):
+    from referee import s9_checks
+    assert s9_checks.check_s9_1(_NoKnnField(index), ds), "a response that does not name the method must be caught"
