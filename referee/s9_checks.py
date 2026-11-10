@@ -68,4 +68,6 @@ def check_s9_1(index, ds, build=None):
     return problems[:12]
 
 
-CHECKS = {"S9-1": check_s9_1}
+from referee.s9_geo_nested_checks import check_geo, check_nested  # noqa: E402
+
+CHECKS = {"S9-1": check_s9_1, "S9-4": check_geo, "S9-5": check_nested}
