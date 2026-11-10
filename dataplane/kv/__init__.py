@@ -29,6 +29,7 @@ from dataplane.mapping import ID_MAX_BYTES, BadValue, Mapping, as_mapping, coerc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS blobs (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS docs (
     id TEXT PRIMARY KEY, doc TEXT NOT NULL, vecf TEXT NOT NULL, vec BLOB,
     first_offset INTEGER NOT NULL, last_offset INTEGER NOT NULL);
@@ -117,6 +118,14 @@ class Store:
     def set_meta(self, key: str, value: str) -> None:
         with self._conn() as c:
             c.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+
+    def blob(self, key: str) -> bytes | None:
+        row = self._conn().execute("SELECT value FROM blobs WHERE key = ?", (key,)).fetchone()
+        return None if row is None else bytes(row[0])
+
+    def set_blob(self, key: str, value: bytes) -> None:
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO blobs VALUES (?, ?)", (key, value))
 
     # ---- vectors ----------------------------------------------------------------------------------------------------
     def _split(self, doc: dict) -> tuple[dict, str, bytes | None]:

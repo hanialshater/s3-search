@@ -160,10 +160,16 @@ go to `rejected.jsonl`, one `{"record": ..., "rejection": ...}` per line.
 - **A batch file is one atomic batch** (one `store.apply`, consecutive offsets). Within it, the first valid record of
   an id wins; later ones are `duplicate_id_in_batch`. The change feed (`apply_changes`, §7's `_docs`) rejects bad
   records one by one and commits the rest as one batch; ids repeat freely there, in order.
-- **Encoders.** `encoder=None` resolves each vector field's `_meta.engine.embeddings.<field>.model` through
-  `dataplane.intake.encoders.register(name, factory)`; an unregistered name gets the deterministic `HashingEncoder`
-  (signed feature hashing of words and bigrams; `name` `hash-<dim>`), the development default. A store records the
-  encoder of each vector field (`store.meta("encoder.<field>")`) and refuses to mix in another one.
+- **Encoders.** `encoder=None` resolves each vector field's `_meta.engine.embeddings.<field>.model`: a factory
+  registered with `dataplane.intake.encoders.register(name, factory)`, else **the engine's encoder**
+  (`engine.encode.get_encoder`, v1 `tfidf-svd-<d>`), else the deterministic `HashingEncoder` (`hash-<dim>`; `knn`
+  only). The encoder reads the engine's text form (`engine.encode.doc_texts`: inputs joined by `" | "`). A fittable
+  encoder is fitted **once per store**, by the first batch that needs it, on every accepted doc of that batch (as
+  `build_index` fits on its catalogue), and its arrays are kept in the store (`store.blob("encoder.<field>")`); later
+  batches and the change feed reuse it (terms outside its vocabulary do not count, as for any fitted encoder). A store
+  records each vector field's encoder name (`store.meta("encoder.<field>")`) and refuses to mix in another one.
+  The indexer passes that name as `build_segment(..., vector_models=)` and puts the fitted arrays in the segment
+  (`SegmentArrays.encoders`, `vector_fields.<f>.encoder = true`), so `neural` queries work on a data-plane segment.
 
 ## 3. Key-value store and change log (intake → indexer and updater) · owner dataplane-engineer
 
@@ -627,3 +633,7 @@ status:
   promised per-feature contributions, and the tools and serving need to read explanations and rankers without
   parsing prose or pickles. Checked by `engine/tests/test_explain.py` against the pre-registered prediction (100
   lexical and 100 rescored explanations sum to the hit's score within 1e-4, on toy).
+- 2026-11-10, dataplane-engineer (defect 4): section 2's encoder rule. Intake now uses the engine's encoder by name,
+  fits it once per store and keeps it there (`Store.blob`, `Store.set_blob`, additive); the indexer passes
+  `vector_models` and the fitted encoder to the segment. Why: a segment of intake-made vectors recorded model
+  "given" and no encoder, so `neural` raised `UnsupportedQuery` where `build_index` answered.

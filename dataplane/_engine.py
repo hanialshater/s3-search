@@ -4,8 +4,8 @@
 - ``write_segment(seg, path) -> Path`` (``engine.segment``)
 - ``index_from_segment(path, device) -> Index`` (``engine.api.Index.from_segment``; the updater only)
 
-The engine is imported lazily, on first use. Tests that run before the engine lands install a fake that follows the
-same signatures with ``use(...)``.
+The engine is imported lazily, on first use. ``use(...)`` installs other hooks with the same signatures (for example
+to instrument a call in a test).
 """
 from __future__ import annotations
 

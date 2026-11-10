@@ -6,26 +6,28 @@ import pytest
 
 from dataplane.indexer import build
 from dataplane.updater import OverBudget, Replica
-from dataplane.tests.conftest import load
+from dataplane.tests.conftest import load, value
 
 BIG = 1 << 40
 
 
 def price(replica, _id):
-    idx = replica.index
-    return float(idx.cols["price"][0][idx.pos[_id]])
+    return value(replica.index, _id, "price")
 
 
 @pytest.fixture
-def setup(tmp_path, store, catalogue, fake):
+def setup(tmp_path, store, catalogue):
     load(store, catalogue)
     seg = build(store, None, tmp_path / "segs")
     return store, seg, tmp_path / "segs"
 
 
-def test_poll_patches_in_place_and_tombstones(setup):
+def test_poll_patches_in_place_and_tombstones(setup, monkeypatch):
     store, seg, _ = setup
     r = Replica(store, seg, budget=BIG)
+    calls = []
+    real_patch = r.index.patch
+    monkeypatch.setattr(r.index, "patch", lambda f, ids, vals: (calls.append(f), real_patch(f, ids, vals)))
     v0 = r.version
     store.apply([{"op": "patch", "_id": "P00001", "fields": {"price": 3.5}},
                  {"op": "patch", "_id": "P00001", "fields": {"price": 4.5, "stock": 0}},   # the last value wins
@@ -36,7 +38,7 @@ def test_poll_patches_in_place_and_tombstones(setup):
     rep = r.poll()
     assert rep.version == v0 + 6 == r.version and rep.changes == 6
     assert (rep.patched, rep.deleted, rep.pending_upserts) == (2, 1, 2)
-    assert price(r, "P00001") == 4.5 and r.index.patch_calls == 2       # one Index.patch per field
+    assert price(r, "P00001") == 4.5 and sorted(calls) == ["price", "stock"]   # one Index.patch per field
     hits = r.search({"query": {"match_all": {}}, "size": 1000})["hits"]
     assert hits["total"] == len(r.live_ids()) and "P00002" not in {h["_id"] for h in hits["hits"]}
     assert r.poll().changes == 0
@@ -60,7 +62,7 @@ def test_swap_replays_and_keeps_old_searches_alive(setup):
     rep = r.swap(seg2)
     assert rep.new_version == store.head() and rep.replayed == 1 and r.segment == seg2
     assert price(r, "NEW") == 6.0 and r.stats()["pending_upserts"] == 0
-    assert "NEW" not in old.pos and old.search({"size": 1})["hits"]["total"] == 200   # the old one still answers
+    assert value(old, "NEW", "price") is None and old.search({"size": 1})["hits"]["total"] == 200   # the old one still answers
     # rollback: swap back to the first segment, replaying the log after it
     r.swap(seg)
     assert r.segment == seg and r.version == store.head() and r.stats()["pending_upserts"] == 2

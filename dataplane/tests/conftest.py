@@ -6,19 +6,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dataplane import _engine
 from dataplane.kv import Store
-from dataplane.tests import fake_engine
 
 MAPPING = {
     "_meta": {"engine": {
         "id_field": "product_id",
         "hot": ["price", "stock"],
         "bm25": {"k1": 1.2, "b": 0.75},
-        "embeddings": {"embedding": {"model": "tfidf-svd-128", "inputs": ["product_title", "product_brand",
+        "embeddings": {"embedding": {"model": "tfidf-svd-16", "inputs": ["product_title", "product_brand",
                                                                            "product_color"]}},
     }},
     "properties": {
+        "product_id": {"type": "keyword"},
         "product_title": {"type": "text", "analyzer": "s3_english"},
         "product_brand": {"type": "text", "analyzer": "s3_english",
                           "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
@@ -68,14 +67,21 @@ def store(tmp_path, mapping):
     s.close()
 
 
-@pytest.fixture
-def fake():
-    with _engine.use(fake_engine.hooks()) as h:
-        yield h
-
-
 def load(store: Store, catalogue: pd.DataFrame) -> tuple[int, int]:
-    from dataplane.intake import enrich, validate
-    docs = [validate(r, store.mapping) for r in catalogue.to_dict("records")]
-    enrich(docs, store.mapping)
-    return store.apply({"op": "upsert", "_id": d["product_id"], "doc": d} for d in docs)
+    """Upsert a catalogue through the change feed (validated, enriched, the encoder fitted and kept in the store)."""
+    from dataplane.intake import apply_changes
+    rep = apply_changes(({"op": "upsert", "_id": r["product_id"], "doc": r} for r in catalogue.to_dict("records")),
+                        store.mapping, store)
+    assert not rep.rejected
+    return rep.first_offset, rep.last_offset
+
+
+def segment_ids(seg) -> list[str]:
+    import pyarrow.parquet as pq
+    return pq.read_table(seg / "ids.parquet", columns=["_id"]).column("_id").to_pylist()
+
+
+def value(index, _id: str, field: str):
+    """A document's value of a numeric field as the index sees it (its sort value), or None if not found."""
+    hits = index.search({"query": {"term": {"product_id": _id}}, "sort": [{field: {"order": "asc"}}]})["hits"]["hits"]
+    return hits[0]["sort"][0] if hits else None
