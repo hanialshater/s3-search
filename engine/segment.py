@@ -57,6 +57,7 @@ class SegmentArrays:
     live: np.ndarray | None = None    # uint32 bitmap
     encoders: dict[str, dict] = field(default_factory=dict)   # vector field -> encoder arrays (terms, idf, components, dim)
     source: dict[str, np.ndarray] = field(default_factory=dict)  # S7-5, optional: text field -> object[N] raw text
+    present: dict[str, np.ndarray] = field(default_factory=dict)  # optional: field -> uint32 bitmap, a stored value
 
     @property
     def n_docs(self) -> int:
@@ -131,6 +132,10 @@ def write_segment(seg: SegmentArrays, path) -> Path:
         _strings(tmp / f"vec/{f}.encoder.terms.parquet", "term", enc["terms"])
         arrays[f"vec/{f}.encoder.idf.npy"] = np.asarray(enc["idf"], np.float32)
         arrays[f"vec/{f}.encoder.components.npy"] = np.asarray(enc["components"], np.float32)
+    if seg.present:
+        (tmp / "present").mkdir()
+        for f, bits in seg.present.items():
+            arrays[f"present/{f}.npy"] = np.asarray(bits, np.uint32)
     if seg.source:
         (tmp / "src").mkdir()
         for f, col in seg.source.items():
@@ -151,6 +156,8 @@ def write_segment(seg: SegmentArrays, path) -> Path:
     version = int(m.get("version", 0))
     if seg.source:
         m["source_fields"] = list(seg.source)
+    if seg.present:
+        m["present_fields"] = list(seg.present)
     m.update(format=FORMAT, format_version=FORMAT_VERSION, n_docs=seg.n_docs, files=files, version=version,
              nbytes=sum(e["bytes"] for e in files.values()), device_nbytes=device_nbytes(seg),
              checksum=checksum, segment_id=f"seg-{version}-{checksum[:8]}")
@@ -209,6 +216,8 @@ def read_segment(path, verify: bool = True, mmap: bool = False) -> SegmentArrays
             seg.encoders[f] = {"terms": strings(f"vec/{f}.encoder.terms.parquet", "term"),
                                "idf": arr(f"vec/{f}.encoder.idf.npy"),
                                "components": arr(f"vec/{f}.encoder.components.npy"), "dim": spec["dim"]}
+    for f in m.get("present_fields", []):                # optional: which docs have a value (exists)
+        seg.present[f] = arr(f"present/{f}.npy")
     for f in m.get("source_fields", []):                 # optional (S7-5)
         col = pd.read_parquet(path / f"src/{f}.parquet")["text"]
         seg.source[f] = np.array([None if v is pd.NA or v is None else str(v) for v in col.tolist()], dtype=object)

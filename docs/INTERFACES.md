@@ -318,6 +318,7 @@ Layout (`seg-<version>-<8 hex>/`):
 | `text/df.npy`, `text/df_field.npy` | int32 [V], int32 [V, F] | document frequency, overall and per field |
 | `text/avg_len.npy` | float32 [F] | mean field length |
 | `text/pos_ptr.npy`, `text/positions.npy` (optional, S7-1) | int64 [P+1]; uint32 [T] | positions, CSR over postings: posting p's are `positions[pos_ptr[p]:pos_ptr[p+1]]`, each `(field << 24) \| position`, ascending; absent in segments built before S7 or with `positions: false`, which still load (phrases are then refused) |
+| `present/<field>.npy` (optional, S7-9 fix) | uint32 bitmap | for text and keyword fields: the docs with a stored value (exists); older segments fall back to tokens (text) and codes (keyword) |
 | `src/<field>.parquet` (optional, S7-5) | `text` string; N rows | a text field's raw text, for highlight (host only; `_meta.engine.source`, default true); older segments load without it (highlight is then refused) |
 | `kw/<field>.codes.npy` | int32 [N] | 0 = missing; codes order = sorted value order |
 | `kw/<field>.values.parquet` | `value` string | row = code; row 0 is `""` |
@@ -460,7 +461,7 @@ Index.from_segment(path, device) -> Index
 | `match` / `multi_match` `fuzziness` (S7-2) | `fuzziness`, `prefix_length`, `max_expansions`, `transpositions` | each analysed query term becomes a clause of its expansions in the queried fields' dictionary; `operator` and `minimum_should_match` count clauses; fuzziness that resolves to 0 everywhere is a plain match; `cross_fields` with fuzziness is `InvalidRequest` (as OpenSearch) |
 | `query.prefix` (S7-2) | `{field: "v"}` or `{field: {"value", "boost"}}` | term-level; text fields: every indexed term of the field starting with it; keyword fields: every value starting with it; constant score `1.0 * boost` |
 | `query.match_bool_prefix` (S7-2) | `{field: "text"}` or `{field: {"query", "operator", "minimum_should_match", "max_expansions": 50, "boost"}}` | text fields; analysed terms but the last are BM25 clauses, the last is a prefix clause (its first `max_expansions` terms in term order, constant 1.0); combined like `match` |
-| `query.exists` (S7-3) | `{"field", "boost"}` | text: at least one token; keyword: a value (empty or over `ignore_above` counts as none); numeric: not missing; knn_vector: a non-zero vector; constant score |
+| `query.exists` (S7-3) | `{"field", "boost"}` | text: a stored value, even one that analyses to no token; keyword: a stored value (an empty string included; over `ignore_above` counts as none); numeric: not missing; knn_vector: a non-zero vector; constant score |
 | `query.ids` (S7-3) | `{"values": [...], "boost"}` | the docs with these `_id`s; constant score |
 | `post_filter` (S7-3) | a query | filters the hits and `hits.total` after aggregations are computed (multi-select facets) |
 | `collapse` (S7-3) | `{"field"}`: keyword or numeric | the top hit per value in sort order (missing values form one group); from/size count groups; `hits.total` counts docs; each hit gains `"fields": {field: [value]}`; with `search_after` refused (`UnsupportedQuery`), with `rescore` `InvalidRequest` |
@@ -843,3 +844,6 @@ status:
   22.6 ms (was 417-538 ms in the dataplane-engineer's stream), a merge's replace of 20 deltas 79 ms.
 - 2026-11-10, architect (S7-6 fix): synonym rules with an empty left side, an empty right side or an empty entry
   (`"lamp =>"`, `"=> light"`, `" , "`), or two `=>`, are `InvalidMapping` naming the rule, as OpenSearch refuses them.
+- 2026-11-10, architect (fix for the steward's S7-9 finding): `exists` on text and keyword fields follows the stored
+  value, not its tokens (a value of stop words or punctuation, or an empty string, exists, as OpenSearch counts it);
+  segments gain optional `present/<field>.npy` bitmaps for it. Additive.
