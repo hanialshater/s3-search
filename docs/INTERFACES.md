@@ -376,7 +376,7 @@ Index.from_segment(path, device) -> Index
 
 | Key | Supported | Notes |
 |---|---|---|
-| `query.match` | `{field: "text"}` or `{field: {"query", "operator": "or"\|"and", "minimum_should_match", "boost"}}` | text fields; BM25 on one field |
+| `query.match` | `{field: "text"}` or `{field: {"query", "operator": "or"\|"and", "minimum_should_match", "boost"}}` | text fields: BM25 on one field; on a keyword or numeric field it is a `term` (as OpenSearch) |
 | `query.multi_match` | `query`, `fields` (`"f^w"` boosts), `type` `best_fields`\|`most_fields`\|`cross_fields`, `operator`, `minimum_should_match`, `tie_breaker` | **all types are scored as BM25F** with field weights = boosts (the prototype's scorer); hit sets follow `operator`/`minimum_should_match` over the analysed query terms |
 | `query.bool` | `must`, `should`, `filter`, `must_not`, `minimum_should_match`, `boost` | scores: sum of `must` and `should`; `filter`/`must_not` do not score |
 | `query.term`, `query.terms` | keyword, numeric, boolean fields | constant score `1.0 * boost` in a scoring context (alone, `must`, `should`); 0 in `filter` and `must_not` |
@@ -409,6 +409,10 @@ Scoring, exactly:
 - `minimum_should_match`: an int, a negative int (all but n), a percentage rounded down, a negative percentage; for
   `match` it counts analysed query terms including unknown ones, so `operator: and` with an unknown term matches
   nothing.
+- **Values by field type** (as OpenSearch): a float field's term value and range bounds are rounded to float32 and
+  compared with the stored float32 (so a price equal to a bound is inside `gte` and `lte`); an integer field refuses a
+  fractional term value (`InvalidRequest`) and treats a fractional bound by comparison (`gte 2.5` is `gte 3`); a
+  boolean field takes `true`/`false` or `"true"`/`"false"`; a keyword field takes the value's string.
 - `boost` multiplies a clause's score. Scores are float32.
 
 **The response:**
@@ -448,10 +452,15 @@ Scoring, exactly:
 
 ## 6. The plan (DSL → operators) · owner architect
 
-`engine/dsl/parse.py: parse(request: dict, state: IndexState) -> Plan` (validates; raises the named errors; in S1
-parsing and planning are one pass, because the parser needs the index's field kinds), wrapped by
-`engine/plan/plan.py: plan(request, state) -> Plan`. `engine/plan/execute.py: Executor(state, rankers).run(plans:
-list[Plan]) -> list[dict]`. Plans are frozen dataclasses (hashable, so the executor groups
+Two passes (S3):
+- `engine/dsl/parse.py: parse(request: dict) -> Request` (`engine/dsl/ast.py`): syntax only, no index. Keys, shapes
+  and value types; anything outside the subset is `UnsupportedQuery` naming its path, malformed input
+  `InvalidRequest`. Field names are not resolved and text is not analysed.
+- `engine/plan/plan.py: plan(request: dict | Request, state: IndexState) -> Plan`: resolves fields and kinds (a field
+  the index lacks is `InvalidRequest`, a field of the wrong kind `UnsupportedQuery`), analyses text, works out
+  `minimum_should_match` and BM25F's idf mode, converts term values and range bounds to the field's type, applies the
+  sort defaults, and checks vector dimensions and encoders.
+- `engine/plan/execute.py: Executor(state, rankers).run(plans: list[Plan]) -> list[dict]`: the batched executor. Plans are frozen dataclasses (hashable, so the executor groups
 equal shapes into one batch).
 
 ```python
@@ -637,3 +646,10 @@ status:
   fits it once per store and keeps it there (`Store.blob`, `Store.set_blob`, additive); the indexer passes
   `vector_models` and the fitted encoder to the segment. Why: a segment of intake-made vectors recorded model
   "given" and no encoder, so `neural` raised `UnsupportedQuery` where `build_index` answered.
+- 2026-11-10, architect (S3): section 6 split into two passes, `parse(request) -> Request` (syntax, `engine/dsl/ast.py`,
+  no index) and `plan(request, state) -> Plan` (semantics), as section 6 first said; `plan` still accepts a dict.
+  Section 5: values are converted by field type as OpenSearch does (float bounds to float32, no fractional term on an
+  integer field), and `match` on a keyword or numeric field is a `term`. Why: S3-1 and S3-2; the float32 rule removes
+  a boundary disagreement with OpenSearch (and with a pandas mask) on float fields. No request that S1 answered is
+  answered differently except a float field's exact-boundary term or range, and a fractional term on an integer field
+  (now refused, before an empty answer).
