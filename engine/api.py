@@ -253,8 +253,23 @@ class Index:
         self._st = st
 
     # ---- ranking
-    def add_ranker(self, name: str, model) -> None:
-        """Register a model with ``predict(X: float32[n, n_features]) -> float32[n]`` for ``rescore.s3_ranker``."""
+    def add_ranker(self, name: str, model, runtime: str = "engine") -> None:
+        """Register a model with ``predict(X: float32[n, n_features]) -> float32[n]`` for ``rescore.s3_ranker``.
+
+        ``runtime`` (S9-3, for an ``engine.rank.gbdt.GBDT``): "engine" (its own device walk, the default),
+        "xgboost" or "fil" (the same model exported to XGBoost's JSON and run by XGBoost or cuML FIL, on the GPU
+        when the index is on cuda), or "auto" (xgboost on cuda when it is installed, else engine)."""
+        from .rank.gbdt import GBDT
+        if runtime != "engine" and isinstance(model, GBDT):
+            from .rank.gpu_trees import GpuTrees
+            if runtime == "auto":
+                try:
+                    import xgboost  # noqa: F401
+                    runtime = "xgboost" if self.device == "cuda" else "engine"
+                except ImportError:
+                    runtime = "engine"
+            if runtime != "engine":
+                model = GpuTrees(model, len(self.feature_names()), runtime, self.device)
         self.rankers[name] = model
 
     def feature_names(self) -> list[str]:

@@ -878,3 +878,7 @@ status:
 - 2026-11-10, architect (S9-5): section 2 gains `nested`; section 4 gains the child segments (`nested/<path>/`,
   listed in the manifest's `nested_fields`); section 5 gains the `nested` query and aggregation; the backend gains
   `segment_max` and `segment_min`. Additive.
+- 2026-11-10, architect (S9-2, S9-3): the embeddings spec gains `"fit": "numpy" | "gpu" | "cuml" | "auto"` (the SVD on
+  the GPU with CuPy; numpy stays the default) and `Index.add_ranker(name, model, runtime=)` gains "xgboost", "fil"
+  and "auto" (the GBDT exported to XGBoost's JSON). Optional imports; decision record
+  `docs/decisions/2026-11-10-s9-gpu-dependencies.md`.

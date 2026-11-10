@@ -220,7 +220,7 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
                     vec[i] = a
             model = (vector_models or {}).get(f) or (catalogue.attrs.get("vector_models") or {}).get(f) or "given"
         elif f in m.embeddings:
-            enc = get_encoder(m.embeddings[f]["model"])
+            enc = get_encoder(m.embeddings[f]["model"], m.embeddings[f].get("fit", "numpy"))
             texts = doc_texts(catalogue, m.embeddings[f].get("inputs") or m.text[:1])
             vec = enc.fit_transform(texts)
             model = enc.name
