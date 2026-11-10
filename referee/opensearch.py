@@ -131,8 +131,9 @@ def _convert(resp, took_ms):
         {"_id": h["_id"], "_score": h.get("_score"), **({"sort": h["sort"]} if "sort" in h else {})}
         for h in hits["hits"]]}, "took_ms": {"total": took_ms, "opensearch": float(resp.get("took", 0))}}
     if "aggregations" in resp:
-        out["aggregations"] = {k: {"buckets": [{"key": b["key"], "doc_count": b["doc_count"]} for b in v["buckets"]],
-                                   "sum_other_doc_count": v.get("sum_other_doc_count", 0)}
+        # terms aggregations in the engine's shape; any other aggregation (outside the subset) passed through as is
+        out["aggregations"] = {k: ({"buckets": [{"key": b["key"], "doc_count": b["doc_count"]} for b in v["buckets"]],
+                                    "sum_other_doc_count": v.get("sum_other_doc_count", 0)} if "buckets" in v else v)
                                for k, v in resp["aggregations"].items()}
     return out
 
