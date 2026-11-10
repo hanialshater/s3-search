@@ -419,9 +419,14 @@ The S1 rules for the data plane (settled 2026-11-09):
   rule.
 - `Index.patch` and `Index.delete`: `NoSuchKey` (a `KeyError`) for ids the segment never held; already-deleted ids
   are ignored by both (a patch to a deleted id is not applied). `None` or NaN in a patch makes the value missing.
-- **Concurrency:** an `Index` is thread-safe. `search`, `search_batch`, `patch`, `delete`, `set_version`, `save`
-  and `candidate_features` take one re-entrant lock per `Index`, so a search sees a whole `patch`/`delete` call or
-  none of it. Searches on one `Index` therefore run one batch at a time; serving batches with `search_batch`.
+- **Concurrency (S8-2c, copy-on-write):** an `Index` is thread-safe and searches never wait on writers. A search (or
+  `search_batch`, `candidate_features`) reads the current state reference once and runs on that state to the end,
+  without a lock. Writers (`patch`, `delete`, `set_version`, `add_segment`, `replace_segments`, `remove_segment`,
+  `save`, `save_commit`) are serialised by a writer lock; each changes a clone of the state (a `patch` copies only
+  the patched hot column; a structural change copies the slot columns and, on first write, the touched segments'
+  live bits; immutable arrays are shared) and publishes it by swapping one reference. **Visibility rule:** a change
+  is visible to every search that starts after the writer's call returns, and to no search that started before it;
+  a search sees one whole state, never part of a change.
 
 ## 5. The search request and response (serving → engine) · owner architect
 
@@ -847,3 +852,7 @@ status:
 - 2026-11-10, architect (fix for the steward's S7-9 finding): `exists` on text and keyword fields follows the stored
   value, not its tokens (a value of stop words or punctuation, or an empty string, exists, as OpenSearch counts it);
   segments gain optional `present/<field>.npy` bitmaps for it. Additive.
+
+- 2026-11-10, architect (S8-2c): copy-on-write states and a writer lock replace the Index RLock (section 4,
+  "Concurrency", with the visibility rule); a multi-segment index scores all segments' postings in one pass
+  (`ops.bm25f_multi`). Why: under 200 changes/s, searches waited on the RLock for whole refreshes.

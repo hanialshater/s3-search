@@ -96,12 +96,12 @@ class Executor:
                 w[st.field_index[f]] = wt
             bb = np.full(F, st.mapping.b, np.float32)
             f_i = next(st.field_index[f] for f, wt in fields if wt > 0) if idf_mode == "field" else None
-            scores = nmatch = None
-            for part in st.parts:                       # one pass per segment, into the slot-ordered buffers
-                idf = part.idf_field[:, f_i] if f_i is not None else part.idf
-                terms = [[part.vocab[t] for t in n.terms if t in part.vocab] for n in nodes]
-                sc, nm = ops.bm25f(b, part, terms, w, bb, st.mapping.k1, idf)
-                scores, nmatch = (sc, nm) if scores is None else (scores + sc, nmatch + nm)
+            idfs = [part.idf_field[:, f_i] if f_i is not None else part.idf for part in st.parts]
+            terms_pp = [[[part.vocab[t] for t in n.terms if t in part.vocab] for n in nodes] for part in st.parts]
+            if len(st.parts) == 1:
+                scores, nmatch = ops.bm25f(b, st.parts[0], terms_pp[0], w, bb, st.mapping.k1, idfs[0])
+            else:                                       # all segments' postings into one pass (S8-2c)
+                scores, nmatch = ops.bm25f_multi(b, st.parts, terms_pp, w, bb, st.mapping.k1, idfs, st.N)
             for i, n in enumerate(nodes):
                 self.lex_cache[n] = (scores[i], nmatch[i])
         timer.lap("retrieve")
@@ -211,7 +211,8 @@ class Executor:
             idf_h = st.host_idf_field[:, f_i]
         else:
             f_i, idf_h = None, st.host_idf
-        group_idf = [min((float(idf_h[st.vocab[t]]) for t in g if t in st.vocab), default=0.0) for g in node.groups]
+        group_idf = [min((float(idf_h[st.gid(t)]) for t in g if st.gid(t) is not None), default=0.0)
+                     for g in node.groups]
         score = count = None
         for part in st.parts:
             pidf = part.idf_field[:, f_i] if node.idf == "field" else part.idf
@@ -234,7 +235,8 @@ class Executor:
             slots = [[part.vocab[t] for t in alts if t in part.vocab] for alts in node.slots]
             fq, mm = phrase(b, part, f_i, slots, list(node.offsets), node.slop)
             freq, m = (fq, mm) if freq is None else (freq + fq, m | mm)
-        idf_sum = sum(max((float(st.host_idf_field[st.vocab[t], f_i]) for t in alts if t in st.vocab), default=0.0)
+        idf_sum = sum(max((float(st.host_idf_field[st.gid(t), f_i]) for t in alts if st.gid(t) is not None),
+                          default=0.0)
                       for alts in node.slots)
         sc = phrase_scores(b, st, f_i, freq, idf_sum, st.mapping.k1, st.mapping.b)
         return b.where(m, sc * node.boost, 0.0), m

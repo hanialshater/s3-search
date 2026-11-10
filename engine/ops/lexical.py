@@ -96,3 +96,39 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
         hit = ptf > 0
         nmatch = nmatch + b.segment_count(keys[hit], Q * N)
     return scores.reshape(Q, N), nmatch.reshape(Q, N)
+
+
+def bm25f_multi(b, parts, terms_per_part, w, bb, k1: float, idfs, N: int):
+    """``bm25f`` over several segments (S8-2c): every segment's entries (postings of live docs, mapped to slots)
+    are gathered first and summed by one ``segment_sum`` into one buffer, so a query costs one pass over the slot
+    space however many segments there are. A doc lives in one segment, so its addends keep their order and the
+    scores equal a single segment's."""
+    Q = len(terms_per_part[0]) if terms_per_part else 0
+    w, bb = b.asarray(w, "float32"), b.asarray(bb, "float32")
+    keys_all, imp_all, hit_all = [], [], []
+    for st, terms, idf in zip(parts, terms_per_part, idfs):
+        owners = [q for q, ts in enumerate(terms) for _ in ts]
+        rows = [t for ts in terms for t in ts]
+        if not rows:
+            continue
+        q_of, entry = b.csr_expand(st.term_ptr, rows, owners)
+        t_rep = b.csr_expand(st.term_ptr, rows, rows)[0]
+        if getattr(st, "post_live", None) is not None:
+            keep = st.post_live[entry]
+            q_of, entry, t_rep = q_of[keep], entry[keep], t_rep[keep]
+        docs = st.doc_ids[entry]
+        tf = b.astype(st.tf[entry], "float32")
+        norm = (1.0 - bb) + bb * st.rel_len[docs]
+        norm = b.where(norm > 1e-6, norm, 1e-6)
+        ptf = b.sum(w * tf / norm, axis=1)
+        keys_all.append(q_of * N + docs)
+        imp_all.append(idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf))
+        hit_all.append(ptf > 0)
+    if not keys_all or N == 0:
+        return b.zeros((Q, N), "float32"), b.zeros((Q, N), "int32")
+    keys = b.concatenate(keys_all) if len(keys_all) > 1 else keys_all[0]
+    imp = b.concatenate(imp_all) if len(imp_all) > 1 else imp_all[0]
+    hit = b.concatenate(hit_all) if len(hit_all) > 1 else hit_all[0]
+    scores = b.segment_sum(keys, imp, Q * N)
+    nmatch = b.segment_count(keys[hit], Q * N)
+    return scores.reshape(Q, N), nmatch.reshape(Q, N)

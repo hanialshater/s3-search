@@ -43,9 +43,11 @@ class Index:
     updater's hooks (patch, delete, set_version) and the multi-segment hooks (add_segment, replace_segments,
     remove_segment, snapshot_segments, save_commit).
 
-    Thread-safe: every public method that reads or changes the index takes one re-entrant lock per Index, so a
-    search sees a patch, delete, add or replace either entirely or not at all. Searches on one Index therefore run
-    one batch at a time (serving batches requests with search_batch).
+    Thread-safe and copy-on-write (S8-2c): a search reads the current state reference once and runs on it without
+    any lock, so it never waits on a writer and sees one state from start to end. Writers (patch, delete,
+    set_version, add_segment, replace_segments, remove_segment, save, save_commit) are serialised by a writer lock;
+    each changes a clone of the state and publishes it by swapping one reference. A change is visible to every
+    search that starts after the writer's call returns, and to none that started before it.
     """
 
     def __init__(self, seg, device: str = "cpu", accumulate: str | None = None, version: int | None = None):
@@ -128,10 +130,11 @@ class Index:
         from .index_state import Part
         part = Part(self._segment_arrays(seg), self._st.b)      # outside the lock: the device upload
         with self._lock:
-            st = self._st
+            st = self._st.clone()                                 # searches keep the current state meanwhile
             st.check_part(part)
             st.add_part(part, delete_ids)
             st.version = int(version)
+            self._st = st                                         # the swap: one reference
 
     def replace_segments(self, old_ids, new=None, version: int | None = None, delete_ids=()) -> None:
         """Atomically replace the segments ``old_ids`` by ``new`` (their merge, or None to drop them).
@@ -141,7 +144,7 @@ class Index:
         from .index_state import Part
         part = Part(self._segment_arrays(new), self._st.b) if new is not None else None
         with self._lock:
-            st = self._st
+            st = self._st.clone()
             old = [st.part(i) for i in old_ids]
             if part is not None:
                 st.check_part(part)
@@ -156,6 +159,7 @@ class Index:
             st.replace_parts(old, part, delete_ids)
             if version is not None:
                 st.version = int(version)
+            self._st = st
 
     def remove_segment(self, segment_id: str) -> None:
         self.replace_segments([segment_id], None)
@@ -197,16 +201,16 @@ class Index:
     def search(self, request: dict) -> dict:
         return self.search_batch([request])[0]
 
-    @_locked
     def search_batch(self, requests: list[dict]) -> list[dict]:
         if not isinstance(requests, (list, tuple)):
             raise InvalidRequest("$", "search_batch takes a list of requests")
+        st = self._st                     # one state for the whole batch, read once: no lock (S8-2c)
         plans, parse_ms = [], []
         for r in requests:
             t0 = time.perf_counter()
-            plans.append(make_plan(r, self._st))
+            plans.append(make_plan(r, st))
             parse_ms.append((time.perf_counter() - t0) * 1000.0)
-        out = Executor(self._st, self.rankers).run(plans) if plans else []
+        out = Executor(st, self.rankers).run(plans) if plans else []
         for resp, ms in zip(out, parse_ms):
             resp["took_ms"] = {"parse": round(ms, 3), **resp["took_ms"]}
             resp["took_ms"]["total"] = round(resp["took_ms"]["total"] + ms, 3)
@@ -217,26 +221,36 @@ class Index:
     def patch(self, field: str, ids: Sequence[str], values: Sequence) -> None:
         """Hot fields only (NotHot otherwise); KeyError for unknown ids; deleted ids are skipped. ``None`` or NaN
         makes the value missing."""
-        if field not in self._st.mapping.hot:
-            raise NotHot(f"{field!r} is not a hot field (_meta.engine.hot: {self._st.mapping.hot})")
-        missing = [i for i in ids if i not in self._st.known]
+        cur = self._st
+        if field not in cur.mapping.hot:
+            raise NotHot(f"{field!r} is not a hot field (_meta.engine.hot: {cur.mapping.hot})")
+        missing = [i for i in ids if i not in cur.known]
         if missing:
             raise NoSuchKey(f"unknown _id(s): {missing[:5]}")
         if len(ids) != len(values):
             raise ValueError("ids and values differ in length")
-        self._st.patch(field, list(ids), list(values))
+        st = cur.clone(field)              # copy-on-write of the patched column only
+        st.patch(field, list(ids), list(values))
+        self._st = st
 
     @_locked
     def delete(self, ids: Sequence[str]) -> None:
         """KeyError for ids the segment never held; already-deleted ids are a no-op."""
-        missing = [i for i in ids if i not in self._st.known]
+        cur = self._st
+        missing = [i for i in ids if i not in cur.known]
         if missing:
             raise NoSuchKey(f"unknown _id(s): {missing[:5]}")
-        self._st.delete(list(ids))
+        if any(i in cur.pos for i in ids):
+            st = cur.clone()
+            st.delete(list(ids))
+            self._st = st
 
     @_locked
     def set_version(self, version: int) -> None:
-        self._st.version = int(version)
+        import copy
+        st = copy.copy(self._st)
+        st.version = int(version)
+        self._st = st
 
     # ---- ranking
     def add_ranker(self, name: str, model) -> None:
@@ -247,11 +261,11 @@ class Index:
         from .rank.features import feature_names_for
         return feature_names_for(self._st)
 
-    @_locked
     def candidate_features(self, request: dict, window: int = 1000):
         """The top ``window`` candidates of ``request`` and their ranker features: ``(ids list[str], X f32[n, F])``."""
         from .rank.features import candidate_features
-        st, b = self._st, self._st.b
+        st = self._st                     # one state, no lock (S8-2c)
+        b = st.b
         p = make_plan(request, st)
         ex = Executor(st, self.rankers)
         from .plan.execute import Timer
