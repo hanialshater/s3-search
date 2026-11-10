@@ -17,44 +17,46 @@ _stemmer = snowballstemmer.stemmer("porter")
 _STEM_CACHE: dict[str, str] = {}
 
 
+_WORD_CACHE: dict[str, str | None] = {}     # a raw word -> its token, or None (a stopword or empty)
+
+
+def _token(w: str):
+    """One regex word to its token (or None): strip a trailing 's, then ', drop stopwords, stem. Cached per word."""
+    t = _WORD_CACHE.get(w, 0)
+    if t == 0:
+        x = w[:-2] if w.endswith("'s") else w
+        x = x.replace("'", "")
+        if not x or x in EN_STOP:
+            t = None
+        else:
+            t = _STEM_CACHE.get(x)
+            if t is None:
+                t = _STEM_CACHE[x] = _stemmer.stemWord(x)
+        _WORD_CACHE[w] = t
+    return t
+
+
+def _missing(text) -> bool:
+    return text is None or (isinstance(text, float) and text != text) or type(text).__name__ == "NAType"
+
+
 def analyze_with_positions(text, analyzer: str = "s3_english") -> tuple[list[str], list[int]]:
     """Tokens of ``text`` and their positions. Every word takes a position, stopwords included (they are dropped but
     leave a gap, as Lucene's stop filter does with position increments), so ``"red the lamp"`` gives red@0, lamp@2.
-    ``[t for t in tokens]`` equals ``analyze(text)``."""
+    The tokens equal ``analyze(text)``."""
     if analyzer not in ANALYZERS:
         raise ValueError(f"unknown analyzer {analyzer!r}")
-    if text is None or (isinstance(text, float) and text != text) or type(text).__name__ == "NAType":
+    if _missing(text):
         return [], []
-    toks, pos = [], []
-    for i, w in enumerate(_WORD.findall(str(text).lower())):
-        if w.endswith("'s"):
-            w = w[:-2]
-        w = w.replace("'", "")
-        if not w or w in EN_STOP:
-            continue
-        s = _STEM_CACHE.get(w)
-        if s is None:
-            s = _STEM_CACHE[w] = _stemmer.stemWord(w)
-        toks.append(s)
-        pos.append(i)
-    return toks, pos
+    toks = [_token(w) for w in _WORD.findall(str(text).lower())]
+    pos = [i for i, t in enumerate(toks) if t is not None]
+    return [toks[i] for i in pos], pos
 
 
 def analyze(text, analyzer: str = "s3_english") -> list[str]:
     """Tokens of ``text`` in order (duplicates kept). ``None`` and NaN analyse to no tokens."""
     if analyzer not in ANALYZERS:
         raise ValueError(f"unknown analyzer {analyzer!r}")
-    if text is None or (isinstance(text, float) and text != text) or type(text).__name__ == "NAType":
+    if _missing(text):
         return []
-    out = []
-    for w in _WORD.findall(str(text).lower()):
-        if w.endswith("'s"):
-            w = w[:-2]
-        w = w.replace("'", "")
-        if not w or w in EN_STOP:
-            continue
-        s = _STEM_CACHE.get(w)
-        if s is None:
-            s = _STEM_CACHE[w] = _stemmer.stemWord(w)
-        out.append(s)
-    return out
+    return [t for t in map(_token, _WORD.findall(str(text).lower())) if t is not None]

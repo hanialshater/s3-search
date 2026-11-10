@@ -693,3 +693,11 @@ status:
   `match_bool_prefix`, expanded in the terms dictionary with OpenSearch's defaults; section 6 gains the
   `LexicalGroups` plan node (clauses of alternative terms: "sum", "synonym", "const"), scored by the new
   `bm25f_groups` operator on the backend. Additive. Why: S7 (typo tolerance and autocomplete).
+- 2026-11-10, architect (S8-3, build speed; no format or result change): `engine.build` analyses each field in one
+  regex pass per document and one dictionary pass over all its words, and builds postings, tf and positions from one
+  stable sort of the tokens' posting keys (the text arrays are identical to before, checked on ESCI-sample);
+  `tfidf-svd-<d>` analyses once, multiplies the sparse matrix one column of X at a time (`bincount`), orthonormalises
+  by CholeskyQR2 and takes the final SVD from a small eigenproblem (the vectors equal the old ones to 2e-10);
+  `engine._blas.limit_to_affinity()` sets OpenBLAS's threads to the CPU affinity mask (it ran 4 threads on 2 cores).
+  On 2 cores, same machine: build_segment of ESCI-sample with positions 12.3-12.8 s before, 9.5-9.8 s after (bench
+  build); the encoder's fit + encode 47-77 s before, 7.3-8.2 s after.

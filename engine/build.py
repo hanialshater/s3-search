@@ -5,11 +5,12 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+from itertools import chain
 
 import numpy as np
 import pandas as pd
 
-from .analysis import ANALYZER_VERSION, analyze, analyze_with_positions
+from .analysis import _WORD, ANALYZER_VERSION, _token
 from .encode import doc_texts, get_encoder
 from .errors import InvalidMapping
 from .mapping import Mapping, parse_mapping
@@ -42,36 +43,53 @@ POS_BITS = 24                    # a position is (field << 24) | position-in-fie
 def build_text(catalogue: pd.DataFrame, fields: list[str], positions: bool = True) -> TextArrays:
     N, F = len(catalogue), len(fields)
     term_of: dict[str, int] = {}
+    word_tid: dict[str, int] = {}                 # a raw word -> its term id, or -1 (stopword); this build only
     per_field = []
     field_len = np.zeros((N, F), dtype=np.int32)
     for f_i, f in enumerate(fields):
         col = catalogue[f].tolist() if f in catalogue.columns else [None] * N
-        docs, terms, poss = [], [], []
-        for d, text in enumerate(col):
-            toks, pos = analyze_with_positions(text)
-            field_len[d, f_i] = len(toks)
-            for t in toks:
-                tid = term_of.get(t)
-                if tid is None:
-                    tid = term_of[t] = len(term_of)
-                terms.append(tid)
-            docs.extend([d] * len(toks))
-            if positions:
-                poss.extend(pos)
-        per_field.append((np.asarray(terms, np.int64), np.asarray(docs, np.int64),
-                          np.minimum(np.asarray(poss, np.int64), (1 << POS_BITS) - 1) if positions else None))
+        # One regex pass per document (C), then one dictionary pass over all the field's words: the same tokens as
+        # engine.analysis.analyze_with_positions, without a Python call per token.
+        words_per_doc = [[] if _is_missing(t) else _WORD.findall(str(t).lower()) for t in col]
+        n_words = np.fromiter((len(w) for w in words_per_doc), np.int64, N)
+        words = list(chain.from_iterable(words_per_doc))
+        del words_per_doc
+        get = word_tid.get
+        ids = [get(w, -2) for w in words]
+        if -2 in ids:
+            for i, x in enumerate(ids):
+                if x == -2:
+                    w = words[i]
+                    t = _token(w)
+                    x = word_tid[w] = -1 if t is None else term_of.setdefault(t, len(term_of))
+                    ids[i] = x
+        ids = np.asarray(ids, np.int64)
+        doc_of_word = np.repeat(np.arange(N, dtype=np.int64), n_words)
+        keep = ids >= 0
+        start = np.concatenate([[0], np.cumsum(n_words)[:-1]]) if N else np.zeros(0, np.int64)
+        pos = (np.arange(len(ids), dtype=np.int64) - start[doc_of_word])[keep] if positions else None
+        terms, docs = ids[keep], doc_of_word[keep]
+        field_len[:, f_i] = np.bincount(docs, minlength=N)
+        per_field.append((terms, docs, np.minimum(pos, (1 << POS_BITS) - 1) if positions else None))
     vocab = sorted(term_of)
     V = len(vocab)
     remap = np.zeros(max(V, 1), np.int64)
     remap[[term_of[t] for t in vocab]] = np.arange(V)
-    keys, counts = [], []
-    for terms, docs, _ in per_field:
-        k, c = np.unique(remap[terms] * N + docs, return_counts=True) if len(terms) else (np.zeros(0, np.int64),) * 2
-        keys.append(k), counts.append(np.minimum(c, 255).astype(np.uint8))
-    postings = np.unique(np.concatenate(keys)) if keys else np.zeros(0, np.int64)
-    tf = np.zeros((len(postings), F), dtype=np.uint8)
-    for f_i in range(F):
-        tf[np.searchsorted(postings, keys[f_i]), f_i] = counts[f_i]
+    # Every token's posting key (term * N + doc), field-major and in position order within each field; one stable
+    # sort by key groups the tokens by posting with (field, position) ascending inside, which gives the postings,
+    # tf per field and the positions in one pass.
+    key_all = np.concatenate([remap[t] * N + d for t, d, _ in per_field]) if per_field else np.zeros(0, np.int64)
+    field_all = np.concatenate([np.full(len(t), f_i, np.int64) for f_i, (t, _, _) in enumerate(per_field)]) \
+        if per_field else np.zeros(0, np.int64)
+    order = np.argsort(key_all, kind="stable")
+    sk = key_all[order]
+    first = np.r_[True, sk[1:] != sk[:-1]] if len(sk) else np.zeros(0, bool)
+    starts = np.flatnonzero(first)
+    postings = sk[starts]
+    P = len(postings)
+    p_of_tok = np.cumsum(first) - 1
+    tf = np.minimum(np.bincount(p_of_tok * F + field_all[order], minlength=P * F), 255).astype(np.uint8)
+    tf = tf.reshape(P, F)
     terms_of_p, docs_of_p = (postings // N, postings % N) if N else (postings, postings)
     df = np.bincount(terms_of_p, minlength=V).astype(np.int32)
     df_field = np.stack([np.bincount(terms_of_p[tf[:, f] > 0], minlength=V) for f in range(F)], axis=1) \
@@ -83,17 +101,10 @@ def build_text(catalogue: pd.DataFrame, fields: list[str], positions: bool = Tru
     if positions:
         # Positions, CSR over postings: for posting p, positions[pos_ptr[p]:pos_ptr[p+1]] holds
         # (field << 24) | position, ascending (by field, then position).
-        post_of, code = [], []
-        for f_i, (terms, docs, pos) in enumerate(per_field):
-            if len(terms):
-                post_of.append(np.searchsorted(postings, remap[terms] * N + docs))
-                code.append((np.int64(f_i) << POS_BITS) | pos)
-        post_of = np.concatenate(post_of) if post_of else np.zeros(0, np.int64)
-        code = np.concatenate(code) if code else np.zeros(0, np.int64)
-        order = np.lexsort((code, post_of))
+        code = np.concatenate([(np.int64(f_i) << POS_BITS) | pos for f_i, (_, _, pos) in enumerate(per_field)]) \
+            if per_field else np.zeros(0, np.int64)
         pos_vals = code[order].astype(np.uint32)
-        pos_ptr = np.zeros(len(postings) + 1, np.int64)
-        pos_ptr[1:] = np.cumsum(np.bincount(post_of, minlength=len(postings)))
+        pos_ptr = np.r_[starts, len(sk)].astype(np.int64)
     return TextArrays(fields=list(fields), vocab=vocab, term_ptr=term_ptr, doc_ids=docs_of_p.astype(np.int32), tf=tf,
                       field_len=field_len, df=df, df_field=df_field.astype(np.int32), avg_len=avg_len,
                       pos_ptr=pos_ptr, positions=pos_vals)
@@ -177,8 +188,7 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
         elif f in m.embeddings:
             enc = get_encoder(m.embeddings[f]["model"])
             texts = doc_texts(catalogue, m.embeddings[f].get("inputs") or m.text[:1])
-            enc.fit(texts)
-            vec = enc.encode_docs(texts)
+            vec = enc.fit_transform(texts)
             model = enc.name
             seg.encoders[f] = enc.to_arrays()
         else:

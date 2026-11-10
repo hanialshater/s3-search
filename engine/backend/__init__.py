@@ -158,6 +158,8 @@ def get_backend(device: str | None = None, accumulate: str | None = None) -> Bac
     BM25F stays deterministic and batch-invariant; the dense float32 GEMM may not be batch-invariant). ``None`` reads
     ``S3_SEARCH_ACCUM``, else float64."""
     device = resolve_device(device)
+    from .._blas import limit_to_affinity
+    limit_to_affinity()                     # OpenBLAS threads = the CPUs this process may use (S8-3)
     accumulate = accumulate or os.environ.get(ENV_ACCUM) or "float64"
     key = (device, accumulate)
     if key not in _CACHE:
