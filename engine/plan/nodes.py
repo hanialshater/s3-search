@@ -70,6 +70,19 @@ class Range:
 
 
 @dataclass(frozen=True)
+class FunctionScore:
+    """S7-5: functions are (filter node or None, (field, factor, modifier, missing) or None, weight or None)."""
+    query: Any
+    functions: tuple
+    score_mode: str = "multiply"
+    boost_mode: str = "multiply"
+    max_boost: float | None = None
+    min_score: float | None = None
+    boost: float = 1.0
+    path: str = "query"
+
+
+@dataclass(frozen=True)
 class Exists:
     field: str
     boost: float = 1.0
@@ -108,7 +121,7 @@ class Hybrid:
     path: str = "query"
 
 
-Node = Union[Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
+Node = Union[FunctionScore, Exists, Ids, Lexical, LexicalGroups, Phrase, Dense, Term, Range, MatchAll, Bool, Hybrid]
 
 
 @dataclass(frozen=True)
@@ -150,3 +163,4 @@ class Plan:
     explain: bool = False
     post_filter: Any = None               # S7-3: a node; hits and total after it, aggregations before it
     collapse: str | None = None           # S7-3: keep the top hit per value of this field
+    highlight: Any = None                 # S7-5: engine.dsl.ast.Highlight
