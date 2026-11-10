@@ -97,6 +97,35 @@ class GBDT:
             out += t["value"][node]
         return out.astype(np.float32)
 
+    def contributions(self, X):
+        """Exact per-feature contributions (Saabas path attribution): ``(base float64[n], contrib float64[n, F])``
+        with ``base + contrib.sum(1) == predict(X)`` up to float rounding. Each split on a sample's path adds the
+        change in node value to the feature it splits on; ``base`` is the model's base plus every tree's root
+        value."""
+        X = np.asarray(X)
+        n, F = X.shape
+        contrib = np.zeros((n, F), np.float64)
+        base = np.full(n, self.base, np.float64)
+        if n == 0:
+            return base, contrib
+        Xb = self._bin(X)
+        rows = np.arange(n)
+        for t in self.trees:
+            node = np.zeros(n, np.int64)
+            base += t["value"][0]
+            for _ in range(self.max_depth + 1):
+                f = t["feature"][node]
+                inner = f >= 0
+                if not inner.any():
+                    break
+                fi = np.where(inner, f, 0)
+                go_left = Xb[rows, fi] <= t["bin"][node]
+                child = np.where(inner, np.where(go_left, t["left"][node], t["right"][node]), node)
+                delta = np.where(inner, t["value"][child] - t["value"][node], 0.0)
+                np.add.at(contrib, (rows, fi), delta)
+                node = child
+        return base, contrib
+
     def to_dict(self) -> dict:
         return {"params": dict(n_rounds=self.n_rounds, learning_rate=self.lr, max_depth=self.max_depth,
                                min_leaf=self.min_leaf, n_bins=self.n_bins, l2=self.l2),
