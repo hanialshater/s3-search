@@ -1,0 +1,30 @@
+{
+ "judge": "evaluation-steward",
+ "date": "2026-11-10",
+ "label": "CPU, development only (2 cores, device cpu)",
+ "suite": "s7-v1 (referee/conformance_s7.py, 254 requests, committed 0b69e2e before the recording)",
+ "recording": "referee/conformance/opensearch-2.19-esci-sample-s7-v1.jsonl.gz (OpenSearch 2.19.1, re-recorded e5f3c87 after the adapter fix)",
+ "command": "S3_SEARCH_SAMPLE=data/esci-sample taskset -c 0,1 python -m referee.conformance_s7",
+ "deviation": "The first recording used the adapter's porter_stem (Lucene), not Snowball's Porter as INTERFACES names; first run: exact 137/146, avg/stats 15/16, phrase 40/40, highlight 20/20. The adapter was fixed (OpenSearch side) and the suite re-recorded; the verdicts below are on the second run. Data: ESCI-sample plus the judges' synthetic price and stock (seed 20261112), identical on both sides.",
+ "verdicts": {
+  "S7 prediction 1": {
+   "verdict": "wrong",
+   "text": "exact features identical in at least 98% of requests; avg and stats within 1e-6 relative",
+   "exact": {"passed": 143, "n": 146, "rate": 0.9795},
+   "avg_stats": {"passed": 16, "n": 16, "within_1e-6": true},
+   "by_family": {"exists": "9/12", "ids": "12/12", "prefix": "20/20", "post_filter": "20/20", "collapse": "20/20",
+                 "agg_min_max": "12/12", "agg_sum": "8/8", "agg_value_count": "8/8", "agg_cardinality": "10/10",
+                 "agg_range": "12/12", "agg_histogram": "12/12"},
+   "why_wrong": "one request short of 98% (143/146 = 97.9%); the three failures are an engine defect: exists on a text field skips values that analyse to no token, which OpenSearch counts (strict xfail in the contract)",
+   "partly": "the avg/stats clause held (16/16)"
+  },
+  "S7 prediction 2": {
+   "verdict": "held",
+   "text": "match_phrase (slop 0 and 2) the same hit set in at least 95%; every highlight fragment holds an analysed query term",
+   "phrase": {"slop0": "20/20", "slop2": "20/20", "rate": 1.0},
+   "highlight": {"requests": "20/20", "every_fragment_holds_a_query_term": true}
+  }
+ },
+ "info_families_not_counted": {"fuzzy": "6/8", "match_fuzziness": "4/8", "match_bool_prefix": "6/8", "function_score": "8/8",
+                               "note": "Lucene's max_expansions (50) on fuzzy and match_bool_prefix selects expansions differently from the engine"}
+}
