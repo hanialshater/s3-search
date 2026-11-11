@@ -5,6 +5,8 @@ same checks pass on the referee's reference index (`referee/tests/test_checks_on
 
 Owner: evaluation-steward. Makers do not edit this folder (P6); a maker who thinks a check is wrong raises it.
 """
+import json
+
 import pytest
 
 api = pytest.importorskip("engine.api")
@@ -272,3 +274,37 @@ class _NoKnnField:
 def test_s9_1_check_catches_a_silent_method(index, ds):
     from referee import s9_checks
     assert s9_checks.check_s9_1(_NoKnnField(index), ds), "a response that does not name the method must be caught"
+
+
+class _AsIfCuda:
+    """Stands in for a cuda index where cuVS ran: the cpu index's answers, relabelled as the method having run
+    (exact scores, filters honoured). `plant` spoils them: "score" shifts a score, "filter" adds a hit outside it."""
+
+    device = "cuda"
+
+    def __init__(self, inner, ds, plant=None):
+        self.inner, self.ds, self.plant = inner, ds, plant
+
+    def search(self, r):
+        out = self.inner.search(r)
+        knn = out.get("knn", {}).get("embedding")
+        objs = knn if isinstance(knn, list) else [knn] if knn else []
+        for o in objs:
+            if o.get("requested") in ("cagra", "ivf_pq"):
+                o["ran"] = o["requested"] + ("+postfilter" if o["requested"] == "ivf_pq" else "")
+                o.pop("reason", None)
+        hits = out["hits"]["hits"]
+        if self.plant == "score" and hits:
+            hits[0]["_score"] += 1e-3
+        if self.plant == "filter" and hits and "filter" in json.dumps(r):
+            hits[-1] = {**hits[-1], "_id": next(p for p, c in zip(self.ds.catalogue["product_id"], self.ds.catalogue["category"])
+                                                if c != "mug" and p not in {h["_id"] for h in hits})}
+        return out
+
+
+def test_s9_1_check_on_a_cuda_index_where_cuvs_ran(index, ds):
+    """The cuda branch, without a GPU: right answers pass; a non-exact score or a hit outside the filter fails."""
+    from referee import s9_checks
+    assert s9_checks.check_s9_1(_AsIfCuda(index, ds), ds) == []
+    assert s9_checks.check_s9_1(_AsIfCuda(index, ds, "score"), ds), "a score that is not the exact similarity"
+    assert s9_checks.check_s9_1(_AsIfCuda(index, ds, "filter"), ds), "a hit outside the filter"

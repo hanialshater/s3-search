@@ -100,15 +100,21 @@ def p1_ann(n_queries=2000, dataset="esci-us"):
         return res, ran
 
     truth = {False: ids(False, "exact")[0], True: ids(True, "exact")[0]}
+    # The method ran as itself when the response says `ran` is the method or "<method>+postfilter" (INTERFACES
+    # section 5 after b0d79f5: IVF-PQ answers a filter by post-filtering with exact re-scoring). "exact" (cuVS did
+    # not run) is never counted. Filtered IVF-PQ is information only: prediction 1 judges IVF-PQ unfiltered.
     for method, filtered, bar, key in (("cagra", False, 0.95, "cagra"), ("cagra", True, 0.90, "cagra_filtered"),
-                                       ("ivf_pq", False, 0.90, "ivf_pq")):
+                                       ("ivf_pq", False, 0.90, "ivf_pq"), ("ivf_pq", True, None, "ivf_pq_filtered_info")):
         try:
             t = time.perf_counter()
             got, ran = ids(filtered, method)
             out[f"search_{key}_s"] = time.perf_counter() - t  # includes building the method's index on first use
             rec = float(np.mean([len(set(a) & set(b)) / max(1, len(b)) for a, b in zip(got, truth[filtered])]))
             entry = {"recall@10": rec, "bar": bar, "method_reported": sorted(map(str, ran))}
-            if ran != {method}:
+            as_itself = bool(ran) and ran <= {method, f"{method}+postfilter"}
+            if bar is None:
+                entry["verdict"] = "information only (not part of prediction 1)"
+            elif not as_itself:
                 entry["verdict"] = f"not judged: the response says {sorted(map(str, ran))} ran, not {method}"
             else:
                 entry["verdict"] = "held" if rec >= bar else "wrong"
