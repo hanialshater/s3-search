@@ -44,9 +44,24 @@ def held_out_ids():
 
 
 def contract(device: str) -> int:
-    import pytest
-    os.environ["S3_SEARCH_DEVICE"] = device
-    return int(pytest.main(["-q", "-p", "no:cacheprovider", str(HERE / "contract")]))
+    """In its own process (474f9f5): the contract starts CUDA, and an index build after CUDA has started in this
+    process must run single-process (forked workers can hang); the scored build then stays the first CUDA work here."""
+    import subprocess
+    env = {**os.environ, "S3_SEARCH_DEVICE": device}
+    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(HERE / "contract")],
+                          env=env, cwd=str(HERE.parent)).returncode
+
+
+def build_mode() -> str:
+    """Which way the engine's build will run, for the progress line (the score's definition does not depend on it)."""
+    if os.environ.get("S3_BUILD_WORKERS"):
+        return f"S3_BUILD_WORKERS={os.environ['S3_BUILD_WORKERS']} (set by the caller)"
+    try:
+        from engine.build import cuda_maybe_started
+    except ImportError:
+        return "unknown (engine.build has no cuda_maybe_started)"
+    return ("serial: CUDA had already started in this process" if cuda_maybe_started()
+            else "parallel workers: no CUDA work before the build")
 
 
 def main(argv=None) -> int:
@@ -84,7 +99,7 @@ def main(argv=None) -> int:
                                                           "ESCI-sample catalogue" if a.catalogue == "sample" else "") if x)
             + "; this run is not a score of record")
     api = bench.get_api(a.engine)
-    devices = api.available_devices()
+    devices = api.available_devices()        # torch.cuda.is_available(): does not start CUDA
     device = a.device or ("cuda" if "cuda" in devices else devices[0])
     out = {"kind": "full", "device": device, "devices": devices, "engine": a.engine}
 
@@ -110,6 +125,9 @@ def main(argv=None) -> int:
         subsets["held_out"] = ho & set(int(q) for q in queries["query_id"])
     template = json.loads(Path(a.request).read_text()) if a.request else \
         (bench.OPENSEARCH_TEMPLATE if a.engine == "opensearch" else None)
+    if a.engine == "engine":
+        out["build_mode"] = build_mode()
+        say(f"build: {out['build_mode']}")
     res = bench.run(ds, queries, judg, api, device=device, template=template, k=a.k, batch=a.batch,
                     latency_queries=a.latency_queries, price_per_hour=a.price_per_hour, split="test",
                     engine=a.engine, subsets=subsets, progress=say)
