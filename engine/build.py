@@ -5,12 +5,12 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
-from itertools import chain
+import os
 
 import numpy as np
 import pandas as pd
 
-from .analysis import _WORD, ANALYZER_VERSION, _token
+from .analysis import ANALYZER_VERSION, tokens_of, words_of
 from .encode import doc_texts, get_encoder
 from .errors import InvalidMapping
 from .mapping import Mapping, parse_mapping
@@ -28,6 +28,122 @@ def _is_missing(v) -> bool:
         return False
 
 
+def _column(catalogue: pd.DataFrame, f: str, N: int) -> pd.Series:
+    return catalogue[f] if f in catalogue.columns else pd.Series([None] * N, dtype=object, name=f)
+
+
+def _missing_mask(series: pd.Series) -> np.ndarray:
+    """``_is_missing`` of every value, vectorised: None, NaN, NA and NaT are missing; lists, tuples, arrays and
+    dicts are not."""
+    if series.dtype == object:
+        return np.asarray(pd.isna(series.to_numpy(dtype=object)), bool)
+    return np.asarray(series.isna().to_numpy(), bool)
+
+
+def _strings(series: pd.Series, miss: np.ndarray) -> np.ndarray:
+    """object[N]: ``str(v)`` of every value, ``""`` where missing (vectorised for string columns)."""
+    if series.dtype != object:
+        try:
+            if pd.api.types.is_string_dtype(series.dtype):
+                return series.to_numpy(dtype=object, na_value="")
+        except TypeError:
+            pass
+    vals = series.to_numpy(dtype=object)
+    out = np.empty(len(vals), dtype=object)
+    out[miss] = ""
+    keep = ~miss
+    out[keep] = [v if type(v) is str else str(v) for v in vals[keep]]
+    return out
+
+
+def build_workers() -> int:
+    """Processes for build-time analysis: the CPUs this process may use (``S3_BUILD_WORKERS`` overrides; 1 or 0:
+    none). The output does not depend on it."""
+    env = os.environ.get("S3_BUILD_WORKERS")
+    if env is not None:
+        return max(1, int(env))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:                                # not Linux
+        return max(1, os.cpu_count() or 1)
+
+
+PARALLEL_MIN_CHARS = 4_000_000      # below this, worker start-up costs more than it saves
+
+_POOL_INPUT = None                  # what the forked workers read (set only while a pool runs)
+
+
+def _words_slice(task):
+    f_i, a, b = task
+    return words_of(_POOL_INPUT[f_i][a:b])
+
+
+def _tokens_slice(task):
+    a, b = task
+    return tokens_of(_POOL_INPUT[a:b])
+
+
+def _pool_ok(workers: int, chars: int) -> bool:
+    """Workers are forked (they inherit their input, nothing is pickled to them, and no caller's ``__main__`` is
+    re-imported), and only from a process with one thread: forking a threaded process (a server) can deadlock the
+    child, so there the analysis runs in this process."""
+    import multiprocessing as mp
+    import threading
+    return workers > 1 and chars >= PARALLEL_MIN_CHARS and "fork" in mp.get_all_start_methods() \
+        and threading.active_count() == 1
+
+
+def _run(fn, data, tasks, workers):
+    """``fn`` over ``tasks`` in a pool of forked workers, the results in task order. ``multiprocessing.Pool`` forks
+    all its workers before it starts its own threads, so no fork happens in a threaded process."""
+    import multiprocessing as mp
+    global _POOL_INPUT
+    _POOL_INPUT = data
+    try:
+        with mp.get_context("fork").Pool(min(workers, len(tasks))) as pool:
+            return pool.map(fn, tasks, chunksize=1)
+    finally:
+        _POOL_INPUT = None
+
+
+def _analyse_fields(per_field: list[list[str]]):
+    """The words of each field's distinct values and every distinct word's token, in two passes that run in worker
+    processes for a large catalogue (each pass in chunks, merged back in order, so the result does not depend on the
+    number of workers): ``([(word ids int64 per regex word, word count int64 per value) per field], tokens)``, where
+    ``tokens[w]`` is word ``w``'s token or None (a stopword)."""
+    workers = build_workers()
+    chars = sum(len(v) for vals in per_field for v in vals)
+    par = _pool_ok(workers, chars)
+    if par:
+        n_chunks = workers * 4
+        tasks = []
+        for f_i, vals in enumerate(per_field):
+            share = max(1, int(round(n_chunks * sum(len(v) for v in vals) / max(chars, 1))))
+            step = max(1, -(-len(vals) // share))
+            tasks += [(f_i, a, a + step) for a in range(0, len(vals), step)] or [(f_i, 0, 0)]
+        parts = _run(_words_slice, per_field, tasks, workers)
+    else:
+        tasks = [(f_i, 0, len(vals)) for f_i, vals in enumerate(per_field)]
+        parts = [words_of(vals) for vals in per_field]
+    word_of: dict[str, int] = {}                          # every distinct word, first seen in task order
+    pieces = [([], []) for _ in per_field]
+    for (f_i, _, _), (uw, flat, lens) in zip(tasks, parts):
+        gid = np.fromiter((word_of.setdefault(w, len(word_of)) for w in uw), np.int64, len(uw))
+        pieces[f_i][0].append(gid[flat] if len(flat) else np.zeros(0, np.int64))
+        pieces[f_i][1].append(lens)
+    words = list(word_of)
+    del word_of
+    if par and len(words) > 1:
+        step = -(-len(words) // (workers * 4))
+        tokens = [t for part in _run(_tokens_slice, words, [(a, a + step) for a in range(0, len(words), step)],
+                                     workers) for t in part]
+    else:
+        tokens = tokens_of(words)
+    out = [(np.concatenate(f) if f else np.zeros(0, np.int64), np.concatenate(ln) if ln else np.zeros(0, np.int64))
+           for f, ln in pieces]
+    return out, tokens
+
+
 def resolve_id_field(m: Mapping, catalogue: pd.DataFrame) -> str:
     if m.id_field in catalogue.columns:
         return m.id_field
@@ -43,27 +159,27 @@ POS_BITS = 24                    # a position is (field << 24) | position-in-fie
 def build_text(catalogue: pd.DataFrame, fields: list[str], positions: bool = True) -> TextArrays:
     N, F = len(catalogue), len(fields)
     term_of: dict[str, int] = {}
-    word_tid: dict[str, int] = {}                 # a raw word -> its term id, or -1 (stopword); this build only
     per_field = []
     field_len = np.zeros((N, F), dtype=np.int32)
-    for f_i, f in enumerate(fields):
-        col = catalogue[f].tolist() if f in catalogue.columns else [None] * N
-        # One regex pass per document (C), then one dictionary pass over all the field's words: the same tokens as
-        # engine.analysis.analyze_with_positions, without a Python call per token.
-        words_per_doc = [[] if _is_missing(t) else _WORD.findall(str(t).lower()) for t in col]
-        n_words = np.fromiter((len(w) for w in words_per_doc), np.int64, N)
-        words = list(chain.from_iterable(words_per_doc))
-        del words_per_doc
-        get = word_tid.get
-        ids = [get(w, -2) for w in words]
-        if -2 in ids:
-            for i, x in enumerate(ids):
-                if x == -2:
-                    w = words[i]
-                    t = _token(w)
-                    x = word_tid[w] = -1 if t is None else term_of.setdefault(t, len(term_of))
-                    ids[i] = x
-        ids = np.asarray(ids, np.int64)
+    # Each field's distinct values are analysed once (brands and colours repeat), in worker processes for a large
+    # catalogue; a doc's words are its value's, gathered with numpy. The same tokens as
+    # engine.analysis.analyze_with_positions (a missing value and "" have no words).
+    coded = []
+    for f in fields:
+        series = _column(catalogue, f, N)
+        codes, uniq = pd.factorize(_strings(series, _missing_mask(series)))
+        coded.append((np.asarray(codes, np.int64), list(uniq)))
+    analysed, tokens = _analyse_fields([u for _, u in coded])
+    word_tid = np.fromiter((-1 if t is None else term_of.setdefault(t, len(term_of)) for t in tokens), np.int64,
+                           len(tokens))                    # a word -> its term id, or -1 (a stopword)
+    for f_i, ((codes, _), (u_flat, u_lens)) in enumerate(zip(coded, analysed)):
+        u_ids = word_tid[u_flat]
+        u_ptr = np.concatenate([[0], np.cumsum(u_lens)]).astype(np.int64)
+        n_words = u_lens[codes] if N else np.zeros(0, np.int64)
+        total = int(n_words.sum())
+        first_word = np.cumsum(n_words) - n_words
+        ids = u_ids[np.repeat(u_ptr[codes] - first_word, n_words) + np.arange(total, dtype=np.int64)] \
+            if total else np.zeros(0, np.int64)
         doc_of_word = np.repeat(np.arange(N, dtype=np.int64), n_words)
         keep = ids >= 0
         start = np.concatenate([[0], np.cumsum(n_words)[:-1]]) if N else np.zeros(0, np.int64)
@@ -110,20 +226,27 @@ def build_text(catalogue: pd.DataFrame, fields: list[str], positions: bool = Tru
                       pos_ptr=pos_ptr, positions=pos_vals)
 
 
+def _keyword_strings(series: pd.Series, ignore_above: int):
+    """(``str`` values with "" for missing and over ``ignore_above``, the missing mask, the kept mask)."""
+    miss = _missing_mask(series)
+    if series.dtype == object and any(isinstance(v, (list, tuple, np.ndarray))
+                                      for v in series.to_numpy(dtype=object)[~miss]):
+        raise InvalidMapping(str(series.name), "keyword fields are single-valued in v1")
+    strs = _strings(series, miss)
+    lens = np.fromiter(map(len, strs), np.int64, len(strs))
+    kept = ~miss & (lens <= ignore_above)
+    return np.where(kept, strs, ""), miss, kept
+
+
 def keyword_column(series: pd.Series, ignore_above: int) -> KeywordColumn:
-    vals = []
-    for v in series.tolist():
-        if _is_missing(v):
-            vals.append("")
-        elif isinstance(v, (list, tuple, np.ndarray)):
-            raise InvalidMapping(str(series.name), "keyword fields are single-valued in v1")
-        else:
-            s = str(v)
-            vals.append(s if len(s) <= ignore_above else "")
-    uniq = sorted(set(vals) - {""})
-    code_of = {v: i + 1 for i, v in enumerate(uniq)}
-    codes = np.fromiter((code_of.get(v, 0) for v in vals), np.int32, len(vals))
-    return KeywordColumn(codes=codes, values=[""] + uniq)
+    vals, _, _ = _keyword_strings(series, ignore_above)
+    codes, uniq = pd.factorize(vals)
+    uniq = list(uniq)
+    values = sorted(set(uniq) - {""})
+    code_of = {v: i + 1 for i, v in enumerate(values)}
+    table = np.fromiter((code_of.get(v, 0) for v in uniq), np.int32, len(uniq))
+    codes = table[codes] if len(codes) else np.zeros(0, np.int32)
+    return KeywordColumn(codes=np.asarray(codes, np.int32), values=[""] + values)
 
 
 def numeric_column(series: pd.Series, dtype: str, pack) -> NumericColumn:
@@ -166,8 +289,9 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
     source = {}
     if m.source:                                          # raw text for highlight (S7-5), host only
         for f in m.text:
-            col = catalogue[f].tolist() if f in catalogue.columns else [None] * len(catalogue)
-            source[f] = np.array([None if _is_missing(v) else str(v) for v in col], dtype=object)
+            series = _column(catalogue, f, N)
+            miss = _missing_mask(series)
+            source[f] = np.where(miss, None, _strings(series, miss)).astype(object)
     seg = SegmentArrays(manifest={}, ids=ids, first_offset=first_offset, text=text,
                         live=pack_bits(np.ones(N, bool)))
     for f, spec in m.keyword.items():
@@ -241,13 +365,9 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
     # which docs have a value, for exists: the stored value, not its tokens (a value of stop words or punctuation
     # still exists, as OpenSearch counts it); a keyword over ignore_above is not indexed, so it does not exist
     for f in m.text:
-        col = catalogue[f].tolist() if f in catalogue.columns else [None] * N
-        seg.present[f] = pack_bits(np.array([not _is_missing(v) for v in col], bool))
+        seg.present[f] = pack_bits(~_missing_mask(_column(catalogue, f, N)))
     for f, spec in m.keyword.items():
-        src = spec["source"]
-        col = catalogue[src].tolist() if src in catalogue.columns else [None] * N
-        seg.present[f] = pack_bits(np.array([not _is_missing(v) and len(str(v)) <= spec["ignore_above"] for v in col],
-                                            bool))
+        seg.present[f] = pack_bits(_keyword_strings(_column(catalogue, spec["source"], N), spec["ignore_above"])[2])
     seg.manifest = {
         "version": int(version), "segment_id": f"seg-{int(version)}-{ident.hexdigest()[:8]}",
         "created": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "analyzer": ANALYZER_VERSION,

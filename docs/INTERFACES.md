@@ -923,3 +923,7 @@ status:
   approximate method did not run as itself; a cuVS failure runs the clause exact instead of raising. Lexical sums over
   fields and synonym groups are elementwise adds in field (group) order, so every backend gives the same bits.
   Additive.
+- 2026-11-11, architect (build speed, ESCI-US): `build_segment` analyses each distinct field value once and, for a
+  large catalogue in a single-threaded process, in forked worker processes (`S3_BUILD_WORKERS`, default the CPU
+  affinity; 1 turns it off); missing checks, keyword columns, presence bitmaps and the slot and id maps are
+  vectorised. The segment is unchanged byte for byte (its checksum is equal on toy and ESCI-sample). No format change.
