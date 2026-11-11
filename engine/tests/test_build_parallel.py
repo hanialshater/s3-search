@@ -31,6 +31,9 @@ def catalogue():
 
 
 def test_parallel_build_equals_serial(tmp_path, monkeypatch):
+    import pytest
+    if B.cuda_maybe_started():
+        pytest.skip(f"no forked workers here: {B.cuda_maybe_started()}")
     m = toy_mapping()
     m["properties"]["category"] = {"type": "keyword", "ignore_above": 256}
     c = catalogue()
@@ -50,3 +53,21 @@ def test_missing_mask_matches_the_scalar_rule():
     t = pd.Series(["a", None, "b"], dtype="string")
     assert B._missing_mask(t).tolist() == [False, True, False]
     assert B._strings(t, B._missing_mask(t)).tolist() == ["a", "", "b"]
+
+
+def test_no_fork_once_cuda_may_be_started(tmp_path, monkeypatch, capsys):
+    import sys
+    import types
+    m = toy_mapping()
+    c = catalogue()
+    monkeypatch.setenv("S3_BUILD_WORKERS", "3")
+    monkeypatch.setattr(B, "PARALLEL_MIN_CHARS", 0)
+    monkeypatch.setitem(sys.modules, "cupy", types.ModuleType("cupy"))      # a GPU library is loaded
+    B._NOTICED.clear()
+    assert not B._pool_ok(3, 10) and B.cuda_maybe_started() == "cupy is loaded"
+    monkeypatch.setattr(B, "_run", lambda *a: (_ for _ in ()).throw(AssertionError("forked with CUDA started")))
+    got = digest(B.build_segment(c, m), tmp_path / "a")
+    assert "analysing in this process" in capsys.readouterr().err
+    monkeypatch.delitem(sys.modules, "cupy")
+    monkeypatch.setenv("S3_BUILD_WORKERS", "1")
+    assert got == digest(B.build_segment(c, m), tmp_path / "b")

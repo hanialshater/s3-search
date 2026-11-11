@@ -83,14 +83,57 @@ def _tokens_slice(task):
     return tokens_of(_POOL_INPUT[a:b])
 
 
+GPU_MODULES = ("cupy", "cuvs", "cuml", "rmm", "numba.cuda", "pycuda")
+
+
+def cuda_maybe_started() -> str | None:
+    """Why CUDA may already be started in this process (a forked child of it can hang or crash), or None. Torch is
+    asked (``torch.cuda.is_initialized``); a loaded GPU library (CuPy, cuVS, cuML, RMM, Numba's CUDA, PyCUDA)
+    counts as started, since those give no such check."""
+    import sys
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            if torch.cuda.is_initialized():
+                return "torch has initialised CUDA"
+        except Exception:
+            pass
+    for name in GPU_MODULES:
+        if name in sys.modules:
+            return f"{name} is loaded"
+    return None
+
+
+_NOTICED = set()
+
+
+def _notice(why: str) -> None:
+    if why not in _NOTICED:
+        _NOTICED.add(why)
+        import sys
+        print(f"engine.build: analysing in this process, not in workers ({why}); the segment is the same",
+              file=sys.stderr)
+
+
 def _pool_ok(workers: int, chars: int) -> bool:
     """Workers are forked (they inherit their input, nothing is pickled to them, and no caller's ``__main__`` is
-    re-imported), and only from a process with one thread: forking a threaded process (a server) can deadlock the
-    child, so there the analysis runs in this process."""
+    re-imported), and only from a process that is safe to fork: one Python thread (forking a threaded process, a
+    server, can deadlock the child) and CUDA not started (a forked child of a CUDA process can hang or crash).
+    Otherwise the analysis runs in this process, with a one-line notice; the output is the same either way."""
     import multiprocessing as mp
     import threading
-    return workers > 1 and chars >= PARALLEL_MIN_CHARS and "fork" in mp.get_all_start_methods() \
-        and threading.active_count() == 1
+    if workers <= 1 or chars < PARALLEL_MIN_CHARS:
+        return False
+    if "fork" not in mp.get_all_start_methods():
+        why = "no fork on this platform"
+    elif threading.active_count() > 1:
+        why = f"{threading.active_count()} Python threads"
+    else:
+        why = cuda_maybe_started()
+    if why is not None:
+        _notice(why)
+        return False
+    return True
 
 
 def _run(fn, data, tasks, workers):
