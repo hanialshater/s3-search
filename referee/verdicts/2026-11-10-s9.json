@@ -134,7 +134,8 @@
   },
   "S9 predictions 1 (GPU half), 2 and 3": {
    "verdict": "not judged yet",
-   "why": "judged by referee/gpu_judges.py in the founder's Colab run (the notebook's S9 cell, the only score of record)"
+   "why": "judged by referee/gpu_judges.py in the founder's Colab run (the notebook's S9 cell, the only score of record)",
+   "disclosure": "2026-11-11, before any GPU result existed (no results-s9.json had been run or seen): the judges were changed. Their first version set no embeddings `fit`, so every build fitted the encoder in numpy and prediction 2 (the GPU fit) could not have been tested; the architect found it. Now p1 and p2's cuda index use fit \"auto\", p2's cpu comparison uses fit \"numpy\", and p2 is 'not judged' on cuda unless the encoder reports it was fitted on the GPU (fitted_with gpu or cuml). The judges' thresholds and definitions did not change. Also 474f9f5: the GPU's name is read after the parts so p1's ESCI-US build is the first CUDA work, and each part records its build_mode (information only)."
   }
  }
 }

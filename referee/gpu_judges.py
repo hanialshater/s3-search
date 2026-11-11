@@ -26,6 +26,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -48,13 +49,30 @@ def _gpu_name():
         return None
 
 
-def _with_embeddings(mapping, method=None):
+def _build_mode():
+    """Which way the next engine build runs (474f9f5); information only, no verdict depends on it."""
+    if os.environ.get("S3_BUILD_WORKERS"):
+        return f"S3_BUILD_WORKERS={os.environ['S3_BUILD_WORKERS']} (set by the caller)"
+    try:
+        from engine.build import cuda_maybe_started
+    except ImportError:
+        return "unknown"
+    return "serial: CUDA had already started" if cuda_maybe_started() else "parallel workers: no CUDA work before it"
+
+
+def _with_embeddings(mapping, method=None, fit="numpy"):
+    """The mapping with the tfidf-svd-128 embeddings. `fit` (INTERFACES, S9-2): "numpy" (the reference, the default)
+    or "auto" (the GPU fit when CUDA is present). The cuda builds pass "auto"; p2's cpu comparison passes "numpy".
+    Fixed 2026-11-11 before any GPU result existed: the first version set no `fit`, so every build fitted in numpy
+    (the architect found it)."""
     m = copy.deepcopy(mapping)
     m["properties"]["embedding"] = {"type": "knn_vector", "dimension": 128,
                                     "method": {"name": method or "exact", "space_type": "cosinesimil"}}
     if method is None:
         m["properties"]["embedding"].pop("method")
-    m["_meta"]["engine"]["embeddings"] = copy.deepcopy(ENC)
+    enc = copy.deepcopy(ENC)
+    enc["embedding"]["fit"] = fit
+    m["_meta"]["engine"]["embeddings"] = enc
     return m
 
 
@@ -77,9 +95,10 @@ def p1_ann(n_queries=2000, dataset="esci-us"):
     base = copy.deepcopy(ds.mapping)
     base["properties"]["s9_bucket"] = {"type": "integer"}
     texts = _queries(ds, n_queries)
+    mode = _build_mode()
     t = time.perf_counter()
-    exact = api.build_index(cat, _with_embeddings(base), device=DEV)
-    out = {"n_queries": len(texts), "n_docs": len(cat), "build_exact_s": time.perf_counter() - t,
+    exact = api.build_index(cat, _with_embeddings(base, fit="auto"), device=DEV)  # the GPU fit on cuda
+    out = {"n_queries": len(texts), "n_docs": len(cat), "build_exact_s": time.perf_counter() - t, "build_mode": mode,
            "bucket_share": float(np.mean(np.asarray(cat["s9_bucket"]) == 0))}
     flt = {"term": {"s9_bucket": 0}}
 
@@ -134,6 +153,7 @@ class _EncoderClock:
 
     def __init__(self):
         self.s, self.calls, self.depth, self.saved, self.types = 0.0, [], 0, [], set()
+        self.fitted_with = set()   # the encoders' own record of the fit that ran (TfidfSvdEncoder.fitted_with)
 
     def __enter__(self):
         import inspect
@@ -160,6 +180,8 @@ class _EncoderClock:
                                     clock.s += time.perf_counter() - t
                                     clock.calls.append(_n)
                                     clock.types.add(f"{_c.__module__}.{_c.__name__}")
+                                    if _n in ("fit", "fit_transform"):
+                                        clock.fitted_with.add(str(getattr(obj, "fitted_with", None)))
                         self.saved.append((cls, name, orig))
                         setattr(cls, name, wrapped)
         return self
@@ -172,20 +194,26 @@ class _EncoderClock:
 def p2_encoder():
     import engine.api as api
     ds = loader.load_dataset("esci-sample")
-    m = _with_embeddings(ds.mapping)
-    out = {}
+    m_gpu = _with_embeddings(ds.mapping, fit="auto")    # the GPU fit (S9-2) that prediction 2 is about
+    m_cpu = _with_embeddings(ds.mapping, fit="numpy")   # the reference fit, for the comparison
+    out = {"build_mode": _build_mode()}
     with _EncoderClock() as clock:
         t = time.perf_counter()
-        gpu_idx = api.build_index(ds.catalogue, m, device=DEV)
+        gpu_idx = api.build_index(ds.catalogue, m_gpu, device=DEV)
         out["build_cuda_s"] = time.perf_counter() - t
     out["encoder_fit_and_encode_s"] = clock.s
     out["encoder_types"] = sorted(clock.types)
     out["encoder_calls"] = clock.calls
+    out["fitted_with"] = sorted(clock.fitted_with)
     if not clock.calls:
         out["fit_verdict"] = "not judged: no encoder fit or encode call was observed"
+    elif DEV == "cuda" and not (clock.fitted_with and clock.fitted_with <= {"gpu", "cuml"}):
+        out["fit_verdict"] = f"not judged: the encoder says it was fitted with {sorted(clock.fitted_with)}, not on the GPU"
     else:
         out["fit_verdict"] = "held" if clock.s <= 2.0 else "wrong"
-    cpu_idx = api.build_index(ds.catalogue, m, device="cpu")
+    with _EncoderClock() as cclock:
+        cpu_idx = api.build_index(ds.catalogue, m_cpu, device="cpu")
+    out["cpu_fitted_with"] = sorted(cclock.fitted_with)
     q = ds.fit[["query_id", "query"]].drop_duplicates("query_id")
     judg = loader.fit_judgments(ds)
     hybrid = {"query": {"hybrid": {"queries": [bench.DEFAULT_TEMPLATE["query"],
@@ -232,6 +260,19 @@ def p3_gbdt(min_rows=10_000):
             ("not judged: fewer than 10,000 rows" if rows < min_rows else "wrong")}
 
 
+def _mark_smoke(d):
+    """Every verdict field, at any depth, of a non-cuda run says it is a smoke test with no verdict."""
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k.endswith("verdict") and isinstance(v, str):
+                d[k] = f"smoke test on {DEV}, no verdict (the judge's code said: {v})"
+            else:
+                _mark_smoke(v)
+    elif isinstance(d, list):
+        for v in d:
+            _mark_smoke(v)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee.gpu_judges")
     ap.add_argument("--out", default="results-s9.json")
@@ -242,8 +283,10 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     global DEV
     DEV = a.device
+    # 474f9f5: no CUDA work before p1's ESCI-US build (the GPU's name is read after the parts), so that build may
+    # fork its workers; later builds in this process run serial, as the engine decides (`build_mode` says which).
     import engine.api as api
-    res = {"kind": "gpu-judges-s9", "devices": api.available_devices(), "gpu": _gpu_name(),
+    res = {"kind": "gpu-judges-s9", "devices": api.available_devices(),
            "label": "score candidate (GPU), the founder's Colab run is the record"}
     if a.device != "cuda":
         res["label"] = "SMOKE TEST on cpu: checks the judges' code only; no verdict"
@@ -257,8 +300,11 @@ def main(argv=None) -> int:
                 t = time.perf_counter()
                 res[part] = fn()
                 res[part]["wall_s"] = time.perf_counter() - t
+                if DEV != "cuda":   # a smoke test gives no verdict: say so on every verdict field, not only the label
+                    _mark_smoke(res[part])
             except Exception as e:  # noqa: BLE001
                 res[part] = {"verdict": f"not judged: {type(e).__name__}: {e}", "trace": traceback.format_exc()[-1200:]}
+    res["gpu"] = _gpu_name()
     Path(a.out).write_text(json.dumps(res, indent=1, default=str) + "\n")
     print(json.dumps({k: (v if not isinstance(v, dict) else {kk: vv for kk, vv in v.items() if kk != "trace"})
                       for k, v in res.items()}, indent=1, default=str)[:4000])

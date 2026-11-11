@@ -70,9 +70,11 @@ class RebuildReplica:
 
     def search(self, r):
         out = self.index.search(r)
-        self.n += 1
-        if self.partial_every and self.n % self.partial_every == 0:
-            out = {**out, "hits": {**out["hits"], "total": max(0, out["hits"]["total"] - 1)}}
+        witness = r.get("query") == {"match_all": {}} and r.get("size") == 0
+        if witness:   # the plant spoils only the witnesses' answers (probes and the capability check stay right)
+            self.n += 1
+            if self.partial_every and self.n % self.partial_every == 0:
+                out = {**out, "hits": {**out["hits"], "total": max(0, out["hits"]["total"] - 1)}}
         return out
 
     def search_batch(self, rs):
@@ -141,9 +143,38 @@ def test_planted_lost_deletes_are_caught(tmp_path):
     assert r["writes"]["never_visible"]["delete"] > 0 or r["quiesced"]["differ"] > 0
 
 
-def test_planted_partial_results_are_caught(tmp_path):
-    """The quick one fast keeps: a short stream, and a replica that answers some queries with a partial result."""
-    r = _run(tmp_path, duration_s=0.4, idle_s=0.1, rate=50, partial_every=3)
+def test_planted_partial_results_are_caught():
+    """The quick one fast keeps, deterministic (it was timing-dependent: a plant on every third search of any kind,
+    seen only when a witness both drew it and held a still version, failed 1 run in 4 under load). The querier's
+    witnesses run against a replica whose version never moves and which answers every match_all witness with a
+    partial total: every witness must be flagged. No stream, no swap timing."""
+    class Partial:
+        version = 7
+
+        def search(self, r):
+            if r["query"] == {"match_all": {}} and r.get("size") == 0:
+                return {"hits": {"total": 99, "hits": []}}     # one document short of the live count, 100
+            return {"hits": {"total": 1, "hits": [{"_id": "a", "_score": 1.0}]}}
+    st = stream._State([f"d{i}" for i in range(100)], 7)
+    stop, rows = threading.Event(), []
+    th = threading.Thread(target=stream._querier,
+                          args=(Partial(), st, [{"query": {"match": {"product_title": "x"}}}], stop, rows, 2000.0))
+    th.start()
+    deadline = time.monotonic() + 30
+    while sum(r["witness"] for r in list(rows)) < 5 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    stop.set()
+    th.join()
+    witnesses = [r for r in rows if r["witness"]]
+    assert len(witnesses) >= 5
+    assert all(r["wrong_total"] == (99, 100, 7) for r in witnesses)
+    assert not any(r["wrong_total"] for r in rows if not r["witness"])
+
+
+@pytest.mark.slow
+def test_planted_partial_results_in_a_stream(tmp_path):
+    """The same plant through a whole (short) stream: a replica answering every witness with a partial total."""
+    r = _run(tmp_path, duration_s=1.5, idle_s=0.2, rate=50, partial_every=1)
     assert r["queries"]["n_wrong_totals"] > 0
 
 
