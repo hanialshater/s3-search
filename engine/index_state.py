@@ -293,14 +293,18 @@ class IndexState:
         pi, li, fo = (np.concatenate(x) for x in (pi, li, fo))
         order = np.lexsort((li, pi, fo))
         pi, li, fo = pi[order], li[order], fo[order]
-        ids = np.array([self.parts[k].ids[i] for k, i in zip(pi.tolist(), li.tolist())], dtype=object)
-        if len(set(ids.tolist())) != len(ids):
-            dup = next(x for x, c in Counter(ids.tolist()).items() if c > 1)
+        base = np.concatenate([[0], np.cumsum([len(p.ids) for p in self.parts])]).astype(np.int64)
+        all_ids = np.concatenate([np.asarray(p.ids, dtype=object) for p in self.parts]) if self.parts \
+            else np.zeros(0, dtype=object)
+        ids = all_ids[base[pi] + li] if len(pi) else np.zeros(0, dtype=object)
+        id_list = ids.tolist()
+        self.pos = dict(zip(id_list, range(len(id_list))))
+        if len(self.pos) != len(ids):
+            dup = next(x for x, c in Counter(id_list).items() if c > 1)
             raise ValueError(f"_id {dup!r} is live in two segments (tombstone the older copy)")
         N = len(ids)
         self.N = self.n_live = N
         self.slot_part, self.slot_local, self.ids, self.first_offset = pi, li, ids, fo
-        self.pos = {d: s for s, d in enumerate(ids.tolist())}
         self.first_offset_dev = b.asarray(fo, "int64")
         self._exists = {}
         self.known = set()

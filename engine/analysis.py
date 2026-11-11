@@ -60,3 +60,26 @@ def analyze(text, analyzer: str = "s3_english") -> list[str]:
     if _missing(text):
         return []
     return [t for t in map(_token, _WORD.findall(str(text).lower())) if t is not None]
+
+
+
+
+def words_of(values):
+    """Build-time analysis, pass 1 (the build speed-ups, 2026-11-11): the regex words of a list of strings, as
+    ``(distinct words in first-seen order, int32 index into them per word in order, int64 word count per value)``.
+    Module level, so build workers can run it."""
+    from itertools import chain
+    import numpy as np
+    findall = _WORD.findall
+    per = [findall(v.lower()) for v in values]
+    lens = np.fromiter((len(w) for w in per), np.int64, len(per))
+    words = list(chain.from_iterable(per))
+    del per
+    index = {w: i for i, w in enumerate(dict.fromkeys(words))}
+    flat = np.fromiter(map(index.__getitem__, words), np.int32, len(words))
+    return list(index), flat, lens
+
+
+def tokens_of(words):
+    """Pass 2: each word's token (or None): exactly ``analyze_with_positions``'s."""
+    return [_token(w) for w in words]
