@@ -305,6 +305,8 @@ def main(argv=None) -> int:
             except Exception as e:  # noqa: BLE001
                 res[part] = {"verdict": f"not judged: {type(e).__name__}: {e}", "trace": traceback.format_exc()[-1200:]}
     res["gpu"] = _gpu_name()
+    from referee import runtime
+    res["runtime"] = runtime.environment()
     Path(a.out).write_text(json.dumps(res, indent=1, default=str) + "\n")
     print(json.dumps({k: (v if not isinstance(v, dict) else {kk: vv for kk, vv in v.items() if kk != "trace"})
                       for k, v in res.items()}, indent=1, default=str)[:4000])

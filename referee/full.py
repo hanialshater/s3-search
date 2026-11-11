@@ -102,6 +102,10 @@ def main(argv=None) -> int:
     devices = api.available_devices()        # torch.cuda.is_available(): does not start CUDA
     device = a.device or ("cuda" if "cuda" in devices else devices[0])
     out = {"kind": "full", "device": device, "devices": devices, "engine": a.engine}
+    from referee import runtime
+    out["runtime"] = runtime.environment()     # GPU, driver, CUDA, torch, RAPIDS (nvidia-smi and metadata: no CUDA)
+    say(f"runtime: {out['runtime']['gpu']} (driver {out['runtime']['driver']}, CUDA {out['runtime']['cuda_driver_api']}, "
+        f"torch CUDA {out['runtime']['torch_cuda']})")
 
     if a.skip_contract or a.engine != "engine":
         out["contract_exit_code"] = None
