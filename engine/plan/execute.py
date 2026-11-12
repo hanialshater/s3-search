@@ -117,7 +117,7 @@ class Executor:
             w = np.zeros(F, np.float32)
             for f, wt in fields:
                 w[st.field_index[f]] = wt
-            bb = np.full(F, st.mapping.b, np.float32)
+            bb = np.array([st.mapping.b_of(f) for f in st.text_fields], np.float32)
             f_i = next(st.field_index[f] for f, wt in fields if wt > 0) if idf_mode == "field" else None
             idfs = [part.idf_field[:, f_i] if f_i is not None else part.idf for part in st.parts]
             terms_pp = [[[part.vocab[t] for t in n.terms if t in part.vocab] for n in nodes] for part in st.parts]
@@ -258,7 +258,7 @@ class Executor:
         w = np.zeros(F, np.float32)
         for f, wt in node.fields:
             w[st.field_index[f]] = wt
-        bb = np.full(F, st.mapping.b, np.float32)
+        bb = np.array([st.mapping.b_of(f) for f in st.text_fields], np.float32)
         if node.idf == "field":
             f_i = next(st.field_index[f] for f, wt in node.fields if wt > 0)
             idf_h = st.host_idf_field[:, f_i]
@@ -291,7 +291,7 @@ class Executor:
         idf_sum = sum(max((float(st.host_idf_field[st.gid(t), f_i]) for t in alts if st.gid(t) is not None),
                           default=0.0)
                       for alts in node.slots)
-        sc = phrase_scores(b, st, f_i, freq, idf_sum, st.mapping.k1, st.mapping.b)
+        sc = phrase_scores(b, st, f_i, freq, idf_sum, st.mapping.k1, st.mapping.b_of(st.text_fields[f_i]))
         return b.where(m, sc * node.boost, 0.0), m
 
     def _child(self, path):

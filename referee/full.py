@@ -71,6 +71,7 @@ def main(argv=None) -> int:
     ap.add_argument("--engine", default="engine", choices=("engine", "opensearch", "reference"))
     ap.add_argument("--device", default=None, help="default: cuda if available, else cpu")
     ap.add_argument("--request", help="JSON request template with the string {{query}} (the engine's tuned request)")
+    ap.add_argument("--bm25", help="JSON file of BM25F parameters for the engine's mapping (_meta.engine.bm25: k1, and b as a number or a per-field map), tuned on the fit split; recorded in the results")
     ap.add_argument("--k", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--latency-queries", type=int, default=1000)
@@ -123,6 +124,18 @@ def main(argv=None) -> int:
         keep = set(int(q) for q in queries["query_id"])
         judg = {q: j for q, j in judg.items() if q in keep}
     say(f"data: {len(ds.catalogue):,} products, {len(queries):,} test queries")
+    if a.bm25:
+        if a.engine != "engine":
+            print("referee full: --bm25 sets the engine's mapping; it does not apply to --engine=" + a.engine, file=sys.stderr)
+            return 2
+        import copy
+        import dataclasses
+        params = json.loads(Path(a.bm25).read_text())
+        mapping = copy.deepcopy(ds.mapping)
+        mapping.setdefault("_meta", {}).setdefault("engine", {})["bm25"] = params
+        ds = dataclasses.replace(ds, mapping=mapping)
+        out["bm25"] = params
+        say(f"bm25: {json.dumps(params)}")
     subsets = {}
     ho = held_out_ids()
     if ho is not None:

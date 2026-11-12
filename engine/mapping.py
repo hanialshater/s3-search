@@ -20,7 +20,8 @@ class Mapping:
     vector: dict[str, dict]                # name -> {"dim", "space_type"}
     hot: list[str]
     k1: float = 1.2
-    b: float = 0.75
+    b: float = 0.75                        # the b of every text field not in field_b
+    field_b: dict = field(default_factory=dict)    # text field -> its own b (BM25F per-field length normalisation)
     embeddings: dict[str, dict] = field(default_factory=dict)
     dynamic: str = "true"
     positions: bool = True                 # _meta.engine.positions (S7-1): index term positions for phrases
@@ -29,6 +30,10 @@ class Mapping:
 
     geo: dict = field(default_factory=dict)        # S9-4: geo_point fields
     nested: dict = field(default_factory=dict)     # S9-5: path -> the children's mapping (a mapping of its own)
+
+    def b_of(self, name: str) -> float:
+        """The BM25 ``b`` of a text field: its own (``_meta.engine.bm25.b`` as a map), else the default."""
+        return float(self.field_b.get(name, self.b))
 
     def kind(self, name: str) -> str | None:
         if name in self.text:
@@ -120,6 +125,7 @@ def parse_mapping(raw: dict) -> Mapping:
         if h not in numeric:
             raise InvalidMapping("_meta.engine.hot", f"{h!r}: hot fields are numeric or boolean fields")
     bm25 = eng.get("bm25", {})
+    k1, b_default, field_b = _bm25_params(bm25, text)
     embeddings = dict(eng.get("embeddings", {}))
     for v, spec in embeddings.items():
         if v not in vector:
@@ -129,10 +135,45 @@ def parse_mapping(raw: dict) -> Mapping:
                 raise InvalidMapping(f"_meta.engine.embeddings.{v}.inputs", f"{src!r} is not a field")
     synonyms = parse_synonyms(eng.get("synonyms", []))
     return Mapping(raw=raw, id_field=eng.get("id_field", "_id"), text=text, keyword=keyword, numeric=numeric,
-                   vector=vector, hot=hot, k1=float(bm25.get("k1", 1.2)), b=float(bm25.get("b", 0.75)),
+                   vector=vector, hot=hot, k1=k1, b=b_default, field_b=field_b,
                    embeddings=embeddings, dynamic=str(raw.get("dynamic", "true")).lower(),
                    positions=bool(eng.get("positions", True)), source=bool(eng.get("source", True)),
                    synonyms=synonyms, geo=geo_fields, nested=nested_fields)
+
+
+def _bm25_params(bm25: dict, text: list) -> tuple[float, float, dict]:
+    """``_meta.engine.bm25``: ``k1`` (>= 0, default 1.2) and ``b`` (in [0, 1], default 0.75), where ``b`` is a number
+    for every text field or a map of text field -> b, with ``b_default`` for the fields it does not name."""
+    if not isinstance(bm25, dict):
+        raise InvalidMapping("_meta.engine.bm25", "an object with k1 and b")
+    try:
+        k1 = float(bm25.get("k1", 1.2))
+    except (TypeError, ValueError):
+        raise InvalidMapping("_meta.engine.bm25.k1", "a number") from None
+    if not k1 >= 0:
+        raise InvalidMapping("_meta.engine.bm25.k1", "a number >= 0")
+
+    def one(path, v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise InvalidMapping(path, "a number in [0, 1]") from None
+        if not 0.0 <= v <= 1.0:
+            raise InvalidMapping(path, "a number in [0, 1]")
+        return v
+
+    raw_b = bm25.get("b", 0.75)
+    if isinstance(raw_b, dict):
+        b_default = one("_meta.engine.bm25.b_default", bm25.get("b_default", 0.75))
+        field_b = {}
+        for f, v in raw_b.items():
+            if f not in text:
+                raise InvalidMapping(f"_meta.engine.bm25.b.{f}", "not a text field")
+            field_b[f] = one(f"_meta.engine.bm25.b.{f}", v)
+        return k1, b_default, field_b
+    if "b_default" in bm25:
+        raise InvalidMapping("_meta.engine.bm25.b_default", "only with a per-field b map")
+    return k1, one("_meta.engine.bm25.b", raw_b), {}
 
 
 def parse_synonyms(lines) -> dict:

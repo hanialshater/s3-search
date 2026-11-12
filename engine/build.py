@@ -417,7 +417,8 @@ def build_segment(catalogue: pd.DataFrame, mapping: dict, version: int = 0,
         "mapping": m.raw, "mapping_sha256": hashlib.sha256(raw.encode()).hexdigest(), "id_field": id_col,
         "text_fields": list(m.text), "keyword_fields": list(m.keyword), "numeric_fields": {f: str(np.asarray(c.values).dtype) for f, c in seg.numerics.items()},
         "geo_fields": list(m.geo), "nested_paths": list(m.nested),
-        "vector_fields": vector_fields, "hot": list(m.hot), "bm25": {"k1": m.k1, "b": m.b},
+        "vector_fields": vector_fields, "hot": list(m.hot),
+        "bm25": {"k1": m.k1, "b": dict(m.field_b), "b_default": m.b} if m.field_b else {"k1": m.k1, "b": m.b},
     }
     return seg
 

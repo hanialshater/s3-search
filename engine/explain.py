@@ -36,7 +36,7 @@ def _boosted(value, boost, inner):
 
 def _lexical(ex, node, doc):
     st = ex.st
-    k1, bpar = st.mapping.k1, st.mapping.b
+    k1 = st.mapping.k1
     terms, total = [], 0.0
     f_one = next(st.field_index[f] for f, w in node.fields if w > 0) if node.idf == "field" else None
     part, loc = st.owner(doc)                       # the segment that holds this slot's live doc
@@ -55,6 +55,7 @@ def _lexical(ex, node, doc):
             tf = int(part.host_tf[j, fi])
             if w <= 0 or tf == 0:
                 continue
+            bpar = st.mapping.b_of(f)
             norm = max(1.0 - bpar + bpar * float(st.host_rel_len[doc, fi]), 1e-6)
             c = w * tf / norm
             ptf += c
@@ -66,7 +67,8 @@ def _lexical(ex, node, doc):
         terms.append(_node("value", v, f"term {t!r}: idf {idf:.4g} * pseudo_tf * (k1 + 1) / (k1 + pseudo_tf), "
                                        f"pseudo_tf {ptf:.4g} = the sum of the field parts below",
                            [_node("sum", ptf, "pseudo_tf", per_field)]))
-    return _node("sum", total, f"BM25F (k1 {k1}, b {bpar}): sum over query terms", terms)
+    b_desc = st.mapping.b if not st.mapping.field_b else {f: st.mapping.b_of(f) for f, w in node.fields if w > 0}
+    return _node("sum", total, f"BM25F (k1 {k1}, b {b_desc}): sum over query terms", terms)
 
 
 def explain_node(ex, node, ctx, doc):

@@ -58,7 +58,10 @@ class ReferenceIndex:
         self.mapping = mapping
         self.id_field = eng.get("id_field", "product_id")
         bm = eng.get("bm25", {})
-        self.k1, self.b = float(bm.get("k1", 1.2)), float(bm.get("b", 0.75))
+        self.k1 = float(bm.get("k1", 1.2))
+        raw_b = bm.get("b", 0.75)                 # a number, or a map of text field -> b (b_default for the rest)
+        self.b = float(bm.get("b_default", 0.75)) if isinstance(raw_b, dict) else float(raw_b)
+        self.field_b = {f: float(v) for f, v in raw_b.items()} if isinstance(raw_b, dict) else {}
         self.hot = set(eng.get("hot", []))
         self.ids = catalogue[self.id_field].astype(str).to_numpy(dtype=object)
         self.row_of = {d: i for i, d in enumerate(self.ids)}
@@ -156,7 +159,8 @@ class ReferenceIndex:
                     continue
                 docs, tf = fd["post"][t]
                 present[docs] = True
-                norm = np.maximum(1.0 - self.b + self.b * fd["len"][docs] / fd["avg"], 1e-6)
+                bf = self.field_b.get(f, self.b)
+                norm = np.maximum(1.0 - bf + bf * fd["len"][docs] / fd["avg"], 1e-6)
                 pseudo[docs] += w * tf / norm
             if single_field_idf:
                 p = self.text[fields[0][0]]["post"].get(t)
