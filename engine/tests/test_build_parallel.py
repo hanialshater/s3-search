@@ -64,7 +64,8 @@ def test_no_fork_once_cuda_may_be_started(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(B, "PARALLEL_MIN_CHARS", 0)
     monkeypatch.setitem(sys.modules, "cupy", types.ModuleType("cupy"))      # a GPU library is loaded
     B._NOTICED.clear()
-    assert not B._pool_ok(3, 10) and B.cuda_maybe_started() == "cupy is loaded"
+    # On a GPU machine torch may have started CUDA already (an earlier test), which the check names first.
+    assert not B._pool_ok(3, 10) and B.cuda_maybe_started() in ("cupy is loaded", "torch has initialised CUDA")
     monkeypatch.setattr(B, "_run", lambda *a: (_ for _ in ()).throw(AssertionError("forked with CUDA started")))
     got = digest(B.build_segment(c, m), tmp_path / "a")
     assert "analysing in this process" in capsys.readouterr().err

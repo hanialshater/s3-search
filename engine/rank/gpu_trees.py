@@ -21,16 +21,34 @@ def _ceil32(x: float) -> float:
     return float(f)
 
 
+def _sibling_order(feat, left, right) -> list[int]:
+    """The engine's nodes in breadth-first order, so that each right child comes right after its left child.
+
+    XGBoost's GPU predictor steps to ``left_child + (x >= threshold)``: it assumes that layout, which its own trees
+    always have. The engine's trees are depth-first (the root's children can be nodes 1 and 32), so on cuda XGBoost
+    took the wrong branch on most rows (CPU was exact, as its predictor reads the right child)."""
+    order, k = [0], 0
+    while k < len(order):
+        i = order[k]
+        k += 1
+        if int(feat[i]) >= 0:
+            order += [int(left[i]), int(right[i])]
+    return order
+
+
 def to_xgboost_json(model, n_features: int) -> dict:
     trees = []
     for ti, t in enumerate(model.trees):
         feat, thr_bin = t["feature"], t["bin"]
         left, right, value = t["left"], t["right"], t["value"]
-        n = len(value)
+        order = _sibling_order(feat, left, right)          # new id -> engine node
+        new_id = {old: new for new, old in enumerate(order)}
+        n = len(order)
         parents = [2147483647] * n
-        conds, lefts, rights, splits = [], [], [], []
-        for i in range(n):
+        conds, lefts, rights, splits, weights = [], [], [], [], []
+        for j, i in enumerate(order):
             f = int(feat[i])
+            weights.append(float(np.float32(value[i])))
             if f < 0:                                         # a leaf
                 conds.append(float(np.float32(value[i])))
                 lefts.append(-1), rights.append(-1), splits.append(0)
@@ -39,10 +57,11 @@ def to_xgboost_json(model, n_features: int) -> dict:
             e = model.edges[f]
             thr = -np.inf if b == 0 else (_ceil32(float(e[b - 1])) if b - 1 < len(e) else np.inf)
             conds.append(float(thr) if np.isfinite(thr) else (-3.4028234663852886e38 if thr < 0 else 3.4028234663852886e38))
-            lefts.append(int(left[i])), rights.append(int(right[i])), splits.append(f)
-            parents[int(left[i])] = i
-            parents[int(right[i])] = i
-        trees.append({"base_weights": [float(np.float32(v)) for v in value], "categories": [], "categories_nodes": [],
+            lo, hi = new_id[int(left[i])], new_id[int(right[i])]
+            lefts.append(lo), rights.append(hi), splits.append(f)
+            parents[lo] = j
+            parents[hi] = j
+        trees.append({"base_weights": weights, "categories": [], "categories_nodes": [],
                       "categories_segments": [], "categories_sizes": [], "default_left": [1 if s >= 0 else 0 for s in lefts],
                       "id": ti, "left_children": lefts, "loss_changes": [0.0] * n, "parents": parents,
                       "right_children": rights, "split_conditions": conds, "split_indices": splits,

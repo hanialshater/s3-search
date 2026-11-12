@@ -67,7 +67,7 @@ def test_several_clauses_on_one_field_are_a_list(index):
     r = index.search({"query": {"hybrid": {"queries": [
         {"knn": {"embedding": {"vector": v, "k": 5, "method": "cagra"}}},
         {"neural": {"embedding": {"query_text": "black shoes", "k": 5}}}]}}})
-    ran = "cagra" if has_cuvs() else "exact"
+    ran = "cagra" if has_cuvs() and index.device == "cuda" else "exact"   # cuVS runs on a cuda index only
     got = [{k: v for k, v in e.items() if k != "reason"} for e in r["knn"]["embedding"]]
     assert got == [{"requested": "cagra", "ran": ran}, {"requested": "exact", "ran": "exact"}]
 
