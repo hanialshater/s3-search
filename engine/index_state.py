@@ -454,6 +454,11 @@ class IndexState:
         vals = [v for _, v in pairs]
         miss = np.array([v is None or (isinstance(v, float) and v != v) for v in vals], bool)
         filled = np.array([0 if m else v for v, m in zip(vals, miss)]).astype(self.num_dtype[field])
+        # Keep only the last write to each row. A scatter with duplicate indices is not ordered on cuda (the CPU
+        # keeps the last), so a product changed twice in one batch could end on either value.
+        _, first_in_reverse = np.unique(rows[::-1], return_index=True)
+        keep = np.sort(len(rows) - 1 - first_in_reverse)
+        rows, filled, miss = rows[keep], filled[keep], miss[keep]
         b = self.b
         self.numerics[field][b.asarray(rows, "int64")] = b.asarray(filled)
         self.missing[field][b.asarray(rows, "int64")] = b.asarray(miss)
