@@ -1,0 +1,160 @@
+#!/usr/bin/env -S colab run --gpu A100 --timeout 900
+"""Profile the full search pipeline on a Colab GPU: speed only, development only, never a score.
+
+    colab run --gpu A100 --timeout 900 colab/pipeline_profile.py [branch-or-commit] [--queries=1000]
+
+The pipeline is the prototype's (S6): tuned BM25F and dense retrieval (tfidf-svd-128), RRF over a 20,000 window, the
+GBDT ranker over the top 1,000, two terms facets and page 1. It reads only what members may read (referee/loader.py):
+the catalogue, the fit split (to train the ranker) and the test queries' texts; never a judgment. Quality is the
+referee's job; this measures latency at batch 1 with the per-stage times (took_ms), and throughput at several batch
+sizes, against S6's bar (at least 694 QPS with page-1 p99 at or under 35 ms on an A100). Lexical-only is measured too.
+Writes /content/pipeline-profile.json and prints it.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+REPO_URL = "https://github.com/hanialshater/s3-search"
+REPO = "/content/s3-search"
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+REF = args[0] if args else "main"
+N_QUERIES = next((int(a.split("=", 1)[1]) for a in sys.argv[1:] if a.startswith("--queries=")), 1000)
+BATCHES = (1, 16, 64, 128)
+S6_QPS, S6_P99_MS = 694, 35.0
+
+t_start = time.time()
+
+
+def say(msg):
+    print(f"[profile {time.time() - t_start:7.1f} s] {msg}", flush=True)
+
+
+def heartbeat(stop):
+    while not stop.wait(60):
+        say("still running")
+
+
+def pct(xs, p):
+    import numpy as np
+    return float(np.percentile(xs, p)) if xs else None
+
+
+def lexical(q):
+    return {"multi_match": {"query": q, "fields": LEX_FIELDS}}
+
+
+def pipeline_request(q):
+    return {"query": {"hybrid": {"queries": [lexical(q), {"neural": {"embedding": {"query_text": q, "k": 1000}}}]}},
+            "rank": {"rrf": {"rank_constant": 60, "window_size": 20000}},
+            "rescore": {"window_size": 1000, "s3_ranker": {"model": "gbdt"}},
+            "aggs": FACETS, "size": 10}
+
+
+def lexical_request(q):
+    return {"query": lexical(q), "aggs": FACETS, "size": 10}
+
+
+def measure(index, make, texts, label):
+    """Batch-1 latency with stage times, then throughput per batch size (each batch's wall time is its latency)."""
+    import numpy as np
+    for t in texts[:20]:                                   # warm-up: kernels, caches, the encoder
+        index.search(make(t))
+    lat, stages = [], {}
+    for t in texts:
+        t0 = time.perf_counter()
+        r = index.search(make(t))
+        lat.append((time.perf_counter() - t0) * 1e3)
+        for s, v in (r.get("took_ms") or {}).items():
+            stages.setdefault(s, []).append(float(v))
+    out = {"batch_1": {"p50_ms": pct(lat, 50), "p99_ms": pct(lat, 99), "mean_ms": float(np.mean(lat))},
+           "stage_ms_p50": {s: pct(v, 50) for s, v in stages.items()},
+           "stage_ms_p99": {s: pct(v, 99) for s, v in stages.items()}, "throughput": {}}
+    say(f"{label}: batch 1 p50 {out['batch_1']['p50_ms']:.2f} ms, p99 {out['batch_1']['p99_ms']:.2f} ms; "
+        f"stages p50 {json.dumps({k: round(v, 2) for k, v in out['stage_ms_p50'].items()})}")
+    for bs in BATCHES[1:]:
+        reqs = [make(t) for t in texts]
+        index.search_batch(reqs[:bs])                      # warm-up at this shape
+        walls = []
+        t0 = time.perf_counter()
+        for i in range(0, len(reqs), bs):
+            s = time.perf_counter()
+            index.search_batch(reqs[i:i + bs])
+            walls.append((time.perf_counter() - s) * 1e3)
+        total = time.perf_counter() - t0
+        qps = len(reqs) / total
+        out["throughput"][str(bs)] = {"qps": qps, "batch_p50_ms": pct(walls, 50), "batch_p99_ms": pct(walls, 99)}
+        say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms")
+    return out
+
+
+def main():
+    global LEX_FIELDS, FACETS
+    stop = threading.Event()
+    threading.Thread(target=heartbeat, args=(stop,), daemon=True).start()
+    if not os.path.isdir(REPO):
+        subprocess.run(["git", "clone", "--quiet", REPO_URL, REPO], check=True)
+    subprocess.run(["git", "-C", REPO, "fetch", "--quiet", "origin", REF], check=True)
+    subprocess.run(["git", "-C", REPO, "checkout", "--quiet", "FETCH_HEAD"], check=True)
+    os.chdir(REPO)
+    sys.path.insert(0, REPO)
+    os.environ.setdefault("S3_SEARCH_DATA", os.path.join(REPO, "data", "esci"))
+    import importlib.util
+    missing = [m for m in ("snowballstemmer",) if importlib.util.find_spec(m) is None]
+    if missing:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *missing], check=True)
+    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+    from engine import api
+    from engine.rank.train import train_ranker
+    from referee import loader, runtime
+    env = runtime.environment()
+    say(f"{REF} at {commit}; {env['gpu']}")
+    loader.fetch()
+    ds = loader.load_dataset("esci-us")
+    tmpl = json.loads(open("referee/requests/bm25f-tuned.json").read())
+    LEX_FIELDS = tmpl["query"]["multi_match"]["fields"]
+    FACETS = {"brand": {"terms": {"field": "product_brand.keyword", "size": 20}},
+              "color": {"terms": {"field": "product_color.keyword", "size": 20}}}
+    m = copy.deepcopy(ds.mapping)
+    m["_meta"]["engine"]["bm25"] = json.loads(open("referee/requests/bm25f-tuned.bm25.json").read())
+    m["_meta"]["engine"]["embeddings"] = {"embedding": {"model": "tfidf-svd-128",
+                                                       "inputs": ["product_title", "product_brand", "product_color"]}}
+    m["properties"]["embedding"] = {"type": "knn_vector", "dimension": 128,
+                                    "method": {"name": "hnsw", "space_type": "cosinesimil", "engine": "lucene"}}
+    say(f"build: {len(ds.catalogue):,} products on cuda, with the tfidf-svd-128 encoder")
+    t0 = time.perf_counter()
+    index = api.build_index(ds.catalogue, m, device="cuda")
+    build_s = time.perf_counter() - t0
+    say(f"build: done in {build_s:.1f} s")
+    t0 = time.perf_counter()
+    model = train_ranker(index, ds.fit, lambda q: {"query": pipeline_request(q)["query"],
+                                                   "rank": pipeline_request(q)["rank"]},
+                         window=1000, n_random=20, max_queries=2000)
+    index.add_ranker("gbdt", model)
+    train_s = time.perf_counter() - t0
+    say(f"ranker: trained on 2,000 fit queries in {train_s:.1f} s")
+    texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
+    result = {"kind": "pipeline-profile", "label": "development only, never a score", "ref": REF, "commit": commit,
+              "runtime": env, "n_products": int(len(ds.catalogue)), "n_queries": len(texts),
+              "build_s": build_s, "ranker_train_s": train_s,
+              "lexical": measure(index, lexical_request, texts, "lexical"),
+              "pipeline": measure(index, pipeline_request, texts, "pipeline")}
+    best = max(result["pipeline"]["throughput"].values(), key=lambda v: v["qps"] if v["batch_p99_ms"] <= S6_P99_MS else -1)
+    result["s6"] = {"bar": {"qps": S6_QPS, "p99_ms": S6_P99_MS},
+                    "best_qps_within_p99": best["qps"] if best["batch_p99_ms"] <= S6_P99_MS else None,
+                    "page1_p99_ms_batch_1": result["pipeline"]["batch_1"]["p99_ms"]}
+    stop.set()
+    json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
+    say("DONE")
+    print(json.dumps(result, indent=1), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
