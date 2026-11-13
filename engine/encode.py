@@ -158,7 +158,12 @@ class TfidfSvdEncoder:
         return rows, cols, vals, n
 
     def _project(self, rows, cols, vals, n):
-        out = _sparse_matmul(rows, cols, vals, self.components.astype(np.float64), n, "rows")
+        # Only the rows of the components that these texts use, in float64: a query touches a handful of the V
+        # rows, and copying all of them (V x d float64, twice) per call was most of a query's encode time (S6-4).
+        # The same values are summed in the same order, so the result is bit-for-bit the full product's.
+        used, local = np.unique(cols, return_inverse=True)
+        sub = self.components[used].astype(np.float64)
+        out = _sparse_matmul(rows, local.reshape(-1).astype(np.int64), vals, sub, n, "rows")
         norm = np.linalg.norm(out, axis=1, keepdims=True)
         return (out / np.where(norm > 0, norm, 1.0)).astype(np.float32)
 
