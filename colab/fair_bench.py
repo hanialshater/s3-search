@@ -3,6 +3,7 @@
 
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
+        [--fronts=0 --gpu-processes=1] [--log=/content/serving.log]
 
 --columns defaults to 1 since S6-7 (s3-search 67c1cd0): serving asks the engine for columnar hits. Runs before that
 commit were the dict form (--columns=0 now). --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
@@ -64,6 +65,9 @@ ENGINES = opt("engines", "engine,opensearch").split(",")
 WORKERS = int(opt("workers", "1"))
 COLUMNS = opt("columns", "1")
 MPS = opt("mps", "0") == "1"
+FRONTS = int(opt("fronts", "0"))                             # S6-10s: front processes (0: not that layout)
+GPUS = int(opt("gpu-processes", "1"))
+LOG = opt("log", "/content/serving.log")                     # one server log per configuration
 OUT = opt("out", "/content/fair-bench.json")
 t_start = time.time()
 
@@ -122,7 +126,7 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
     async def run():
         n_total = int(rate * duration)
         mine = range(p, n_total, n_procs)
-        lat, errors, timeouts, hits, lag = [], 0, 0, [], []
+        lat, errors, timeouts, hits, lag, samples, why = [], 0, 0, [], [], [], {}
         conn = aiohttp.TCPConnector(limit=0, force_close=False)
         tout = aiohttp.ClientTimeout(total=TIMEOUT_S)
         async with aiohttp.ClientSession(connector=conn, timeout=tout) as s:
@@ -134,14 +138,18 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                         raw = await r.read()
                         if r.status != 200:
                             errors += 1
+                            why[str(r.status)] = why.get(str(r.status), 0) + 1
                             return
                     lat.append((time.time() - due) * 1e3)
-                    if i % 97 == 0:
-                        hits.append(len(json.loads(raw)["hits"]["hits"]))
+                    if i % 97 == 0:                          # sampled: hits, and a digest to compare unloaded
+                        n_hits, digest = result_digest(raw)
+                        hits.append(n_hits)
+                        samples.append([i, n_hits, digest])
                 except asyncio.TimeoutError:
                     timeouts += 1
-                except Exception:
+                except Exception as e:
                     errors += 1
+                    why[type(e).__name__] = why.get(type(e).__name__, 0) + 1
 
             tasks = []
             for i in mine:
@@ -153,9 +161,38 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                 tasks.append(asyncio.create_task(one(i, due)))
             await asyncio.gather(*tasks)
         json.dump({"lat": lat, "errors": errors, "timeouts": timeouts, "hits": hits, "lag": lag,
-                   "sent": len(mine)}, open(out_path, "w"))
+                   "sent": len(mine), "samples": samples, "why": why}, open(out_path, "w"))
 
     asyncio.run(run())
+
+
+def result_digest(raw: bytes) -> tuple[int, str]:
+    """A response's hit count and a digest of everything but took_ms (for the unloaded comparison)."""
+    import hashlib
+    d = json.loads(raw)
+    d.pop("took_ms", None)
+    return len(d["hits"]["hits"]), hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+
+def compare_unloaded(url, bodies, runs, limit=400):
+    """Replay sampled requests one at a time after the ladder and compare with what the loaded runs returned: a
+    response changed by load (or emptied) shows as a mismatch; a query with no matches has 0 hits both ways."""
+    seen, out = {}, {"checked": 0, "mismatch": [], "zero_hits_loaded": 0, "zero_hits_unloaded_too": 0}
+    for r in runs:
+        for i, n, dg in r.get("samples", []):
+            seen.setdefault(i, []).append((r["target_qps"], n, dg))
+    for i in sorted(seen)[:limit]:
+        raw = urllib.request.urlopen(urllib.request.Request(url, data=bodies[i % len(bodies)], method="POST",
+                                     headers={"Content-Type": "application/json"}), timeout=60).read()
+        n0, d0 = result_digest(raw)
+        for rate, n, dg in seen[i]:
+            out["checked"] += 1
+            if n == 0:
+                out["zero_hits_loaded"] += 1
+                out["zero_hits_unloaded_too"] += n0 == 0
+            if dg != d0:
+                out["mismatch"].append({"i": i, "rate": rate, "hits_loaded": n, "hits_unloaded": n0})
+    return out
 
 
 def load(url, bodies, rate, duration, client_cpus):
@@ -170,10 +207,12 @@ def load(url, bodies, rate, duration, client_cpus):
         procs.append(pr)
     for pr in procs:
         pr.join(duration + TIMEOUT_S + 120)
-    lat, hits, lag, errors, timeouts, sent = [], [], [], 0, 0, 0
+    lat, hits, lag, errors, timeouts, sent, samples, why = [], [], [], 0, 0, 0, [], {}
     for out in outs:
         d = json.load(open(out))
-        lat += d["lat"]; hits += d["hits"]; lag += d["lag"]
+        lat += d["lat"]; hits += d["hits"]; lag += d["lag"]; samples += d["samples"]
+        for k, v in d["why"].items():
+            why[k] = why.get(k, 0) + v
         errors += d["errors"]; timeouts += d["timeouts"]; sent += d["sent"]
     wall = max(duration, (max(lat) / 1e3) if lat else 0) + 0.0
     import numpy as np
@@ -186,6 +225,8 @@ def load(url, bodies, rate, duration, client_cpus):
            "latency_ms": {"p50": pct(lat, 50), "p95": pct(lat, 95), "p99": pct(lat, 99), "max": max(lat) if lat else None},
            "hits_per_response": {"min": min(hits) if hits else None, "median": pct(hits, 50)},
            "client_send_lag_ms_p99": pct(lag, 99)}
+    res["errors_by"] = why
+    res["samples"] = samples
     res["client_limited"] = bool(res["client_send_lag_ms_p99"] and res["client_send_lag_ms_p99"] > 50)
     return res
 
@@ -275,7 +316,8 @@ def engine_target(ds, server_cpus):
     build_s = time.time() - t0
     env = {**os.environ, "S3_SERVING_CACHE": "0", "S3_SERVING_MAX_BATCH": opt("max-batch", "64"),
            "S3_SERVING_MAX_WAIT_MS": opt("max-wait-ms", "2"), "S3_SEARCH_DEVICE": "cuda",
-           "S3_SERVING_WORKERS": str(WORKERS), "S3_SERVING_COLUMNS": COLUMNS}
+           "S3_SERVING_WORKERS": str(WORKERS), "S3_SERVING_COLUMNS": COLUMNS,
+           "S3_SERVING_FRONTS": str(FRONTS), "S3_SERVING_GPU_PROCESSES": str(GPUS)}
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
@@ -284,20 +326,20 @@ def engine_target(ds, server_cpus):
     port = free_port()
     cmd = ["taskset", "-c", ",".join(map(str, server_cpus)), sys.executable, "-m", "serving", "--data-dir",
            str(SERVE_DIR), "--device", "cuda", "--preload", "esci", "--port", str(port)]
-    proc = subprocess.Popen(cmd, env=env, stdout=open("/content/serving.log", "w"), stderr=subprocess.STDOUT,
+    proc = subprocess.Popen(cmd, env=env, stdout=open(LOG, "w"), stderr=subprocess.STDOUT,
                             start_new_session=True)
     try:
         wait_until(lambda: urllib.request.urlopen(f"http://localhost:{port}/readyz", timeout=5).status == 200,
-                   "serving", 1800, proc=proc, log="/content/serving.log")
+                   "serving", 1800, proc=proc, log=LOG)
     except Exception:
         stop(proc)
         raise
     if WORKERS > 1:                                          # every worker loaded, not only the first (/readyz says)
         wait_until(lambda: http_json("GET", f"http://localhost:{port}/readyz", timeout=5).get("workers_ready", 0)
-                   >= WORKERS, f"{WORKERS} workers loaded", 1800, proc=proc, log="/content/serving.log")
+                   >= WORKERS, f"{WORKERS} workers loaded", 1800, proc=proc, log=LOG)
     say(f"engine: serving on cuda (index built in {build_s:.0f} s; query cache off, max_batch "
         f"{env['S3_SERVING_MAX_BATCH']}, max_wait {env['S3_SERVING_MAX_WAIT_MS']} ms, workers {WORKERS}, "
-        f"columns {COLUMNS})")
+        f"columns {COLUMNS}, fronts {FRONTS}, gpu processes {GPUS}; log {LOG})")
     tmpl = json.loads(Path("referee/requests/bm25f-tuned.json").read_text())
 
     def body(q):
@@ -308,6 +350,20 @@ def engine_target(ds, server_cpus):
     return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
 
 
+def _role(p) -> str:
+    """What a server process is, from its command line (supervisor, worker i, front i, gpu process j)."""
+    try:
+        a = p.cmdline()
+    except Exception:
+        return "?"
+    for flag, name in (("--gpu-process", "gpu process"), ("--gpu-sockets", "front"), ("--worker-index", "worker")):
+        if flag in a:
+            i = a.index(flag)
+            j = a[i + 1] if flag != "--gpu-sockets" else a[a.index("--worker-index") + 1] if "--worker-index" in a else "?"
+            return f"{name} {j}"
+    return "supervisor" if "serving" in " ".join(a) else a[0] if a else "?"
+
+
 class Sampler:
     """Every 0.5 s during a run: GPU utilisation and memory (nvidia-smi), and the server's CPU use (its whole process
     tree, in cores). Says whether the GPU or the host was the limit."""
@@ -315,6 +371,7 @@ class Sampler:
     def __init__(self, pid):
         import threading
         self.pid, self.gpu, self.mem, self.cpu = pid, [], [], []
+        self.per_cpu, self.per_mem, self.role = {}, {}, {}      # per process: cores and device MiB samples
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
 
@@ -335,9 +392,20 @@ class Sampler:
                     if p.pid not in procs:
                         procs[p.pid] = p
                         p.cpu_percent(None)                     # the first call only starts the counter
+                        self.role[p.pid] = _role(p)
                         continue
-                    total += procs[p.pid].cpu_percent(None)
+                    c = procs[p.pid].cpu_percent(None)
+                    total += c
+                    self.per_cpu.setdefault(p.pid, []).append(c / 100.0)
                 self.cpu.append(total / 100.0)
+            except Exception:
+                pass
+            try:                                                 # device memory per process (what grows, and where)
+                apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                                      capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+                for line in apps:
+                    pid, mib = (x.strip() for x in line.split(","))
+                    self.per_mem.setdefault(int(pid), []).append(float(mib))
             except Exception:
                 pass
 
@@ -356,11 +424,18 @@ class Sampler:
             return {"mean": float(np.mean(x)), "p95": float(np.percentile(x, 95)), "max": float(np.max(x))} if x else None
         out = {"gpu_util_pct": s(self.gpu[2:]), "gpu_mem_mib": s(self.mem), "server_cpu_cores": s(self.cpu[2:]),
                "server_cpus_available": n_server_cpus}
+        out["per_process"] = sorted(
+            ({"pid": pid, "role": self.role.get(pid, "?"), "cpu_cores": s(v[2:] or v),
+              "device_mib": s(self.per_mem.get(pid, []))} for pid, v in self.per_cpu.items() if v),
+            key=lambda r: -(r["cpu_cores"] or {}).get("p95", 0))[:12]
+        busiest = out["per_process"][0] if out["per_process"] else None
         g, c = out["gpu_util_pct"], out["server_cpu_cores"]
         if g and c:
             out["limit"] = ("gpu" if g["mean"] >= 85 else
-                            "host cpu (one core: the Python process)" if WORKERS == 1 and 0.9 <= c["p95"] < 1.6 else
-                            "host cpu" if c["p95"] >= 0.85 * n_server_cpus else "neither saturated")
+                            "host cpu (one core: the Python process)" if WORKERS == 1 and not FRONTS and 0.9 <= c["p95"] < 1.6 else
+                            "host cpu" if c["p95"] >= 0.85 * n_server_cpus else
+                            f"one process at a core: {busiest['role']}" if busiest and busiest["cpu_cores"]
+                            and busiest["cpu_cores"]["p95"] >= 0.9 else "neither saturated")
         return out
 
 
@@ -389,7 +464,7 @@ def main():
     out = {"kind": "fair-bench", "label": "development only, never a score", "ref": REF, "commit": commit,
            "runtime": env, "cpus": os.cpu_count(), "client_cpus": client_cpus, "server_cpus": server_cpus,
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
-           "columns": COLUMNS, "mps": MPS, "engines": {}}
+           "columns": COLUMNS, "mps": MPS, "fronts": FRONTS, "gpu_processes": GPUS, "log": LOG, "engines": {}}
     for name in ENGINES:
         target = engine_target if name == "engine" else opensearch_target
         try:
@@ -422,7 +497,11 @@ def main():
                     say(f"{name}: cannot sustain {rate:.0f} QPS; no higher rates (the same rule for every engine)")
                     break
                 time.sleep(5)
-            out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs}
+            say(f"{name}: replaying sampled requests unloaded")
+            check = compare_unloaded(url, bodies, runs)
+            say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
+                f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 unloaded)")
+            out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check}
         finally:
             stop(proc)
             time.sleep(5)

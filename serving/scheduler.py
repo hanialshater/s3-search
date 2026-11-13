@@ -29,25 +29,33 @@ from .metrics import Metrics
 
 def takes_hits(fn) -> bool:
     """Whether ``search``/``search_batch`` accepts ``hits=`` (the engine's columnar hits, S6-7)."""
-    return _takes_hits(getattr(fn, "__func__", fn))
+    return takes_param(fn, "hits")
 
 
-@functools.lru_cache(maxsize=64)
-def _takes_hits(fn) -> bool:
+def takes_param(fn, name: str) -> bool:
+    return _takes(getattr(fn, "__func__", fn), name)
+
+
+@functools.lru_cache(maxsize=128)
+def _takes(fn, name: str) -> bool:
     try:
-        return "hits" in inspect.signature(fn).parameters
+        return name in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
 
 
 def search_batch(index, requests: list, columns: bool) -> list:
     if columns and takes_hits(index.search_batch):
+        if takes_param(index.search_batch, "ids"):              # S6-12: _id as one bytes array
+            return index.search_batch(requests, hits="columns", ids="bytes")
         return index.search_batch(requests, hits="columns")
     return index.search_batch(requests)
 
 
 def search_one(index, request: dict, columns: bool) -> dict:
     if columns and takes_hits(index.search):
+        if takes_param(index.search, "ids"):
+            return index.search(request, hits="columns", ids="bytes")
         return index.search(request, hits="columns")
     return index.search(request)
 
