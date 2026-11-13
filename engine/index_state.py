@@ -259,6 +259,13 @@ class IndexState:
             raise ValueError(f"segment {p.segment_id}: text fields {p.fields} differ from the index's")
         if set(p.seg.numerics) != set(ref.seg.numerics) or set(p.seg.keywords) != set(ref.seg.keywords):
             raise ValueError(f"segment {p.segment_id}: its fields differ from the index's")
+        # The index scores every part with one mapping's k1 and b (the first segment's), so a segment built with
+        # other BM25F parameters would be scored with the wrong ones, silently.
+        theirs = parse_mapping(p.manifest["mapping"])
+        if (theirs.k1, theirs.b, theirs.field_b) != (self.mapping.k1, self.mapping.b, self.mapping.field_b):
+            raise ValueError(f"segment {p.segment_id}: BM25F parameters (k1 {theirs.k1}, b "
+                             f"{theirs.field_b or theirs.b}) differ from the index's (k1 {self.mapping.k1}, b "
+                             f"{self.mapping.field_b or self.mapping.b}); rebuild every segment with one mapping")
         for f, e in p.seg.encoders.items():
             mine = self.encoders.get(f)
             if mine is not None:

@@ -403,6 +403,10 @@ Layout (`seg-<version>-<8 hex>/`):
   `Index.snapshot_segments(segment_ids) -> (segments, version)` (references to immutable arrays, copies of live bits
   and hot columns), `Index.segments` (`[{segment_id, version, n_docs, live, device_nbytes}]`),
   `Index.save_commit(dir) -> Path`, `engine.build.merge_segments(segs, mapping) -> SegmentArrays`.
+- **One set of BM25F parameters per index** (2026-11-13): every part is scored with the first segment's `k1` and `b`
+  (one number or the per-field map, §2), so `Index.add_segment`, `replace_segments` and `from_segments` refuse, with a
+  `ValueError` naming both, a segment built with other parameters, as they already refuse other fields or another
+  encoder. To change `_meta.engine.bm25`, rebuild every segment.
 - **The commit checksum** (S8-2, the data plane's definition adopted): sha256 of the canonical JSON (sorted keys,
   separators `,` and `:`) of every field of the commit except `checksum`, with one more key,
   `"delete_sha256": {segment_id: sha256 of that delete file's bytes}`, hashed but not stored. The engine has its own
@@ -452,6 +456,8 @@ The S1 rules for the data plane (settled 2026-11-09):
   rule.
 - `Index.patch` and `Index.delete`: `NoSuchKey` (a `KeyError`) for ids the segment never held; already-deleted ids
   are ignored by both (a patch to a deleted id is not applied). `None` or NaN in a patch makes the value missing.
+  An id repeated in one `patch` call takes its last value, on every device (2026-11-13: cuda does not order a
+  scatter with repeated indices, so the engine keeps one write per row before it scatters).
 - **Concurrency (S8-2c, copy-on-write):** an `Index` is thread-safe and searches never wait on writers. A search (or
   `search_batch`, `candidate_features`) reads the current state reference once and runs on that state to the end,
   without a lock. Writers (`patch`, `delete`, `set_version`, `add_segment`, `replace_segments`, `remove_segment`,
