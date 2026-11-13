@@ -88,6 +88,13 @@ class Backend(Protocol):
     def segment_count(self, keys: Array, n: int) -> Array:
         """``int32[n]`` counts of ``keys``."""
 
+    def accumulator(self, n: int) -> Array:
+        """S6-13: ``zeros(n)`` in the accumulation dtype (float64, or float32 with ``accumulate="float32"``)."""
+
+    def add_unique(self, out: Array, keys: Array, values: Array) -> None:
+        """S6-13: ``out[keys] += values`` in place, for keys that are distinct (a gather, an add and a scatter: no
+        atomics, no sort; with distinct keys the result is exact and deterministic)."""
+
     # ---- dense ----------------------------------------------------------------------------------------------------
     def matmul(self, a: Array, b: Array) -> Array:
         """``a @ b`` as float32, accumulated in float64 (so a row's result does not depend on the batch it is in);

@@ -71,6 +71,12 @@ Decision record: `docs/decisions/2026-11-09-gpu-portable-backend.md`.
 - **torch is optional.** `requirements.txt` stays numpy-only; `requirements-gpu.txt` adds torch for Colab and GPU
   nodes.
 
+- **How the host waits (S6-15, 2026-11-13, architect).** On cuda the host waits for the device with CUDA's default
+  (spinning) wait. `S3_CUDA_BLOCKING_SYNC=1` makes the torch backend wait on a blocking CUDA event before every host
+  read (a copy to the host, a host-side count), so the waiting thread sleeps instead. Results are the same either
+  way. It is off by default: on an A100 at depth 2,000 it saved no host CPU (the process was busy with its own work,
+  not waiting) and added about 0.3 ms to a single request (the profile at 3bfeea4).
+
 ## 1. Datasets (evaluation-steward → everyone)
 
 Served only through `referee/loader.py`; nobody reads ESCI files any other way, and nobody loads test judgments.
@@ -575,7 +581,9 @@ Scoring, exactly:
   `first_offset` (the global tie key; for an index built from a catalogue it is 0..N-1, the doc id, as before). A missing field value sorts as `None`. Under
   `rescore`, the first value is the tier (1 inside the rescored window, 0 below it), so the window comes first.
 - `aggregations` is present only when requested. `took_ms` always has `total`, plus each stage that ran; stage names
-  are the closed set above plus `encode` (additive).
+  are the closed set above plus `encode` (additive). Inside a `search_batch` of two or more requests, a request's own stages are host times
+  (the device is not synchronised between plans, S6-11); its shared stages, and every stage of a single request, are
+  device times as before.
 - `explain` (when requested) is a list in hit order, Lucene-shaped: `{_id, op, value, description, details}` per hit,
   with per term and per field contributions and, under `rescore`, each feature's contribution. Every node has `op`,
   which says how its value comes from its `details` (`description` is for people; tools check by `op`):
@@ -625,6 +633,55 @@ engine.api.expand_hits(response) -> dict                        # columns -> the
   form is returned unchanged.
 - Serving owns the bytes (JSON or otherwise) it builds from the columns; the HTTP response it sends is unchanged
   (section 7). Columns are host arrays (numpy), never device tensors.
+- **Ids as one bytes array (S6-12, additive, opt-in; 2026-11-13, architect).** `search(request, hits="columns",
+  ids="bytes")` and `search_batch(requests, hits="columns", ids="bytes")` return `hits.columns._id` as one numpy
+  array of dtype `S<w>` (h entries): each id UTF-8 encoded, `w` the index's longest encoded id, shorter ids padded
+  with NUL bytes (numpy drops trailing NULs when an entry is read; ids never end in NUL). `ids="str"` (the default)
+  is the `list[str]` above. It applies only with `hits="columns"` (`ValueError` otherwise) and to the responses in
+  the columnar form. Why: a GPU process pickles 64 replies of 2,000 ids per batch, and a list of 2,000 str pickles
+  about seven times slower than one bytes array (23.8 against 3.3 ms per batch of 64 on CPU; unpickling 13.9
+  against 1.7 ms). `engine.api.expand_hits` decodes it (`_id` = `entry.decode("utf-8")`), so the dict form, and
+  serving's bytes, are unchanged. The engine keeps a bytes copy of its ids, updated with each segment added, so a
+  page reads it with one gather.
+
+**The engine in one GPU process (S6-10, engine side; 2026-11-13, architect).** Serving may run one GPU process that
+holds the only `Index` (one index copy on the device) and calls `search_batch` for requests gathered from several CPU
+front processes, which do HTTP and encoding (section 7: the process architecture, the transport and batch formation
+are the platform-engineer's). What the engine promises that process:
+
+- **The call:** `Index.search_batch(requests, hits="columns", errors="return") -> list`, one entry per request, in
+  request order, the same length as `requests`. `hits` is as above ("Columnar hits"). `errors`:
+  - `"raise"` (the default, as today): the first refused request raises its error and the batch returns nothing;
+  - `"return"`: a request refused while it is parsed or planned (`UnsupportedQuery`, `InvalidRequest`, and any other
+    `engine.errors` class raised for that request alone, e.g. an unknown ranker in `rescore`) gets
+    `{"error": {"type": <class name>, "path": <JSON path>, "reason": <sentence>}}` in its slot, and every other request
+    of the batch is answered as if it had come alone. A failure that is not one request's (`OverBudget`,
+    `DeviceUnavailable`, a CUDA error, a bug) still raises for the whole batch; the caller may retry its requests
+    singly (section 7 already does) or fail them all.
+- **Equality:** every entry equals `search(request, hits=...)` alone on the same state, except `took_ms`
+  (`search_batch == [search]`, tested in `engine/tests/test_batched_executor.py` on every device). A batch's
+  composition never changes a result: not its size, not its order, not which requests share it.
+- **One state per batch:** the batch reads the index state once (S8-2c), so all its requests see the same version and
+  the same writes; a write that returns while a batch runs is visible to the next batch, not to this one.
+- **What is batched, and what stays per request** (for serving's batch formation; results are the same either way):
+  - batched across the requests of a call: lexical retrieval, query encoding, dense similarities, exact unfiltered
+    knn top-k, hybrid RRF windows and fusion, rescoring (features and the ranker), `hits.total`, plain score-sorted
+    pages, and terms aggregations without sub-aggregations;
+  - per request inside the call: parsing and planning, filters, field sorts and `search_after`, `collapse`,
+    `highlight`, `explain` (and a rescore with `explain`), filtered or cuVS knn, every other aggregation, and
+    building the response. A request of this kind makes its batch slower, never different: serving may route it
+    to a batch of its own.
+  - a batch of one takes the per-request path throughout.
+- **Size:** `search_batch` takes any number of requests. It stacks at most `Executor.BATCH_ROWS` (64) requests'
+  `[N]` rows at a time, so the device memory a call adds is about 64 x N x 10 bytes on top of the index (about
+  0.8 GB at N = 1.2M), whatever the batch size; larger batches run in chunks of 64. Throughput on an A100 stopped
+  growing past 64 in every profile so far (`results/pipeline-profile-*.json`), so 64 is the recommended largest batch.
+- **Threads:** `search_batch` is thread-safe and never waits on writers, but calls from several threads compete for
+  the one GPU and batch less; the GPU process should make one call at a time and let batches grow instead.
+- **Returned objects:** responses hold host values only (Python scalars, lists, numpy arrays in `hits.columns`), no
+  device tensors and no references into the index, so they can be pickled or copied to another process as they are.
+- **Writes** (`patch`, `delete`, `add_segment`, `replace_segments`, ...) go to the same `Index` in the GPU process;
+  front processes hold no `Index`.
 
 ## 6. The plan (DSL → operators) · owner architect
 
@@ -986,6 +1043,16 @@ status:
   Python dict per hit. Additive and opt-in: the default response is unchanged, and so is serving's HTTP response.
   Also recorded today: one set of BM25F parameters per index (section 4), the last-write rule for a repeated id in one
   `patch` call, and that nested text fields keep the default BM25F parameters (section 2).
+- 2026-11-13, architect (S6-10, the engine in one GPU process; asked by the coordinator after the platform-engineer
+  and the architect proposed the same shape): section 5 says what `search_batch` promises a GPU process serving
+  several front processes. New, additive: `search_batch(..., errors="return")` puts a refused request's error in its
+  slot instead of failing the batch (default `"raise"`, unchanged). The process architecture is section 7's.
+- 2026-11-13, architect (S6-12, from the platform-engineer's S6-10s finding that one GPU process spends its own core on
+  pickling replies): section 5's columnar hits gain `ids="bytes"`, `_id` as one numpy `S<w>` array instead of a list
+  of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.
+- 2026-11-13, architect (S6-15): section 0 says how the host waits for the device on cuda: CUDA's spinning wait by
+  default, a blocking event with `S3_CUDA_BLOCKING_SYNC=1`. It changes no result. The blocking wait was the default
+  in 3bfeea4 and was made opt-in after its profile measured no host CPU saved.
 - 2026-11-13, platform-engineer (S6-7, the server side): section 7 gains **response bytes and columnar hits** (serving
   asks for `hits="columns"` and encodes them to the same bytes as the dict form) and **workers** (`--workers N`, N
   read-only processes behind one port). The HTTP and RPC responses are unchanged but for a new `X-S3-Worker` header.

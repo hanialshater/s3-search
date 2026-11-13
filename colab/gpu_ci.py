@@ -1,7 +1,7 @@
 #!/usr/bin/env -S colab run --gpu L4 --timeout 600
 """GPU CI: the referee's fast suite and the engine's tests on a Colab GPU. Development only, never a score.
 
-    colab run --gpu L4 --timeout 600 colab/gpu_ci.py [branch-or-commit]
+    colab run --gpu L4 --timeout 600 colab/gpu_ci.py [branch-or-commit]   (a branch, or a full or short sha)
 
 CI runs on CPU, so the cuda paths are exercised only here. A test silent for 120 s gets its stack dumped
 (faulthandler), each suite has a hard limit, and a heartbeat line every 60 s keeps the Colab CLI from timing out.
@@ -21,6 +21,7 @@ REF = sys.argv[1] if len(sys.argv) > 1 else "main"
 SUITES = [  # (name, pytest targets, hard limit in seconds)
     ("referee fast", None, 900),
     ("engine tests", ["engine/tests"], 1200),
+    ("serving tests", ["serving/tests"], 600),       # the platform-engineer's suggestion: serving on cuda too
 ]
 
 
@@ -59,8 +60,13 @@ def run_suite(name, targets, limit):
 def main():
     if not os.path.isdir(REPO):
         sh(["git", "clone", "--quiet", REPO_URL, REPO])
-    sh(["git", "-C", REPO, "fetch", "--quiet", "origin", REF])
-    sh(["git", "-C", REPO, "checkout", "--quiet", "FETCH_HEAD"])
+    # A branch or a full sha can be fetched by name; a short sha cannot (git fetch needs a ref or a full id), so
+    # fetch every branch and resolve it locally instead.
+    if subprocess.run(["git", "-C", REPO, "fetch", "--quiet", "origin", REF]).returncode == 0:
+        sh(["git", "-C", REPO, "checkout", "--quiet", "FETCH_HEAD"])
+    else:
+        sh(["git", "-C", REPO, "fetch", "--quiet", "origin", "+refs/heads/*:refs/remotes/origin/*"])
+        sh(["git", "-C", REPO, "checkout", "--quiet", REF])
     os.chdir(REPO)
     missing = [m for m in ("snowballstemmer", "pytest") if __import__("importlib").util.find_spec(m) is None]
     if missing:

@@ -198,27 +198,56 @@ class Index:
         return self._st.parts[0].segment_id if len(self._st.parts) == 1 else ""
 
     # ---- search
-    def search(self, request: dict, hits: str = "dicts") -> dict:
-        return self.search_batch([request], hits=hits)[0]
+    def search(self, request: dict, hits: str = "dicts", ids: str = "str") -> dict:
+        return self.search_batch([request], hits=hits, ids=ids)[0]
 
-    def search_batch(self, requests: list[dict], hits: str = "dicts") -> list[dict]:
+    def search_batch(self, requests: list[dict], hits: str = "dicts", errors: str = "raise",
+                     ids: str = "str") -> list[dict]:
         """``hits``: "dicts" (the default) or "columns" (S6-7, INTERFACES §5 "Columnar hits"; ``expand_hits`` turns a
-        response back into the dict form)."""
+        response back into the dict form). ``errors`` (S6-10, §5 "The engine in one GPU process"): "raise" (the
+        default: a refused request raises) or "return" (a refused request gets ``{"error": {type, path, reason}}``
+        in its slot and the others are answered as if alone; a failure that is not one request's still raises)."""
         if not isinstance(requests, (list, tuple)):
             raise InvalidRequest("$", "search_batch takes a list of requests")
         if hits not in ("dicts", "columns"):
             raise ValueError(f"hits: 'dicts' or 'columns', not {hits!r}")
+        if errors not in ("raise", "return"):
+            raise ValueError(f"errors: 'raise' or 'return', not {errors!r}")
+        if ids not in ("str", "bytes") or (ids == "bytes" and hits != "columns"):
+            raise ValueError(f"ids: 'str', or 'bytes' with hits='columns' (S6-12), not {ids!r} with hits={hits!r}")
         st = self._st                     # one state for the whole batch, read once: no lock (S8-2c)
-        plans, parse_ms = [], []
-        for r in requests:
+        plans, parse_ms, refused = [], [], {}
+        for i, r in enumerate(requests):
             t0 = time.perf_counter()
-            plans.append(make_plan(r, st))
+            try:
+                p = make_plan(r, st)
+                if p.rescore is not None and p.rescore.model not in self.rankers:
+                    raise InvalidRequest("rescore.s3_ranker.model", f"no ranker named {p.rescore.model!r} on this index")
+            except UnsupportedQuery as e:
+                if errors == "raise":
+                    raise
+                refused[i] = _error_entry(e)
+                continue
+            plans.append((i, p))
             parse_ms.append((time.perf_counter() - t0) * 1000.0)
-        out = Executor(st, self.rankers).run(plans, columns=hits == "columns") if plans else []
-        for resp, ms in zip(out, parse_ms):
-            resp["took_ms"] = {"parse": round(ms, 3), **resp["took_ms"]}
-            resp["took_ms"]["total"] = round(resp["took_ms"]["total"] + ms, 3)
-        return out
+        columns = hits == "columns"
+        try:
+            done = Executor(st, self.rankers).run([p for _, p in plans], columns=columns, ids_bytes=ids == "bytes") if plans else []
+        except UnsupportedQuery:          # refused while it ran (one request's): find which, the rest answered alone
+            if errors == "raise":
+                raise
+            done = []
+            for i, p in plans:
+                try:
+                    done.extend(Executor(st, self.rankers).run([p], columns=columns, ids_bytes=ids == "bytes"))
+                except UnsupportedQuery as e:
+                    done.append(_error_entry(e))
+        for (i, _), resp, ms in zip(plans, done, parse_ms):
+            if "error" not in resp:
+                resp["took_ms"] = {"parse": round(ms, 3), **resp["took_ms"]}
+                resp["took_ms"]["total"] = round(resp["took_ms"]["total"] + ms, 3)
+            refused[i] = resp
+        return [refused[i] for i in range(len(requests))]
 
     # ---- the updater's hooks (docs/INTERFACES.md §3, §4)
     @_locked
@@ -307,6 +336,11 @@ def _copy_for_write(seg):
     return c
 
 
+def _error_entry(e) -> dict:
+    """A refused request's slot in ``search_batch(..., errors="return")`` (INTERFACES §5)."""
+    return {"error": {"type": type(e).__name__, "path": getattr(e, "path", "$"), "reason": getattr(e, "reason", str(e))}}
+
+
 def expand_hits(response: dict) -> dict:
     """A ``hits="columns"`` response in the dict form, exactly as ``hits="dicts"`` gives it (INTERFACES §5). A response
     already in the dict form is returned unchanged."""
@@ -321,9 +355,12 @@ def expand_hits(response: dict) -> dict:
         return vals if miss is None else [None if m else x for x, m in zip(vals, miss.tolist())]
 
     sorts = [py(col) for col in c["sort"]]
+    id_list = c["_id"]
+    if isinstance(id_list, np.ndarray):                     # ids="bytes" (S6-12): UTF-8, NUL-padded
+        id_list = [x.decode("utf-8") for x in id_list.tolist()]
     hits = [{"_id": i, "_score": s, "sort": list(row)}
-            for i, s, row in zip(c["_id"], np.asarray(c["_score"], np.float32).astype(np.float64).tolist(),
-                                 zip(*sorts) if sorts else [()] * len(c["_id"]))]
+            for i, s, row in zip(id_list, np.asarray(c["_score"], np.float32).astype(np.float64).tolist(),
+                                 zip(*sorts) if sorts else [()] * len(id_list))]
     out = dict(response)
     out["hits"] = {k: v for k, v in h.items() if k != "columns"}
     out["hits"]["hits"] = hits

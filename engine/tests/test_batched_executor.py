@@ -75,9 +75,12 @@ def test_rescored_plans_in_a_batch(segment, catalogue, device, runtime, monkeypa
     for k, t in enumerate(texts):
         lex = {"match": {"product_title": t}}
         hyb = {"hybrid": {"queries": [lex, {"neural": {"embedding": {"query_text": t, "k": 20}}}]}}
-        reqs.append({"query": hyb if k % 2 else lex, "size": [10, 3, 30][k % 3],
+        reqs.append({"query": hyb if k % 2 else lex, "size": [10, 3, 30][k % 3], "from": [0, 4, 0, 2, 0][k],
                      "rescore": {"window_size": [20, 5, 100, 1, 7][k], "s3_ranker": {"model": "m"}}})
         reqs.append({"query": lex})
+    reqs.append({"query": {"match": {"product_title": "shoes"}}, "size": 40, "from": 3,     # deep into tier 0
+                 "post_filter": {"range": {"price": {"lte": 80}}},
+                 "rescore": {"window_size": 4, "s3_ranker": {"model": "m"}}})
     reqs.append({"query": {"match": {"product_title": "shoes"}}, "explain": True, "size": 3,
                  "rescore": {"window_size": 10, "s3_ranker": {"model": "m"}}})
     got = ix.search_batch(reqs)
@@ -138,3 +141,32 @@ def test_features_equal_the_host_count_route(segment, catalogue, device):
                                    [st.keywords[f].codes for f in mf], st.static_features(), [len(node.terms)], [n])
         assert (n > 0) == (q < 2)
         np.testing.assert_array_equal(b.to_numpy(X[q:q + 1]), b.to_numpy(want))   # NaN == NaN here
+
+
+def test_hybrid_and_knn_plans_in_a_batch(segment, catalogue, device, monkeypatch):
+    """S6-9: knn top-k masks and hybrid RRF windows and fusion, batched, equal the per-plan path and each alone."""
+    monkeypatch.setattr(Executor, "BATCH_ROWS", 3)
+    ix = ranked_index(segment, catalogue, device)
+    reqs = []
+    for k, t in enumerate(["black shoes", "red shirt", "running", "zzzz", "blue jeans", "shoes"]):
+        lex = {"match": {"product_title": t}}
+        knn = {"neural": {"embedding": {"query_text": t, "k": [20, 5, 50][k % 3]}}}
+        rank = {"rrf": {"rank_constant": [60, 10][k % 2], "window_size": [100, 7, 20000][k % 3]}}
+        reqs.append({"query": {"hybrid": {"queries": [lex, knn]}}, "rank": rank, "size": 15})
+        reqs.append({"query": knn, "size": 10})
+        reqs.append({"query": {"hybrid": {"queries": [knn, lex, {"match": {"product_brand": t}}]}}, "size": 5})
+    reqs.append({"query": {"neural": {"embedding": {"query_text": "shoes", "k": 10,
+                                                    "filter": {"range": {"price": {"lte": 50}}}}}}})
+    reqs.append({"query": {"hybrid": {"queries": [{"match": {"product_title": "shoes"}},
+                                                  {"neural": {"embedding": {"query_text": "shoes", "k": 10}}}]}},
+                 "explain": True, "size": 3})
+    reqs.append({"query": {"hybrid": {"queries": [{"match": {"product_title": "shoes"}},
+                                                  {"neural": {"embedding": {"query_text": "shoes", "k": 10}}}]}},
+                 "rescore": {"window_size": 10, "s3_ranker": {"model": "m"}}})
+    got = ix.search_batch(reqs)
+    monkeypatch.setattr(Executor, "BATCHED", False)
+    ref = ix.search_batch(reqs)
+    monkeypatch.setattr(Executor, "BATCHED", True)
+    for r, g, e in zip(reqs, got, ref):
+        assert _same(g, e), r
+        assert _same(g, ix.search(r)), r
