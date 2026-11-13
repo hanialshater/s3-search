@@ -798,7 +798,11 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     and every write or admin call gets 405.
   - **Front caches** are keyed by `(index, segment_id, epoch)`. GPU process 0 republishes these values in
     `versions-0.json` in the state directory within 20 ms of any swap, patch, delete or background refresh. Every
-    batch reply also carries the version it read. So a write forwarded by any front leaves no stale entry reachable.
+    batch reply also carries a version, read just before its `search_batch` call; a write that lands during the call
+    can be in that batch's results under the older version. That is safe for the caches: an entry is never stored
+    under a version newer than the state it came from, so a write leaves no stale entry reachable under the new
+    version. (The architect offers a state version in §5's responses if exactness is ever needed.)
+    `S3_SERVING_STATE_DIR` names the state directory instead of a fresh temporary one (it must be empty).
   - **Transport.** One Unix-domain socket per GPU process, in the supervisor's state directory (`mkdtemp`, mode 0700);
     the socket itself is mode 0600. A frame is an 8-byte big-endian length and a pickle. Columns are host numpy
     arrays plus a list of `_id` strings (the largest part), so they pickle as they are. **Unpickling is code
