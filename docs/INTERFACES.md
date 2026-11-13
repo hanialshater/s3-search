@@ -128,6 +128,8 @@ names.
   one number for every text field, or a map of text field -> b with `b_default` (default 0.75) for the fields it does
   not name: the prototype's tuned BM25F has its own b per field (`referee/requests/bm25f-tuned.bm25.json`). Anything
   else is an `InvalidMapping` naming the path. `referee full --bm25=<file>` sets them for a run and records them.
+  Text fields inside a `nested` field (S9-5) are scored with the defaults (k1 1.2, b 0.75) whatever the parent sets,
+  and the map cannot name them (v1; noted 2026-11-13 by the architect).
 - **Types (v1):** `text` (searchable; BM25F field), `keyword` (term/terms filters, terms aggs, sort; single-valued
   in v1), `float`, `integer`, `long`, `boolean` (term/range filters, sort), `knn_vector` (exact dense; the `method`
   is accepted for OpenSearch and ignored: the engine is exact). Sub-fields are addressed as `product_brand.keyword`.
