@@ -112,7 +112,7 @@ class NumpyBackend:
         return np.argsort(a, axis=-1, kind="stable")
 
     # ---- sparse CSR
-    def csr_expand(self, ptr, rows, owners):
+    def csr_expand(self, ptr, rows, owners, total=None):
         rows = np.asarray(rows, dtype=np.int64)
         starts = ptr[rows]
         n = ptr[rows + 1] - starts
@@ -148,6 +148,9 @@ class NumpyBackend:
 
     def segment_count(self, keys, n):
         return np.bincount(keys, minlength=n).astype(np.int32)
+
+    def segment_count_where(self, keys, mask, n):
+        return np.bincount(keys[mask], minlength=n).astype(np.int32)
 
     # ---- dense
     def matmul(self, a, b, chunk=65_536):

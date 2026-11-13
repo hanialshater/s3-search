@@ -115,8 +115,9 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
     w = b.asarray(w, "float32")
     bb = b.asarray(bb, "float32")
     for g in groups:
-        q_of, entry = b.csr_expand(st.term_ptr, [rows[i] for i in g], [owners[i] for i in g])
-        t_rep = b.csr_expand(st.term_ptr, [rows[i] for i in g], [rows[i] for i in g])[0]
+        total = sum(lens[i] for i in g)                  # known on the host: no device read (S6-17)
+        q_of, entry = b.csr_expand(st.term_ptr, [rows[i] for i in g], [owners[i] for i in g], total=total)
+        t_rep = b.csr_expand(st.term_ptr, [rows[i] for i in g], [rows[i] for i in g], total=total)[0]
         if getattr(st, "post_live", None) is not None:      # a segment of a multi-segment index: dead copies out
             keep = st.post_live[entry]
             q_of, entry, t_rep = q_of[keep], entry[keep], t_rep[keep]
@@ -129,7 +130,7 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
         keys = q_of * N + docs
         scores = scores + b.segment_sum(keys, imp, Q * N)
         hit = ptf > 0
-        nmatch = nmatch + b.segment_count(keys[hit], Q * N)
+        nmatch = nmatch + b.segment_count_where(keys, hit, Q * N)   # no boolean index: no host sync (S6-17)
     return scores.reshape(Q, N), nmatch.reshape(Q, N)
 
 
