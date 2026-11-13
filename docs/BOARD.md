@@ -72,9 +72,9 @@ Status values: open · claimed · in review · done.
 |---|---|---|---|
 | S6-1 | A compiled query encoder, CUDA graphs, fused fusion and features; measured only in Colab | open | |
 | S6-2 | `colab/pipeline_profile.py`: the S6 pipeline's per-stage latency and throughput on a Colab GPU (development only). Built out of process by the coordinator (dd319a7); reviewed by the architect | in review | architect, 2026-11-13 |
-| S6-3 | `colab/fair_bench.py`: a matched open-loop load test, the engine against OpenSearch, with GPU and server CPU sampled (development only). Built out of process by the coordinator (d0ae1a6, a702cc4); reviewed by the architect | in review | architect, 2026-11-13 |
+| S6-3 | `colab/fair_bench.py`: a matched open-loop load test, the engine against OpenSearch, with GPU and server CPU sampled (development only). Built out of process by the coordinator (d0ae1a6, a702cc4); reviewed by the architect; free ports and a fail-fast start after the run of 2026-11-13 died on port 8080 (63731a2) | in review | architect, 2026-11-13 |
 | S6-4 | Query encode reads only the components rows a query uses (the A100 profile at 87baeec: encode 150.8 ms of a 272.6 ms pipeline query, from copying all V x 128 components to float64 per call); bit-equal to before | in review | architect, 2026-11-13 |
-| S6-5 | The rank stage (100.7 ms p50 at batch 1): the profile's ranker ran the engine's own tree walk (`add_ranker` defaults to `runtime="engine"`: one small kernel per tree and depth), not XGBoost; measure `runtime="auto"`/`"fil"`, and walk all trees at once | claimed | architect, 2026-11-13 |
+| S6-5 | The rank stage (100.7 ms p50 at batch 1): the profile's ranker ran the engine's own tree walk (`add_ranker` defaults to `runtime="engine"`: one small kernel per tree and depth), not XGBoost; measure `runtime="auto"`/`"fil"`, and walk all trees at once | in review | architect, 2026-11-13 (e108d2b; A100 profile: rank 100.7 -> 3.62 ms, pipeline batch 1 p50 272.6 -> 23.4 ms) |
 | S6-6 | Batching does not pay: lexical `search_batch` stays at about 200 QPS at batch 16, 64 and 128, and the pipeline at 4 QPS (per-query work inside the batch: encode, rescore, facets, page) | open | |
 
 ## S7 · Feature coverage (architect, platform-engineer, tools-engineer, evaluation-steward)
