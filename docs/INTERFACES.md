@@ -830,6 +830,10 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     daemon is the node's (`colab/fair_bench.py --mps=1` starts one). One GPU process makes about 690 QPS lexical and
     180 QPS full pipeline at batch 64 in process (the architect's profiles), so K = 1 likely tops out near 700 QPS
     lexical. The first measurement, with predictions filed first, chooses K.
+  - **Which process answered (diagnosis, S6-15s).** A search answered through a front carries `X-S3-Gpu-Process`
+    (the GPU process), `X-S3-Index-Version` (`<segment_id>:<epoch>` of the index that batch read) and
+    `X-S3-Batch-Size` (the size of the `search_batch` call that answered it). A request header `X-S3-Route-Gpu: j`
+    sends a search to GPU process j instead of the least loaded one; it is for replays only.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:
@@ -1135,3 +1139,5 @@ status:
   thread, a shared load table for picking a GPU process, and `S3_SERVING_GPU_MEMORY_FRACTION` (section 7).
 - 2026-11-13, platform-engineer (S6-15s): the encoder gains a fast path (orjson numbers, one bytes template) that
   writes the same bytes (section 7); `orjson` is added to `requirements.txt`.
+- 2026-11-13, platform-engineer (S6-15s, the plat-m8 mismatch): responses through a front carry `X-S3-Gpu-Process`,
+  `X-S3-Index-Version` and `X-S3-Batch-Size`, and `X-S3-Route-Gpu` routes a replay (section 7). Additive.
