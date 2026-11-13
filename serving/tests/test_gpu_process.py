@@ -84,7 +84,9 @@ def test_fronts_and_one_gpu_process_answer_as_one_process(built, single, tmp_pat
     data = tmp_path / "data"                                # this test writes: its own copy of the index and store
     shutil.copytree(built, data)
     port = _free_port()
-    p = _start(data, port, ["--fronts", "2", "--gpu-processes", "1"])
+    import tempfile                                          # a short path: a Unix socket path is limited to ~104 bytes
+    state = tempfile.mkdtemp(prefix="s3t-")                  # the supervisor's state directory, named so we can look in it
+    p = _start(data, port, ["--fronts", "2", "--gpu-processes", "1"], {"S3_SERVING_STATE_DIR": str(state)})
     try:
         rz = json.loads(_http("GET", f"http://127.0.0.1:{port}/readyz")[1])
         assert rz["ready"] and rz["fronts"] == 2 and rz["gpu_processes"] == 1 and rz["gpu_ready"] == 1
@@ -111,21 +113,14 @@ def test_fronts_and_one_gpu_process_answer_as_one_process(built, single, tmp_pat
         assert st == 200, body
         low = json.loads(_http("POST", url, {"query": {"match_all": {}}, "sort": [{"price": "asc"}], "size": 1})[1])
         assert low["hits"]["hits"][0]["_id"] == doc
-        assert "versions-0.json" in os.listdir(_state_dir(p))
-        sock = os.path.join(_state_dir(p), "gpu-0.sock")
+        assert "versions-0.json" in os.listdir(state)
+        sock = os.path.join(state, "gpu-0.sock")
         assert stat.S_IMODE(os.stat(sock).st_mode) == 0o600
-        assert stat.S_IMODE(os.stat(_state_dir(p)).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(state).st_mode) == 0o700
     finally:
         assert _stop(p) == 0
 
 
-def _state_dir(proc):
-    import psutil
-    for c in psutil.Process(proc.pid).children():
-        env = c.environ()
-        if env.get("S3_SERVING_WORKER_STATE"):
-            return env["S3_SERVING_WORKER_STATE"]
-    raise AssertionError("no state dir")
 
 
 def test_two_gpu_processes_are_read_only(built, single):

@@ -66,15 +66,25 @@ def lexical_request(q):
     return {"query": lexical(q), "aggs": FACETS, "size": 10}
 
 
-def measure(index, make, texts, label):
+def deep_request(q):
+    """The matched load test's request (colab/fair_bench.py): tuned BM25F, the top 2,000, no aggregations."""
+    return {"query": lexical(q), "size": 2000}
+
+
+# --deep=1: also measure deep_request in-process, asking for the hits as serving does (hits="columns", ids="bytes"):
+# the engine's own ceiling for the founder's workload (1,000 QPS at depth 2,000), without HTTP or pickling.
+DEEP = any(a == "--deep=1" for a in sys.argv[1:])
+
+
+def measure(index, make, texts, label, kw=None):
     """Batch-1 latency with stage times, then throughput per batch size (each batch's wall time is its latency)."""
     import numpy as np
     for t in texts[:20]:                                   # warm-up: kernels, caches, the encoder
-        index.search(make(t))
+        index.search(make(t), **(kw or {}))
     lat, stages = [], {}
     for t in texts:
         t0 = time.perf_counter()
-        r = index.search(make(t))
+        r = index.search(make(t), **(kw or {}))
         lat.append((time.perf_counter() - t0) * 1e3)
         for s, v in (r.get("took_ms") or {}).items():
             stages.setdefault(s, []).append(float(v))
@@ -85,31 +95,36 @@ def measure(index, make, texts, label):
         f"stages p50 {json.dumps({k: round(v, 2) for k, v in out['stage_ms_p50'].items()})}")
     for bs in BATCHES[1:]:
         reqs = [make(t) for t in texts]
-        index.search_batch(reqs[:bs])                      # warm-up at this shape
+        index.search_batch(reqs[:bs], **(kw or {}))        # warm-up at this shape
         walls = []
+        c0 = time.process_time()                           # this process's CPU time: the host core it uses
         t0 = time.perf_counter()
         for i in range(0, len(reqs), bs):
             s = time.perf_counter()
-            index.search_batch(reqs[i:i + bs])
+            index.search_batch(reqs[i:i + bs], **(kw or {}))
             walls.append((time.perf_counter() - s) * 1e3)
         total = time.perf_counter() - t0
+        cpu = time.process_time() - c0
         qps = len(reqs) / total
-        out["throughput"][str(bs)] = {"qps": qps, "batch_p50_ms": pct(walls, 50), "batch_p99_ms": pct(walls, 99)}
-        say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms")
+        out["throughput"][str(bs)] = {"qps": qps, "batch_p50_ms": pct(walls, 50), "batch_p99_ms": pct(walls, 99),
+                                      "cpu_ms_per_request": cpu * 1e3 / len(reqs), "cpu_cores": cpu / total}
+        say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms, "
+            f"host CPU {cpu * 1e3 / len(reqs):.3f} ms per request ({cpu / total:.2f} cores)")
     return out
 
 
-def torch_profile(index, make, texts, label, bs=64):
+def torch_profile(index, make, texts, label, bs=64, kw=None):
     """One batch of ``bs`` under torch.profiler: the top CUDA kernels by device time, and launches and syncs per
     request."""
     import torch
     from torch.profiler import ProfilerActivity, profile
     reqs = [make(t) for t in texts[:bs]]
-    index.search_batch(reqs)                               # warm
+    kw = kw or {}
+    index.search_batch(reqs, **kw)                         # warm
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         t0 = time.perf_counter()
-        index.search_batch(reqs)
+        index.search_batch(reqs, **kw)
         torch.cuda.synchronize()
         wall = (time.perf_counter() - t0) * 1e3
     ev = prof.key_averages()
@@ -191,11 +206,23 @@ def main():
         index.add_ranker("gbdt", model, runtime=rt)
         say(f"pipeline with the ranker on runtime {rt!r} ({type(index.rankers['gbdt']).__name__})")
         result.setdefault("pipeline_by_runtime", {})[rt] = measure(index, pipeline_request, texts, f"pipeline/{rt}")
+    if DEEP:
+        result["deep"] = measure(index, deep_request, texts, "deep", {"hits": "columns", "ids": "bytes"})
+        b = index._st.b
+        if hasattr(b, "blocking_sync"):                    # S6-15: the same with the other kind of host wait
+            was = b.blocking_sync
+            b.blocking_sync = not was
+            result["deep_blocking" if not was else "deep_spinning"] = measure(
+                index, deep_request, texts, "deep/blocking" if not was else "deep/spinning",
+                {"hits": "columns", "ids": "bytes"})
+            b.blocking_sync = was
     if TORCH_PROFILE:
         result["torch_profile"] = {}
-        for label, make in (("lexical", lexical_request), ("pipeline", pipeline_request)):
+        kinds = [("lexical", lexical_request), ("pipeline", pipeline_request)] + ([("deep", deep_request)] if DEEP else [])
+        for label, make in kinds:
             try:
-                result["torch_profile"][label] = torch_profile(index, make, texts, label)
+                result["torch_profile"][label] = torch_profile(
+                    index, make, texts, label, kw={"hits": "columns", "ids": "bytes"} if label == "deep" else None)
             except Exception as e:                   # the profile is extra: never lose the run's numbers to it
                 result["torch_profile"][label] = {"error": repr(e)[:500]}
                 say(f"{label} torch profile failed: {e!r}")

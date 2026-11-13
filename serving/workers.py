@@ -114,6 +114,19 @@ def inherited(fd: int | None) -> socket.socket | None:
     return s
 
 
+def _state_dir() -> str:
+    """The supervisor's state directory, mode 0700: a fresh temporary one, or ``S3_SERVING_STATE_DIR`` (created; it
+    must be empty or new, and is the service user's own)."""
+    want = os.environ.get("S3_SERVING_STATE_DIR")
+    if not want:
+        return tempfile.mkdtemp(prefix="s3-workers-")
+    os.makedirs(want, mode=0o700, exist_ok=True)
+    os.chmod(want, 0o700)
+    if os.listdir(want):
+        raise RuntimeError(f"S3_SERVING_STATE_DIR {want} is not empty")
+    return want
+
+
 class Supervisor:
     """Starts ``n`` workers on shared sockets, restarts one that dies, passes SIGTERM/SIGINT on."""
 
@@ -129,7 +142,7 @@ class Supervisor:
         self.procs: list[subprocess.Popen | None] = [None] * n
         self.started = [0.0] * n
         self.stopping = threading.Event()
-        self.state_dir = tempfile.mkdtemp(prefix="s3-workers-")   # ready-<i> per loaded worker (``/readyz``); 0700
+        self.state_dir = _state_dir()                            # ready-<i> per loaded worker (``/readyz``); 0700
         self.gpu_sockets = [os.path.join(self.state_dir, f"gpu-{j}.sock") for j in range(self.k)]
         if self.k:
             from .gpu import LoadTable

@@ -130,6 +130,12 @@ class NumpyBackend:
             return out
         return np.bincount(keys, weights=values, minlength=n).astype(np.float32)
 
+    def accumulator(self, n):
+        return np.zeros(n, np.float32 if self.accumulate == "float32" else np.float64)
+
+    def add_unique(self, out, keys, values):
+        out[keys] += np.asarray(values, out.dtype)
+
     def segment_max(self, keys, values, n, init=float("-inf")):
         out = np.full(n, init, np.float64)
         np.maximum.at(out, keys, np.asarray(values, np.float64))
