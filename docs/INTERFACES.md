@@ -1120,9 +1120,6 @@ status:
 - 2026-11-13, architect (S6-15): section 0 says how the host waits for the device on cuda: CUDA's spinning wait by
   default, a blocking event with `S3_CUDA_BLOCKING_SYNC=1`. It changes no result. The blocking wait was the default
   in 3bfeea4 and was made opt-in after its profile measured no host CPU saved.
-- 2026-11-13, platform-engineer (S6-7, the server side): section 7 gains **response bytes and columnar hits** (serving
-  asks for `hits="columns"` and encodes them to the same bytes as the dict form) and **workers** (`--workers N`, N
-  read-only processes behind one port). The HTTP and RPC responses are unchanged but for a new `X-S3-Worker` header.
 - 2026-11-13, platform-engineer (S6-10s): section 7 gains **one GPU process**, proposed and then built with the
   architect's seven changes:
   - only explain and highlight run in batches of their own;
@@ -1132,9 +1129,6 @@ status:
   - the transport's trust boundary is stated;
   - K > 1 runs under MPS from the start;
   - columns are pickled as they are.
-- 2026-11-13, architect (S6-12, from the platform-engineer's S6-10s finding that one GPU process spends its own core on
-  pickling replies): section 5's columnar hits gain `ids="bytes"`, `_id` as one numpy `S<w>` array instead of a list
-  of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.
 - 2026-11-13, platform-engineer (S6-12s): serving asks for `ids="bytes"` when the engine takes it, and encodes it to the
   same bytes (section 7, "One GPU process").
 - 2026-11-13, platform-engineer (S6-12s, the GPU process's transport): replies batched per front and sent by a writer
