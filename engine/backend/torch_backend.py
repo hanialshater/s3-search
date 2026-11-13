@@ -17,12 +17,13 @@ class TorchBackend:
             raise ValueError("accumulate: float64 | float32")
         self.name, self.accumulate = name, accumulate
         self.device = torch.device("cuda" if name == "cuda" else "cpu")
-        # S6-15: wait for the device without spinning. A host read (a copy to the host, a scalar) waits for the
-        # stream; CUDA's default wait spins a host core at 100% for as long as the device runs. With blocking_sync
-        # the wait is on a blocking event, so the thread sleeps and the core is free for other processes (serving's
-        # fronts). Results are unchanged; only how the host waits. S3_CUDA_BLOCKING_SYNC=0 turns it off.
+        # S6-15: optionally wait for the device without spinning. A host read (a copy to the host, a scalar) waits
+        # for the stream; CUDA's default wait spins a host core while the device runs. With blocking_sync the wait is
+        # on a blocking event and the thread sleeps. Off by default: the A100 profile at 3bfeea4 measured no host CPU
+        # saved at depth 2,000 (1.224 against 1.248 ms per request, the process CPU-bound by its own work) and
+        # 0.34 ms more batch-1 latency. S3_CUDA_BLOCKING_SYNC=1 turns it on. Results are the same either way.
         import os
-        self.blocking_sync = self.device.type == "cuda" and os.environ.get("S3_CUDA_BLOCKING_SYNC", "1") != "0"
+        self.blocking_sync = self.device.type == "cuda" and os.environ.get("S3_CUDA_BLOCKING_SYNC", "0") == "1"
 
     # ---- creation and transfer
     def asarray(self, x, dtype=None):

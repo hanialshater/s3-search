@@ -209,11 +209,13 @@ def main():
     if DEEP:
         result["deep"] = measure(index, deep_request, texts, "deep", {"hits": "columns", "ids": "bytes"})
         b = index._st.b
-        if hasattr(b, "blocking_sync"):                    # S6-15: the same, with the host spinning on its waits
-            b.blocking_sync = False
-            result["deep_spinning"] = measure(index, deep_request, texts, "deep/spinning",
-                                              {"hits": "columns", "ids": "bytes"})
-            b.blocking_sync = True
+        if hasattr(b, "blocking_sync"):                    # S6-15: the same with the other kind of host wait
+            was = b.blocking_sync
+            b.blocking_sync = not was
+            result["deep_blocking" if not was else "deep_spinning"] = measure(
+                index, deep_request, texts, "deep/blocking" if not was else "deep/spinning",
+                {"hits": "columns", "ids": "bytes"})
+            b.blocking_sync = was
     if TORCH_PROFILE:
         result["torch_profile"] = {}
         kinds = [("lexical", lexical_request), ("pipeline", pipeline_request)] + ([("deep", deep_request)] if DEEP else [])
