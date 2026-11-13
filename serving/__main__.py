@@ -2,6 +2,7 @@
 
     python -m serving [--data-dir D] [--device cpu|torch-cpu|cuda] [--port 8080] [--preload name[:segment_id]]
                       [--workers N]       (N > 1: N read-only worker processes behind the one port, serving/workers.py)
+                      [--fronts F [--gpu-processes K]]   (S6-10s: F front processes and K GPU processes, serving/gpu.py)
     python -m serving build --name N --mapping mapping.json --source products.parquet [--data-dir D]
                             [--termination-log /dev/termination-log]
 
@@ -38,6 +39,18 @@ def _serve(args: argparse.Namespace) -> int:
         cfg.preload = parse_preload(args.preload)
     if args.workers:
         cfg.workers = max(1, args.workers)
+    if args.fronts is not None:
+        cfg.fronts = max(0, args.fronts)
+    if args.gpu_processes is not None:
+        cfg.gpu_processes = max(1, args.gpu_processes)
+    if args.gpu_process is not None:                            # a GPU process of the S6-10s layout
+        from .gpu import gpu_main
+        cfg.read_only = cfg.gpu_processes > 1
+        return gpu_main(cfg, args.gpu_socket, args.gpu_process)
+    if cfg.fronts > 0 and args.listen_fd is None:               # the S6-10s supervisor
+        from .workers import supervise
+        return supervise(cfg.fronts, cfg.host, cfg.port, cfg.rpc_port, [a for a in argv_of(args) if a],
+                         gpu_processes=cfg.gpu_processes)
     if cfg.workers > 1 and args.listen_fd is None:              # the supervisor: no index, no engine import
         from .workers import supervise
         if not cfg.preload:
@@ -50,8 +63,12 @@ def _serve(args: argparse.Namespace) -> int:
         sock, rpc_sock = inherited(args.listen_fd), inherited(args.rpc_listen_fd)
         cfg.worker_index = args.worker_index
         cfg.read_only = cfg.workers > 1
-    app = create_app(cfg)
-    if sock is not None and args.worker_index:                  # workers after the first accept once loaded
+    if args.gpu_sockets:                                        # a front: no index, searches go to the GPU processes
+        from .front import FrontApp
+        app = FrontApp(cfg, args.gpu_sockets.split(","))
+    else:
+        app = create_app(cfg)
+    if sock is not None and args.worker_index and not args.gpu_sockets:                  # workers after the first accept once loaded
         app.preload()
         logging.info("worker %s preloaded %s", args.worker_index, [n for n, _ in cfg.preload])
         from .workers import mark_ready
@@ -120,6 +137,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rpc-port", type=int, dest="rpc_port")
     ap.add_argument("--preload", help="name[:segment_id][,...]")
     ap.add_argument("--workers", type=int, help="worker processes behind the one port (default 1; more is read-only)")
+    ap.add_argument("--fronts", type=int, help="S6-10s: front processes feeding --gpu-processes GPU processes")
+    ap.add_argument("--gpu-processes", type=int, dest="gpu_processes", help="S6-10s: GPU processes (default 1)")
+    ap.add_argument("--gpu-process", type=int, dest="gpu_process", help=argparse.SUPPRESS)
+    ap.add_argument("--gpu-socket", dest="gpu_socket", help=argparse.SUPPRESS)
+    ap.add_argument("--gpu-sockets", dest="gpu_sockets", help=argparse.SUPPRESS)
     ap.add_argument("--listen-fd", type=int, dest="listen_fd", help=argparse.SUPPRESS)
     ap.add_argument("--rpc-listen-fd", type=int, dest="rpc_listen_fd", help=argparse.SUPPRESS)
     ap.add_argument("--worker-index", type=int, dest="worker_index", default=0, help=argparse.SUPPRESS)

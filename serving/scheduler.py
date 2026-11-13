@@ -29,13 +29,17 @@ from .metrics import Metrics
 
 def takes_hits(fn) -> bool:
     """Whether ``search``/``search_batch`` accepts ``hits=`` (the engine's columnar hits, S6-7)."""
-    return _takes_hits(getattr(fn, "__func__", fn))
+    return takes_param(fn, "hits")
 
 
-@functools.lru_cache(maxsize=64)
-def _takes_hits(fn) -> bool:
+def takes_param(fn, name: str) -> bool:
+    return _takes(getattr(fn, "__func__", fn), name)
+
+
+@functools.lru_cache(maxsize=128)
+def _takes(fn, name: str) -> bool:
     try:
-        return "hits" in inspect.signature(fn).parameters
+        return name in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
 
