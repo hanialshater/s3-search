@@ -4,6 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97]
+        [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
 
 --columns defaults to 1 since S6-7 (s3-search 67c1cd0): serving asks the engine for columnar hits. Runs before that
 commit were the dict form (--columns=0 now). --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
@@ -179,6 +180,34 @@ def result_digest(raw: bytes) -> tuple[int, str]:
 
 
 SAMPLES = "/content/fair-samples"
+PROFILE_RATES = [float(x) for x in opt("profile", "").split(",") if x]   # rates at which py-spy records the server
+
+
+def start_profiles(root_pid, rate):
+    """py-spy (sampling, no code change, about 1% overhead at 100 Hz) on one GPU process and one front for 20 s in the
+    middle of the run, as speedscope JSON: where each process's own core goes (S6-17s)."""
+    import psutil
+    out = []
+    for p in psutil.Process(root_pid).children(recursive=True):
+        role = _role(p)
+        if role in ("gpu process 0", "front 0", "worker 0", "server") and not any(r == role for r, _, _ in out):
+            path = f"/content/pyspy-{int(rate)}-{role.replace(' ', '')}.json"
+            cmd = ["py-spy", "record", "--rate", "100", "--duration", "20", "--nonblocking", "--format", "speedscope",
+                   "-o", path, "--pid", str(p.pid)]
+            delayed = ["bash", "-c", f"sleep {max(1, DURATION / 2 - 10):.0f}; exec " + " ".join(cmd)]
+            out.append((role, path, subprocess.Popen(delayed, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)))
+    return out
+
+
+def finish_profiles(prof):
+    done = []
+    for role, path, pr in prof:
+        try:
+            pr.wait(60)
+        except Exception:
+            pr.kill()
+        done.append({"role": role, "path": path, "ok": os.path.exists(path)})
+    return done
 
 
 def _post(url, body, route=None):
@@ -493,7 +522,7 @@ def main():
     os.chdir(REPO)
     sys.path.insert(0, REPO)
     os.environ.setdefault("S3_SEARCH_DATA", os.path.join(REPO, "data", "esci"))
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "aiohttp", "snowballstemmer", "orjson"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "aiohttp", "snowballstemmer", "orjson", "py-spy"], check=True)
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     from referee import loader, runtime
     env = runtime.environment()
@@ -526,8 +555,10 @@ def main():
             runs = []
             for rate in RATES:
                 say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s")
+                prof = start_profiles(proc.pid, rate) if rate in PROFILE_RATES else []
                 with Sampler(proc.pid) as smp:
                     r = load(url, bodies, rate, DURATION, client_cpus)
+                r["profiles"] = finish_profiles(prof)
                 r["resources"] = smp.summary(len(server_cpus))
                 say(f"{name}: {rate:.0f} QPS resources: GPU {r['resources']['gpu_util_pct']}, server CPU cores "
                     f"{r['resources']['server_cpu_cores']} of {len(server_cpus)}; limit: {r['resources'].get('limit')}")
