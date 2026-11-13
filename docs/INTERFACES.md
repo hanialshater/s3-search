@@ -575,7 +575,9 @@ Scoring, exactly:
   `first_offset` (the global tie key; for an index built from a catalogue it is 0..N-1, the doc id, as before). A missing field value sorts as `None`. Under
   `rescore`, the first value is the tier (1 inside the rescored window, 0 below it), so the window comes first.
 - `aggregations` is present only when requested. `took_ms` always has `total`, plus each stage that ran; stage names
-  are the closed set above plus `encode` (additive).
+  are the closed set above plus `encode` (additive). Inside a `search_batch` of two or more requests, a request's own stages are host times
+  (the device is not synchronised between plans, S6-11); its shared stages, and every stage of a single request, are
+  device times as before.
 - `explain` (when requested) is a list in hit order, Lucene-shaped: `{_id, op, value, description, details}` per hit,
   with per term and per field contributions and, under `rescore`, each feature's contribution. Every node has `op`,
   which says how its value comes from its `details` (`description` is for people; tools check by `op`):
