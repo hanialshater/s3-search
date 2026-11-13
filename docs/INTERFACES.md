@@ -71,6 +71,12 @@ Decision record: `docs/decisions/2026-11-09-gpu-portable-backend.md`.
 - **torch is optional.** `requirements.txt` stays numpy-only; `requirements-gpu.txt` adds torch for Colab and GPU
   nodes.
 
+- **How the host waits (S6-15, 2026-11-13, architect).** On cuda the host waits for the device with CUDA's default
+  (spinning) wait. `S3_CUDA_BLOCKING_SYNC=1` makes the torch backend wait on a blocking CUDA event before every host
+  read (a copy to the host, a host-side count), so the waiting thread sleeps instead. Results are the same either
+  way. It is off by default: on an A100 at depth 2,000 it saved no host CPU (the process was busy with its own work,
+  not waiting) and added about 0.3 ms to a single request (the profile at 3bfeea4).
+
 ## 1. Datasets (evaluation-steward → everyone)
 
 Served only through `referee/loader.py`; nobody reads ESCI files any other way, and nobody loads test judgments.
@@ -1028,3 +1034,6 @@ status:
 - 2026-11-13, architect (S6-12, from the platform-engineer's S6-10s finding that one GPU process spends its own core on
   pickling replies): section 5's columnar hits gain `ids="bytes"`, `_id` as one numpy `S<w>` array instead of a list
   of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.
+- 2026-11-13, architect (S6-15): section 0 says how the host waits for the device on cuda: CUDA's spinning wait by
+  default, a blocking event with `S3_CUDA_BLOCKING_SYNC=1`. It changes no result. The blocking wait was the default
+  in 3bfeea4 and was made opt-in after its profile measured no host CPU saved.

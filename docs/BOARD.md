@@ -85,6 +85,7 @@ Status values: open · claimed · in review · done.
 | S6-12 | `ids="bytes"`: columnar `_id` as one numpy bytes array (INTERFACES §5), and a bytes copy of the ids kept by the index; a batch of one keeps the per-plan page (S6-11's 2.37 ms batch-1 page) | in review | architect, 2026-11-13 (contract b9f9967, code 3f597b9) |
 | S6-13 | Lexical device time: BM25F by rounds of distinct keys was tried and reverted (the A100 profile at 56b0b72: lexical batch-1 p50 6.96 -> 12.09 ms, 687 QPS at batch 64, one csr_expand and its syncs per round outweighed the sort); RRF's lists add by distinct keys (kept) | in review | architect, 2026-11-13 |
 | S6-14 | Top-k without a tie pass: one torch top-k over a unique int64 key (score bits, then index) instead of the kth value, a cumsum over every row, a nonzero and a sort; the profile measures the founder's workload in-process (depth 2,000, columns, ids as bytes) and the S6-13 revert | in review | architect, 2026-11-13 (3bcbeb9; A100 profile: depth 2,000 in-process 833 QPS at batch 64, pipeline batch-1 p50 18.93 ms) |
+| S6-15 | The GPU process's host core at depth 2,000: a blocking wait instead of a spinning one was tried and made opt-in (the A100 profile at 3bfeea4: 1.224 against 1.248 ms of host CPU per request, 0.97 against 1.00 cores; the process is busy with its own work, about 1.2 ms of host CPU per request, not waiting) | in review | architect, 2026-11-13 |
 
 ## S7 · Feature coverage (architect, platform-engineer, tools-engineer, evaluation-steward)
 
