@@ -39,6 +39,13 @@ class FrontApp:
         self.cfg = cfg
         self.metrics = metrics_mod.standard()
         self.gpus = [GpuClient(p) for p in sockets]
+        self.load = None
+        if cfg.worker_state and len(sockets) > 1:
+            from .gpu import LoadTable
+            try:
+                self.load = LoadTable(cfg.worker_state, create=False)
+            except OSError:
+                self.load = None
         self.cache = LRUCache(cfg.cache_size)
         self.draining = False
         self._versions: dict = {}
@@ -149,7 +156,11 @@ class FrontApp:
             raise BadJSON(f"body is not JSON: {exc}") from None
 
     def _pick(self) -> GpuClient:
-        return min(self.gpus, key=lambda g: g.inflight)
+        """The least loaded GPU process by the shared load table (what every front sees), this front's own in-flight
+        count breaking ties; without the table, the own count alone."""
+        if self.load is None:
+            return min(self.gpus, key=lambda g: g.inflight)
+        return min(enumerate(self.gpus), key=lambda jg: (self.load.get(jg[0]), jg[1].inflight))[1]
 
     def _submit(self, name: str, request: dict):
         with self._vlock:

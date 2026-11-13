@@ -784,7 +784,10 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     with the fewest requests in flight.
   - **GPU processes** (`serving/gpu.py`) each hold one copy of each preloaded index and a full `App`. A batch loop
     makes one `search_batch(requests, hits="columns", errors="return")` call at a time, with at most 64 requests:
-    whatever has queued when the last call returned, with no batch window. **Only `explain` and `highlight` requests
+    whatever has queued when the last call returned, with no batch window. When the engine takes `ids` (S6-12) the GPU process and
+    the single-process scheduler ask for `ids="bytes"`: `_id` is one numpy `S<w>` array. It pickles about 7x faster,
+    and the encoder writes its bytes as they are when they are plain ASCII (else it decodes and escapes them); the
+    HTTP bytes are unchanged. **Only `explain` and `highlight` requests
     run in batches of their own.** Filters, field sorts, aggregations and collapse share a batch: §5 makes them cost
     more, never answer differently. Route more only if a measurement shows it is needed.
   - **Errors.** An `{"error": {"type": <engine class name>, ...}}` entry maps to §7's snake_case type and status
@@ -804,10 +807,25 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     version. (The architect offers a state version in §5's responses if exactness is ever needed.)
     `S3_SERVING_STATE_DIR` names the state directory instead of a fresh temporary one (it must be empty).
   - **Transport.** One Unix-domain socket per GPU process, in the supervisor's state directory (`mkdtemp`, mode 0700);
-    the socket itself is mode 0600. A frame is an 8-byte big-endian length and a pickle. Columns are host numpy
+    the socket itself is mode 0600. A frame is an 8-byte big-endian length and a pickle. The replies of one batch to one front
+    travel as one `("multi", [...])` frame, written by that connection's writer thread, so the batch loop never waits
+    on a front. Columns are host numpy
     arrays plus a list of `_id` strings (the largest part), so they pickle as they are. **Unpickling is code
     execution:** the socket is for the service user's own processes only, inside one trust boundary, and is never
     exposed on TCP.
+  - **The encoder's fast path (S6-15s).** orjson writes the numbers, but only where it writes exactly what
+    `float.__repr__` writes: finite values that are 0 or have 1e-4 <= |x| < 1e16. The ids are quoted in one
+    vectorised step, and one bytes template per page shape joins everything. Any other column (missing values,
+    keywords, booleans, out-of-range floats, ids that need escaping) takes the pure-Python path, which writes the
+    same bytes (checked in `serving/tests/test_encode.py`). One front's CPU per 2,000-hit search fell from 4.8 to
+    2.8 ms on a laptop core. `S3_SERVING_FAST_ENCODE=0` turns the fast path off.
+  - **Picking a GPU process:** each GPU process writes its load (queued plus in its batch) to its own slot of
+    `load.bin` in the state directory. Every front reads the same table and picks the least loaded process, with its
+    own in-flight count breaking ties.
+  - **Device memory:** what grows with load is torch's cache (S6-10s diagnosis: 15.1 GB reserved against 1.4 GB live
+    at 400 QPS, with peaks of 6.7 GB at batch 64), so K is sized from reserved memory.
+    `S3_SERVING_GPU_MEMORY_FRACTION=f` caps each GPU process's cache with
+    `torch.cuda.set_per_process_memory_fraction(f)`, so K processes fit predictably.
   - **K > 1 runs under CUDA MPS**, with one index copy per process (about 5.8 GB each for ESCI-US on an A100). The MPS
     daemon is the node's (`colab/fair_bench.py --mps=1` starts one). One GPU process makes about 690 QPS lexical and
     180 QPS full pipeline at batch 64 in process (the architect's profiles), so K = 1 likely tops out near 700 QPS
@@ -1111,3 +1129,9 @@ status:
   - the transport's trust boundary is stated;
   - K > 1 runs under MPS from the start;
   - columns are pickled as they are.
+- 2026-11-13, platform-engineer (S6-12s): serving asks for `ids="bytes"` when the engine takes it, and encodes it to the
+  same bytes (section 7, "One GPU process").
+- 2026-11-13, platform-engineer (S6-12s, the GPU process's transport): replies batched per front and sent by a writer
+  thread, a shared load table for picking a GPU process, and `S3_SERVING_GPU_MEMORY_FRACTION` (section 7).
+- 2026-11-13, platform-engineer (S6-15s): the encoder gains a fast path (orjson numbers, one bytes template) that
+  writes the same bytes (section 7); `orjson` is added to `requirements.txt`.
