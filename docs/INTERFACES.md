@@ -701,6 +701,22 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
   "headers"}`, response `{"id", "status", "body", "headers"}`, with the same method and path as the HTTP route and the
   same `App.handle`, so responses equal HTTP's (checked on the 200 conformance requests). Client: `serving.rpc.RpcClient`.
   The `SearchIndex` Service also exposes port 9090 as `rpc`.
+- **Response bytes and columnar hits (S6-7).** Serving asks the engine for `hits="columns"` (§5) whenever the loaded
+  index's `search`/`search_batch` takes `hits` (`S3_SERVING_COLUMNS=1`, the default; `0` asks for the dict form) and
+  encodes the columns itself (`serving/encode.py`). The HTTP and RPC bodies are unchanged: byte for byte what
+  `json.dumps(engine.api.expand_hits(resp), separators=(",", ":"))` gives (checked against the engine on every
+  device in `serving/tests/test_encode.py`). A response the engine answers in the dict form (collapse, highlight,
+  explain) is encoded as before; `_source` expands that one response to dicts first. The cache holds what the engine
+  returned.
+- **Workers (S6-7).** `python -m serving --workers N` (`S3_SERVING_WORKERS`, default 1): a supervisor binds the HTTP
+  (and RPC) port once and starts N `python -m serving` workers that share the listening socket (`serving/workers.py`).
+  Each worker loads its own copy of the preloaded indexes (N copies in GPU memory on cuda) and has its own cache,
+  scheduler and `/metrics`; every response carries `X-S3-Worker: <i>`. **N > 1 is read-only:** `GET` routes,
+  `_search`, `_msearch`, `_mapping` and `versions` are served, every other route is 405 `method_not_allowed` (each
+  worker's index is its own, so a write would reach one of them). Worker 0 accepts at once (`/healthz` while loading,
+  `/readyz` 503 until loaded); the others accept only after their preload. SIGTERM to the supervisor drains every
+  worker; a worker that dies is started again. For the replica Deployment, which preloads a segment the indexer Job
+  built and takes no writes.
 - **Bulk** (`serving/bulk.py`). The body is streamed (Content-Length or chunked), grouped into chunks of `bulk_chunk`
   actions (default 2000), and each chunk is planned, applied to the store as one atomic batch through
   `dataplane.intake.apply_changes` (bad records are rejected one by one) and replayed onto the live index before the next
@@ -970,3 +986,6 @@ status:
   Python dict per hit. Additive and opt-in: the default response is unchanged, and so is serving's HTTP response.
   Also recorded today: one set of BM25F parameters per index (section 4), the last-write rule for a repeated id in one
   `patch` call, and that nested text fields keep the default BM25F parameters (section 2).
+- 2026-11-13, platform-engineer (S6-7, the server side): section 7 gains **response bytes and columnar hits** (serving
+  asks for `hits="columns"` and encodes them to the same bytes as the dict form) and **workers** (`--workers N`, N
+  read-only processes behind one port). The HTTP and RPC responses are unchanged but for a new `X-S3-Worker` header.

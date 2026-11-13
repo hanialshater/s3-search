@@ -9,9 +9,14 @@ The index is resolved when a batch is dispatched (``get_index()``), so a swap ta
 batch in flight finishes on the index it started on.
 
 If a batch call raises, the requests are retried one by one, so one bad request fails alone with its own named error.
+
+``columns=True`` asks an index whose ``search_batch`` takes ``hits`` for columnar hits (docs/INTERFACES.md §5,
+"Columnar hits"; serving encodes them, ``serving/encode.py``). An index without the parameter answers in the dict form.
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import queue
 import threading
 import time
@@ -20,6 +25,31 @@ from typing import Any, Callable
 
 from .errors import Overloaded
 from .metrics import Metrics
+
+
+def takes_hits(fn) -> bool:
+    """Whether ``search``/``search_batch`` accepts ``hits=`` (the engine's columnar hits, S6-7)."""
+    return _takes_hits(getattr(fn, "__func__", fn))
+
+
+@functools.lru_cache(maxsize=64)
+def _takes_hits(fn) -> bool:
+    try:
+        return "hits" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def search_batch(index, requests: list, columns: bool) -> list:
+    if columns and takes_hits(index.search_batch):
+        return index.search_batch(requests, hits="columns")
+    return index.search_batch(requests)
+
+
+def search_one(index, request: dict, columns: bool) -> dict:
+    if columns and takes_hits(index.search):
+        return index.search(request, hits="columns")
+    return index.search(request)
 
 
 class _Item:
@@ -33,12 +63,13 @@ class _Item:
 
 class BatchScheduler:
     def __init__(self, get_index: Callable[[], Any], *, name: str = "", max_batch: int = 32, max_wait_ms: float = 2.0,
-                 max_queue: int = 4096, metrics: Metrics | None = None):
+                 max_queue: int = 4096, metrics: Metrics | None = None, columns: bool = False):
         self.get_index = get_index
         self.name = name
         self.max_batch = max(1, int(max_batch))
         self.max_wait = max(0.0, float(max_wait_ms)) / 1000.0
         self.metrics = metrics or Metrics()
+        self.columns = bool(columns)
         self._q: queue.Queue[_Item] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"batcher-{name}", daemon=True)
@@ -98,7 +129,7 @@ class BatchScheduler:
         self.metrics.set("s3_queue_depth", self._q.qsize(), index=self.name)
         try:
             index = self.get_index()
-            responses = index.search_batch([it.request for it in batch])
+            responses = search_batch(index, [it.request for it in batch], self.columns)
             if len(responses) != len(batch):
                 raise RuntimeError(f"search_batch returned {len(responses)} responses for {len(batch)} requests")
         except Exception:
@@ -110,6 +141,6 @@ class BatchScheduler:
     def _one_by_one(self, batch: list[_Item], waits: list[float]) -> None:
         for it, w in zip(batch, waits):
             try:
-                it.future.set_result((self.get_index().search(it.request), w))
+                it.future.set_result((search_one(self.get_index(), it.request, self.columns), w))
             except Exception as exc:  # noqa: BLE001 - delivered to the caller, which names it
                 it.future.set_exception(exc)
