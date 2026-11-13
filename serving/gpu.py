@@ -98,11 +98,38 @@ def version_of(mi) -> tuple:
 
 
 # ---- the GPU process ------------------------------------------------------------------------------------------------------
-class _Item:
-    __slots__ = ("conn", "lock", "id", "name", "request", "t")
+class _Conn:
+    """One front's connection: a writer thread sends what the batch loop and the call thread queue, so neither ever
+    waits on a slow reader. Replies of one batch to one front travel as one ("multi", [msg, ...]) frame."""
 
-    def __init__(self, conn, lock, id_, name, request):
-        self.conn, self.lock, self.id, self.name, self.request = conn, lock, id_, name, request
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.out: queue.Queue = queue.Queue()
+        self.lock = threading.Lock()
+        threading.Thread(target=self._writer, daemon=True).start()
+
+    def put(self, msg) -> None:
+        self.out.put(msg)
+
+    def _writer(self) -> None:
+        while True:
+            msg = self.out.get()
+            if msg is None:
+                return
+            try:
+                send_msg(self.sock, msg, self.lock)
+            except OSError:
+                return                                          # the front went away; its callers time out
+
+    def close(self) -> None:
+        self.out.put(None)
+
+
+class _Item:
+    __slots__ = ("conn", "id", "name", "request", "t")
+
+    def __init__(self, conn, id_, name, request):
+        self.conn, self.id, self.name, self.request = conn, id_, name, request
         self.t = time.perf_counter()
 
 
@@ -129,6 +156,9 @@ class GpuServer:
         self._stop = threading.Event()
         self.n_batches = self.n_requests = 0
         self.busy_s = 0.0                                       # time inside search_batch (the batch loop's work)
+        self._out: dict[_Conn, list] | None = None              # replies of the batch in hand, per front
+        self.in_batch = 0
+        self.load = LoadTable(state_dir, create=False) if state_dir else None
 
     # -- connections
     def serve_forever(self) -> None:
@@ -149,38 +179,46 @@ class GpuServer:
     def shutdown(self) -> None:
         self._stop.set()
 
-    def _reader(self, conn: socket.socket) -> None:
-        lock = threading.Lock()
+    def _reader(self, sock: socket.socket) -> None:
+        conn = _Conn(sock)
         try:
             while True:
-                msg = recv_msg(conn)
+                msg = recv_msg(sock)
                 if msg is None:
                     return
                 if msg[0] == "search":
-                    self.q.put(_Item(conn, lock, msg[1], msg[2], msg[3]))
+                    self.q.put(_Item(conn, msg[1], msg[2], msg[3]))
+                    self._publish_load()
                 elif msg[0] == "call":
-                    self.calls.submit(self._call, conn, lock, msg)
+                    self.calls.submit(self._call, conn, msg)
         except (OSError, EOFError, pickle.UnpicklingError):
             return
         finally:
+            conn.close()
             try:
-                conn.close()
+                sock.close()
             except OSError:
                 pass
 
-    def _reply(self, it: _Item, msg: tuple) -> None:
-        try:
-            send_msg(it.conn, msg, it.lock)
-        except OSError:
-            pass                                                # the front went away; its caller has timed out
+    def _publish_load(self) -> None:
+        if self.load is not None:
+            self.load.set(self.index, self.q.qsize() + self.in_batch)
 
-    def _call(self, conn, lock, msg) -> None:
+    def _reply(self, it: _Item, msg: tuple) -> None:
+        if self._out is not None:                               # inside a batch: one frame per front at its end
+            self._out.setdefault(it.conn, []).append(msg)
+        else:
+            it.conn.put(msg)
+
+    def _flush(self) -> None:
+        out, self._out = self._out or {}, None
+        for conn, msgs in out.items():
+            conn.put(("multi", msgs) if len(msgs) > 1 else msgs[0])
+
+    def _call(self, conn, msg) -> None:
         _, id_, method, path, body, headers = msg
         r = self.app.handle(method, path, body, headers)
-        try:
-            send_msg(conn, ("call", id_, r.status, r.body, r.content_type, r.headers), lock)
-        except OSError:
-            pass
+        conn.put(("call", id_, r.status, r.body, r.content_type, r.headers))
 
     # -- the batch loop
     def _collect(self) -> list[_Item]:
@@ -201,6 +239,9 @@ class GpuServer:
             batch = self._collect()
             if not batch:
                 continue
+            self.in_batch = len(batch)
+            self._publish_load()
+            self._out = {}
             groups: dict[tuple, list[_Item]] = {}
             for it in batch:                                    # one search_batch per index; explain/highlight alone
                 own = isinstance(it.request, dict) and any(it.request.get(k) for k in _OWN_BATCH)
@@ -213,6 +254,9 @@ class GpuServer:
                     status, body = classify(exc)
                     for it in items:
                         self._reply(it, ("search", it.id, "error", status, body))
+            self._flush()
+            self.in_batch = 0
+            self._publish_load()
 
     def _fail(self, items: list[_Item], exc: BaseException) -> None:
         status, body = classify(exc)
@@ -320,6 +364,29 @@ class GpuServer:
             self._stop.wait(0.02)
 
 
+class LoadTable:
+    """Each GPU process's load (requests queued plus in its batch in hand), one int64 slot per process in a file in the
+    state directory, mmapped by every front: one writer per slot (that GPU process), so it never drifts, and every front
+    picks the least loaded process from the same numbers (S6-12s; it was each front's own in-flight count)."""
+
+    SLOTS = 64
+
+    def __init__(self, state_dir: str, create: bool):
+        import mmap
+        path = os.path.join(state_dir, "load.bin")
+        if create or not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.write(b"\0" * 8 * self.SLOTS)
+        self._f = open(path, "r+b")
+        self._m = mmap.mmap(self._f.fileno(), 8 * self.SLOTS)
+
+    def set(self, j: int, v: int) -> None:
+        struct.pack_into("<q", self._m, 8 * j, int(v))
+
+    def get(self, j: int) -> int:
+        return struct.unpack_from("<q", self._m, 8 * j)[0]
+
+
 def device_memory() -> dict:
     """torch's caching allocator on cuda: allocated (live tensors), reserved (held by the cache), peak allocated."""
     try:
@@ -360,9 +427,10 @@ class GpuClient:
                 msg = recv_msg(s)
                 if msg is None:
                     break
-                fut = self._pending.pop(msg[1], None)
-                if fut is not None:
-                    fut.set_result(msg)
+                for m in (msg[1] if msg[0] == "multi" else (msg,)):
+                    fut = self._pending.pop(m[1], None)
+                    if fut is not None:
+                        fut.set_result(m)
         except (OSError, EOFError, pickle.UnpicklingError):
             pass
         with self._conn_lock:
@@ -399,6 +467,15 @@ def gpu_main(cfg, sock_path: str, index: int) -> int:
     import signal
     from .app import create_app
     from .workers import mark_ready
+    frac = float(os.environ.get("S3_SERVING_GPU_MEMORY_FRACTION", "0") or 0)
+    if frac > 0:                                                # cap torch's cache so K processes fit predictably
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.set_per_process_memory_fraction(frac)
+                log.info("gpu process %d: torch memory capped at %.2f of the device", index, frac)
+        except Exception:  # noqa: BLE001
+            log.exception("could not cap the device memory")
     app = create_app(cfg)
     srv = GpuServer(app, sock_path, index, cfg.worker_state)
 

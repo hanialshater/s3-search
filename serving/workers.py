@@ -131,6 +131,9 @@ class Supervisor:
         self.stopping = threading.Event()
         self.state_dir = tempfile.mkdtemp(prefix="s3-workers-")   # ready-<i> per loaded worker (``/readyz``); 0700
         self.gpu_sockets = [os.path.join(self.state_dir, f"gpu-{j}.sock") for j in range(self.k)]
+        if self.k:
+            from .gpu import LoadTable
+            LoadTable(self.state_dir, create=True)
 
     def _kind(self, i: int) -> tuple[str, int]:
         """Processes 0..k-1 are the GPU processes (started first), then the fronts; without GPU processes, workers."""

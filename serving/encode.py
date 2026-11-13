@@ -94,7 +94,15 @@ def encode_hits(columns: dict) -> str:
     score_txt = _floats(np.asarray(columns["_score"], np.float32))
     if len(score_txt) != h:
         raise ValueError(f"{len(score_txt)} scores for {h} hits")
-    cols = [_column_text(c, h) for c in columns.get("sort") or []]
+    s64 = np.asarray(columns["_score"], np.float32).astype(np.float64)
+
+    def text(c):                                                # a _score sort column is the score again: reuse its text
+        v = c.get("values")
+        if c.get("missing") is None and isinstance(v, np.ndarray) and v.dtype == np.float64 and len(v) == h \
+                and np.array_equal(v, s64):
+            return score_txt
+        return _column_text(c, h)
+    cols = [text(c) for c in columns.get("sort") or []]
     if not cols:
         body = [f'{{"_id":{i},"_score":{s},"sort":[]}}' for i, s in zip(id_txt, score_txt)]
     elif len(cols) == 1:

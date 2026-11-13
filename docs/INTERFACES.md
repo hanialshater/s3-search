@@ -797,10 +797,19 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     `versions-0.json` in the state directory within 20 ms of any swap, patch, delete or background refresh. Every
     batch reply also carries the version it read. So a write forwarded by any front leaves no stale entry reachable.
   - **Transport.** One Unix-domain socket per GPU process, in the supervisor's state directory (`mkdtemp`, mode 0700);
-    the socket itself is mode 0600. A frame is an 8-byte big-endian length and a pickle. Columns are host numpy
+    the socket itself is mode 0600. A frame is an 8-byte big-endian length and a pickle. The replies of one batch to one front
+    travel as one `("multi", [...])` frame, written by that connection's writer thread, so the batch loop never waits
+    on a front. Columns are host numpy
     arrays plus a list of `_id` strings (the largest part), so they pickle as they are. **Unpickling is code
     execution:** the socket is for the service user's own processes only, inside one trust boundary, and is never
     exposed on TCP.
+  - **Picking a GPU process:** each GPU process writes its load (queued plus in its batch) to its own slot of
+    `load.bin` in the state directory. Every front reads the same table and picks the least loaded process, with its
+    own in-flight count breaking ties.
+  - **Device memory:** what grows with load is torch's cache (S6-10s diagnosis: 15.1 GB reserved against 1.4 GB live
+    at 400 QPS, with peaks of 6.7 GB at batch 64), so K is sized from reserved memory.
+    `S3_SERVING_GPU_MEMORY_FRACTION=f` caps each GPU process's cache with
+    `torch.cuda.set_per_process_memory_fraction(f)`, so K processes fit predictably.
   - **K > 1 runs under CUDA MPS**, with one index copy per process (about 5.8 GB each for ESCI-US on an A100). The MPS
     daemon is the node's (`colab/fair_bench.py --mps=1` starts one). One GPU process makes about 690 QPS lexical and
     180 QPS full pipeline at batch 64 in process (the architect's profiles), so K = 1 likely tops out near 700 QPS
@@ -1103,3 +1112,5 @@ status:
   of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.
 - 2026-11-13, platform-engineer (S6-12s): serving asks for `ids="bytes"` when the engine takes it, and encodes it to the
   same bytes (section 7, "One GPU process").
+- 2026-11-13, platform-engineer (S6-12s, the GPU process's transport): replies batched per front and sent by a writer
+  thread, a shared load table for picking a GPU process, and `S3_SERVING_GPU_MEMORY_FRACTION` (section 7).
