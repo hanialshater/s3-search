@@ -112,6 +112,8 @@ def _search_batch(index, requests: list) -> tuple[list, bool]:
     kw = {}
     if takes_param(index.search_batch, "hits"):
         kw["hits"] = "columns"
+        if takes_param(index.search_batch, "ids"):              # S6-12: _id as one bytes array (pickles ~7x faster)
+            kw["ids"] = "bytes"
     per_request = takes_param(index.search_batch, "errors")
     if per_request:
         kw["errors"] = "return"

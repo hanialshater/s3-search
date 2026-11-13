@@ -60,13 +60,36 @@ def _column_text(col: dict, h: int) -> list[str]:
     return out
 
 
+def id_texts(ids) -> list[str]:
+    """Each ``_id`` as JSON text. ``ids`` is a ``list[str]`` (``ids="str"``) or one numpy ``S<w>`` array (``ids="bytes"``,
+    INTERFACES §5: UTF-8, NUL-padded, never ending in NUL). When every byte of the array is printable ASCII other
+    than ``"`` and ``\\`` (the padding NULs aside), the bytes are the JSON text already; otherwise each entry is decoded
+    and escaped as ``json.dumps`` does."""
+    import numpy as np
+    if isinstance(ids, np.ndarray) and ids.dtype.kind == "S":
+        b = np.frombuffer(ids.tobytes(), np.uint8)
+        plain = not ((b >= 0x7F) | ((b < 0x20) & (b != 0)) | (b == 0x22) | (b == 0x5C)).any()
+        if plain:
+            return ['"' + x + '"' for x in ids.astype("U").tolist()]
+        return [_esc(x.decode("utf-8")) for x in ids.tolist()]
+    return [_esc(i) if isinstance(i, str) else json.dumps(i) for i in ids]
+
+
+def id_list(ids) -> list:
+    """``_id`` as the dict form's ``list[str]`` whichever form it came in."""
+    import numpy as np
+    if isinstance(ids, np.ndarray) and ids.dtype.kind == "S":
+        return [x.decode("utf-8") for x in ids.tolist()]
+    return list(ids)
+
+
 def encode_hits(columns: dict) -> str:
     """The dict form's ``hits.hits`` list as JSON text: ``[{"_id":..,"_score":..,"sort":[..]},...]``."""
     ids = columns["_id"]
     h = len(ids)
     if h == 0:
         return "[]"
-    id_txt = [_esc(i) if isinstance(i, str) else json.dumps(i) for i in ids]
+    id_txt = id_texts(ids)
     import numpy as np
     score_txt = _floats(np.asarray(columns["_score"], np.float32))
     if len(score_txt) != h:
@@ -130,7 +153,7 @@ def expand_columns(resp: dict) -> dict:
         return resp
     import numpy as np
     cols = resp["hits"]["columns"]
-    ids = list(cols["_id"])
+    ids = id_list(cols["_id"])
     scores = np.asarray(cols["_score"], np.float32).astype(np.float64).tolist()
     sort = [_py(c, len(ids)) for c in cols.get("sort") or []]
     rows = list(zip(*sort)) if sort else [()] * len(ids)

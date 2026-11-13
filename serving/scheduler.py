@@ -46,12 +46,16 @@ def _takes(fn, name: str) -> bool:
 
 def search_batch(index, requests: list, columns: bool) -> list:
     if columns and takes_hits(index.search_batch):
+        if takes_param(index.search_batch, "ids"):              # S6-12: _id as one bytes array
+            return index.search_batch(requests, hits="columns", ids="bytes")
         return index.search_batch(requests, hits="columns")
     return index.search_batch(requests)
 
 
 def search_one(index, request: dict, columns: bool) -> dict:
     if columns and takes_hits(index.search):
+        if takes_param(index.search, "ids"):
+            return index.search(request, hits="columns", ids="bytes")
         return index.search(request, hits="columns")
     return index.search(request)
 

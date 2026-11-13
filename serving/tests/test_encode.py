@@ -64,3 +64,14 @@ def test_bytes_equal_the_engine_dict_form():
             assert enc.encode(c) == _dumps(api.expand_hits(c)), r
             assert enc.expand_columns(c) == api.expand_hits(c), r
         assert n >= len(reqs) // 2
+
+
+def test_ids_as_a_bytes_array_encode_the_same():
+    """S6-12: ``_id`` as one numpy S<w> array (UTF-8, NUL-padded) gives the same bytes as the list[str] form."""
+    for ids in (["B0001", "B02", "X"], ["a\"b", "c\\d", "tab\tx", "é", "日本"], ["plain", "naïve"]):
+        r = _columnar(len(ids))
+        as_str = {**r, "hits": {**r["hits"], "columns": {**r["hits"]["columns"], "_id": ids}}}
+        arr = np.array([i.encode("utf-8") for i in ids], dtype=f"S{max(len(i.encode()) for i in ids)}")
+        as_bytes = {**r, "hits": {**r["hits"], "columns": {**r["hits"]["columns"], "_id": arr}}}
+        assert enc.encode(as_bytes) == enc.encode(as_str) == _dumps(enc.expand(as_str))
+        assert enc.expand(as_bytes) == enc.expand(as_str)
