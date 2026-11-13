@@ -62,13 +62,37 @@ def test_search_batch_equals_search_one_at_a_time(device, hits, ds, monkeypatch)
         assert _same(g, ix.search(r, hits=hits)), r
 
 
-def test_a_rescored_request_in_a_batch(segment, catalogue, device):
+@pytest.mark.parametrize("runtime", ["engine", "auto"])
+def test_rescored_plans_in_a_batch(segment, catalogue, device, runtime, monkeypatch):
+    """S6-8: rescored plans of several windows, queries and shapes, batched, equal the per-plan path and each alone."""
+    monkeypatch.setattr(Executor, "BATCH_ROWS", 4)
     ix = ranked_index(segment, catalogue, device)
-    lex = {"match": {"product_title": "black shoes"}}
-    reqs = [{"query": lex}, {"query": lex, "rescore": {"window_size": 20, "s3_ranker": {"model": "m"}}},
-            {"query": lex, "size": 3}]
-    for r, got in zip(reqs, ix.search_batch(reqs)):
-        assert _same(got, ix.search(r)), r
+    if runtime == "auto":
+        ix.add_ranker("m", ix.rankers["m"] if not hasattr(ix.rankers["m"], "model") else ix.rankers["m"].model,
+                      runtime="auto")
+    texts = ["black shoes", "red shirt", "running", "zzzz", "blue"]
+    reqs = []
+    for k, t in enumerate(texts):
+        lex = {"match": {"product_title": t}}
+        hyb = {"hybrid": {"queries": [lex, {"neural": {"embedding": {"query_text": t, "k": 20}}}]}}
+        reqs.append({"query": hyb if k % 2 else lex, "size": [10, 3, 30][k % 3],
+                     "rescore": {"window_size": [20, 5, 100, 1, 7][k], "s3_ranker": {"model": "m"}}})
+        reqs.append({"query": lex})
+    reqs.append({"query": {"match": {"product_title": "shoes"}}, "explain": True, "size": 3,
+                 "rescore": {"window_size": 10, "s3_ranker": {"model": "m"}}})
+    got = ix.search_batch(reqs)
+    monkeypatch.setattr(Executor, "BATCHED", False)
+    ref = ix.search_batch(reqs)
+    monkeypatch.setattr(Executor, "BATCHED", True)
+    for r, g, e in zip(reqs, got, ref):
+        assert _same(g, e), r
+        assert _same(g, ix.search(r)), r
+
+
+def test_a_missing_ranker_is_still_named(segment, catalogue):
+    ix = ranked_index(segment, catalogue, "cpu")
+    with pytest.raises(api.InvalidRequest, match="no ranker named 'x'"):
+        ix.search_batch([{"query": {"match_all": {}}, "rescore": {"window_size": 5, "s3_ranker": {"model": "x"}}}])
 
 
 def test_host_transfers_do_not_grow_with_the_batch(ds):
@@ -83,3 +107,34 @@ def test_host_transfers_do_not_grow_with_the_batch(ds):
         finally:
             undo()
         assert len(calls) == 3, (n, len(calls))                # the pages and totals, and one per facet field
+
+
+def test_features_equal_the_host_count_route(segment, catalogue, device):
+    """The match-count feature from the device table has the bits of the host route (math.log1p of the count)."""
+    import numpy as np
+    from engine import ops
+    from engine.plan.execute import Timer
+    from engine.plan.plan import plan as make_plan
+    from engine.rank.features import _components, candidate_features_batch
+    ix = ranked_index(segment, catalogue, device)
+    st = ix._st
+    b = st.b
+    ex = Executor(st, ix.rankers)
+    plans = [make_plan({"query": {"match": {"product_title": t}}}, st) for t in ("black shoes", "shoes", "zzzz")]
+    ex._prefetch(plans, Timer(b))
+    ctxs = []
+    for p in plans:
+        ctx = {"explain": None}
+        ex.eval(p.root, ctx)
+        ctxs.append(ctx)
+    cand = b.asarray(np.tile(np.arange(20, dtype=np.int32), (3, 1)), "int32")
+    X, _ = candidate_features_batch(ex, ctxs, cand)
+    for q, ctx in enumerate(ctxs):
+        comps, node, nm = _components(ex, ctx)
+        n = int(b.to_numpy(b.count_nonzero(nm))) if nm is not None else 0
+        mf = st.match_fields()
+        want = ops.gather_features(b, b.astype(cand[q:q + 1], "int64"), *[c.reshape(1, -1) for c in comps],
+                                   [[st.keywords[f].matched_codes(set(node.terms))] for f in mf],
+                                   [st.keywords[f].codes for f in mf], st.static_features(), [len(node.terms)], [n])
+        assert (n > 0) == (q < 2)
+        np.testing.assert_array_equal(b.to_numpy(X[q:q + 1]), b.to_numpy(want))   # NaN == NaN here

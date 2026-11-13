@@ -39,7 +39,10 @@ def gather_features(b, cand, lex, lex_rank, dense, dense_rank, rrf, match_codes,
             rows.append(b.astype(m, "float32"))
         cols.append(b.stack(rows, 0))
     st = static[safe]                                                  # [Q,W,S]
-    qf = b.asarray([[float(q_len[q]), math.log1p(float(n_match[q]))] for q in range(Q)], "float32")
+    if isinstance(n_match, (list, tuple)):                            # host counts
+        qf = b.asarray([[float(q_len[q]), math.log1p(float(n_match[q]))] for q in range(Q)], "float32")
+    else:                                     # S6-8: log1p(n_match) already, f32[Q] on the device
+        qf = b.stack([b.asarray([float(x) for x in q_len], "float32"), b.astype(n_match, "float32")], 1)
     X = b.concatenate([b.stack(cols, 2), st, qf.reshape(Q, 1, 2) + b.zeros((Q, W, 2), "float32")], axis=2)
     return X
 

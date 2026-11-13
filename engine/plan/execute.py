@@ -696,10 +696,12 @@ class Executor:
             if plan.post_filter is not None:             # aggregations see the query's matches, hits these
                 hits_mask = match & self.eval(plan.post_filter, {"explain": None})[1]
             tier = None
-            if plan.rescore is not None:
+            batched = self.BATCHED and plan.rescore is not None and not plan.explain
+            if plan.rescore is not None and not batched:  # explain reads the rescore's host copy: per plan
                 score, tier = self._rescore(plan, score, match, ctx, t)
             states.append({"plan": plan, "t": t, "ctx": ctx, "score": score, "match": match, "hits_mask": hits_mask,
-                           "tier": tier, "knn": _knn_methods(b, plan, self.knn_outcome)})
+                           "tier": tier, "knn": _knn_methods(b, plan, self.knn_outcome), "rescore_later": batched})
+        self._batched_rescore(states)
         totals, pages = self._batched_totals_and_pages(states)
         aggs = self._batched_terms(states)
         out = []
@@ -777,6 +779,55 @@ class Executor:
         took["total"] = round(shared_ms + t.total(), 3)
         resp["took_ms"] = took
         return resp
+
+    def _batched_rescore(self, states):
+        """S6-8: the rescored plans of the batch (without explain), per ranker and chunk: one top-k window over the
+        stacked scores, the candidates' features in one gather, one ranker call over every plan's candidates, and
+        the new scores and tiers scattered back. Row q equals ``_rescore`` of that plan alone: its window is the
+        first ``window`` of a larger top-k (score descending, then doc id), its features are its own row's, and the
+        ranker scores rows independently."""
+        from ..rank.features import candidate_features_batch
+        b, st = self.b, self.st
+        N = st.N
+        by_model = defaultdict(list)
+        for i, sx in enumerate(states):
+            if sx["rescore_later"]:
+                by_model[sx["plan"].rescore.model].append(i)
+        for model, idxs in by_model.items():
+            ranker = self.rankers.get(model)
+            if ranker is None:
+                raise InvalidRequest("rescore.s3_ranker.model", f"no ranker named {model!r} on this index")
+            for ch in self._chunks(idxs):
+                t0 = time.perf_counter()
+                G = len(ch)
+                wins = [min(states[i]["plan"].rescore.window, N) for i in ch]
+                S = b.stack([states[i]["score"] for i in ch], 0)
+                M = b.stack([states[i]["match"] for i in ch], 0)
+                idx, _ = b.topk(S, max(wins), M)
+                W = idx.shape[1]
+                inside = b.arange(W).reshape(1, W) < b.asarray(wins, "int64").reshape(G, 1)
+                idx = b.where(inside, b.astype(idx, "int64"), -1)
+                X, cand = candidate_features_batch(self, [states[i]["ctx"] for i in ch], idx)
+                b.synchronize()
+                t1 = time.perf_counter()
+                ok = cand >= 0
+                rr, cc = b.nonzero(ok)
+                sel = cand[rr, cc]
+                Xd = X[ok]
+                if hasattr(ranker, "predict_backend"):    # on the device: no copy to the host
+                    pred = ranker.predict_backend(b, Xd)
+                else:                                     # any other model: through the host
+                    pred = b.asarray(np.asarray(ranker.predict(b.to_numpy(Xd)), np.float32), "float32")
+                new = b.copy(S)
+                tier = b.zeros((G, N), "float32")
+                new[rr, sel] = pred
+                tier[rr, sel] = 1.0
+                b.synchronize()
+                t2 = time.perf_counter()
+                for g, i in enumerate(ch):
+                    states[i]["score"], states[i]["tier"] = new[g], tier[g]
+                    states[i]["t"].laps["features"] += (t1 - t0) * 1000.0 / G
+                    states[i]["t"].laps["rank"] += (t2 - t1) * 1000.0 / G
 
     def _chunks(self, idx):
         for k in range(0, len(idx), self.BATCH_ROWS):

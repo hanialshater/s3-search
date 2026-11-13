@@ -59,3 +59,14 @@ def test_bincount_rows(device):
     codes = b.asarray(np.array([0, 1, 1, 2, 2, 2], np.int64))
     mask = b.asarray(np.array([[1, 1, 1, 1, 1, 1], [0, 0, 1, 0, 1, 1]], bool))
     assert b.to_numpy(b.bincount_rows(codes, mask, 3)).tolist() == [[1, 2, 3], [0, 1, 2]]
+
+
+def test_numpy_count_nonzero_is_a_numpy_integer(monkeypatch):
+    """numpy < 2 returns a Python int for axis=None; the backend's callers use .astype on it (aggs.range_agg)."""
+    import numpy as np
+    from engine.backend.numpy_backend import NumpyBackend
+    real = np.count_nonzero
+    monkeypatch.setattr(np, "count_nonzero", lambda a, axis=None: int(real(a)) if axis is None else real(a, axis=axis))
+    b = NumpyBackend()
+    n = b.count_nonzero(np.array([True, False, True]))
+    assert n == 2 and b.astype(n, "float64").reshape(1)[0] == 2.0
