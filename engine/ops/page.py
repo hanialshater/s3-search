@@ -6,8 +6,6 @@ float32 scores, doc ids and int32 values exactly).
 """
 from __future__ import annotations
 
-import numpy as np
-
 
 def after_mask(b, keys, after, tiekey=None):
     """``bool[N]``: entries strictly after ``after`` (one value per key, then the tie key) in the sort order. The tie
@@ -37,7 +35,8 @@ def page_arrays(b, keys, mask, from_: int, size: int, after=None, extra=(), tiek
     nk, ne = len(keys), len(extra)
 
     def empty():
-        return np.zeros(0, np.int64), np.zeros((0, nk)), np.zeros((0, ne))
+        return (b.to_numpy(b.zeros(0, "int64")), b.to_numpy(b.zeros((0, nk), "float64")),
+                b.to_numpy(b.zeros((0, ne), "float64")))
     # collapse: int64[N] group codes (S7-3): only the first doc of each group in sort order is kept, and
     # from/size count groups.
     valid = mask if after is None else mask & after_mask(b, keys, after, tiekey)
