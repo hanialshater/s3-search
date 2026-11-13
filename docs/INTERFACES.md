@@ -1102,9 +1102,6 @@ status:
 - 2026-11-13, architect (S6-15): section 0 says how the host waits for the device on cuda: CUDA's spinning wait by
   default, a blocking event with `S3_CUDA_BLOCKING_SYNC=1`. It changes no result. The blocking wait was the default
   in 3bfeea4 and was made opt-in after its profile measured no host CPU saved.
-- 2026-11-13, platform-engineer (S6-7, the server side): section 7 gains **response bytes and columnar hits** (serving
-  asks for `hits="columns"` and encodes them to the same bytes as the dict form) and **workers** (`--workers N`, N
-  read-only processes behind one port). The HTTP and RPC responses are unchanged but for a new `X-S3-Worker` header.
 - 2026-11-13, platform-engineer (S6-10s): section 7 gains **one GPU process**, proposed and then built with the
   architect's seven changes:
   - only explain and highlight run in batches of their own;
