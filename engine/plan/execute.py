@@ -78,12 +78,14 @@ def _knn_methods(b, plan, outcome=None) -> dict:
     return out
 
 class Timer:
-    def __init__(self, b):
+    def __init__(self, b, sync: bool = True):
         self.b, self.laps, self.t0 = b, defaultdict(float), time.perf_counter()
         self.t = self.t0
+        self.sync = sync
 
     def lap(self, name):
-        self.b.synchronize()
+        if self.sync:                                 # a device sync, so the lap holds the stage's device time
+            self.b.synchronize()
         now = time.perf_counter()
         self.laps[name] += (now - self.t) * 1000.0
         self.t = now
@@ -683,6 +685,9 @@ class Executor:
     # plain score-sorted pages for the whole batch, each in one transfer; the rest per plan, as before.
     BATCH_ROWS = 64                                   # plans stacked per [B, N] step (bounds the device memory)
     BATCHED = True                                    # False: every plan on the per-plan path (the reference)
+    # S6-11: inside a batch of two or more, a plan's own stage laps do not sync the device (a sync per plan and stage
+    # kept the host from queueing the next plan's work); its took_ms stages are then host times. True: as before.
+    SYNC_PLAN_TIMES = False
 
     def run(self, plans: list[Plan], columns: bool = False) -> list[dict]:
         b, st = self.b, self.st
@@ -695,7 +700,7 @@ class Executor:
         shared_ms = (time.perf_counter() - shared_t0) * 1000.0
         states = []
         for plan in plans:
-            t = Timer(b)
+            t = Timer(b, sync=self.SYNC_PLAN_TIMES or len(plans) == 1)
             ctx = {"explain": {} if plan.explain else None}
             self.knn_outcome = {}
             score, match = self.eval(plan.root, ctx)

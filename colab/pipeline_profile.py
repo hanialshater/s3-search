@@ -28,6 +28,9 @@ REF = args[0] if args else "main"
 N_QUERIES = next((int(a.split("=", 1)[1]) for a in sys.argv[1:] if a.startswith("--queries=")), 1000)
 # The ranker's runtime (Index.add_ranker): "engine" (its own device walk) was the only one before 2026-11-13.
 RUNTIMES = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--runtime=")), "engine").split(",")
+# --torch-profile=1: after the throughput runs, one batch of 64 of each kind under torch.profiler (device time by
+# kernel, and the number of kernel launches and host syncs per request), to show where a batch's time goes.
+TORCH_PROFILE = any(a == "--torch-profile=1" for a in sys.argv[1:])
 BATCHES = (1, 16, 64, 128)
 S6_QPS, S6_P99_MS = 694, 35.0
 
@@ -96,6 +99,33 @@ def measure(index, make, texts, label):
     return out
 
 
+def torch_profile(index, make, texts, label, bs=64):
+    """One batch of ``bs`` under torch.profiler: the top CUDA kernels by device time, and launches and syncs per
+    request."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+    reqs = [make(t) for t in texts[:bs]]
+    index.search_batch(reqs)                               # warm
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        t0 = time.perf_counter()
+        index.search_batch(reqs)
+        torch.cuda.synchronize()
+        wall = (time.perf_counter() - t0) * 1e3
+    ev = prof.key_averages()
+    dev = lambda e: getattr(e, "device_time_total", None) or getattr(e, "cuda_time_total", 0)  # noqa: E731
+    kernels = [e for e in ev if dev(e) > 0 and e.device_type.name == "CUDA"]
+    launches = sum(e.count for e in ev if e.key in ("cudaLaunchKernel", "cuLaunchKernel", "cudaLaunchKernelExC"))
+    syncs = sum(e.count for e in ev if e.key in ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaMemcpyAsync"))
+    top = sorted(kernels, key=dev, reverse=True)[:12]
+    out = {"batch": bs, "wall_ms": wall, "device_ms": sum(dev(e) for e in kernels) / 1000.0,
+           "launches_per_request": launches / bs, "syncs_and_copies_per_request": syncs / bs,
+           "top_kernels": [{"name": e.key[:90], "device_ms": dev(e) / 1000.0, "count": e.count} for e in top]}
+    say(f"{label} torch profile: wall {wall:.1f} ms, device {out['device_ms']:.1f} ms, launches/request "
+        f"{out['launches_per_request']:.0f}, syncs+copies/request {out['syncs_and_copies_per_request']:.1f}")
+    return out
+
+
 def main():
     global LEX_FIELDS, FACETS
     stop = threading.Event()
@@ -161,6 +191,14 @@ def main():
         index.add_ranker("gbdt", model, runtime=rt)
         say(f"pipeline with the ranker on runtime {rt!r} ({type(index.rankers['gbdt']).__name__})")
         result.setdefault("pipeline_by_runtime", {})[rt] = measure(index, pipeline_request, texts, f"pipeline/{rt}")
+    if TORCH_PROFILE:
+        result["torch_profile"] = {}
+        for label, make in (("lexical", lexical_request), ("pipeline", pipeline_request)):
+            try:
+                result["torch_profile"][label] = torch_profile(index, make, texts, label)
+            except Exception as e:                   # the profile is extra: never lose the run's numbers to it
+                result["torch_profile"][label] = {"error": repr(e)[:500]}
+                say(f"{label} torch profile failed: {e!r}")
     stop.set()
     json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
     say("DONE")
