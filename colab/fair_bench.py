@@ -141,10 +141,13 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                             why[str(r.status)] = why.get(str(r.status), 0) + 1
                             return
                     lat.append((time.time() - due) * 1e3)
-                    if i % 97 == 0:                          # sampled: hits, and a digest to compare unloaded
+                    if i % 97 == 0:                          # sampled: hits, a digest, the bytes, who answered
                         n_hits, digest = result_digest(raw)
                         hits.append(n_hits)
-                        samples.append([i, n_hits, digest])
+                        samples.append([i, n_hits, digest, r.headers.get("X-S3-Gpu-Process"),
+                                        r.headers.get("X-S3-Index-Version"), r.headers.get("X-S3-Batch-Size")])
+                        with open(f"{SAMPLES}/{int(rate)}-{i}.json", "wb") as fh:
+                            fh.write(raw)
                 except asyncio.TimeoutError:
                     timeouts += 1
                 except Exception as e:
@@ -174,24 +177,61 @@ def result_digest(raw: bytes) -> tuple[int, str]:
     return len(d["hits"]["hits"]), hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
 
-def compare_unloaded(url, bodies, runs, limit=400):
+SAMPLES = "/content/fair-samples"
+
+
+def _post(url, body, route=None):
+    h = {"Content-Type": "application/json"}
+    if route is not None:
+        h["X-S3-Route-Gpu"] = str(route)
+    with urllib.request.urlopen(urllib.request.Request(url, data=body, method="POST", headers=h), timeout=60) as r:
+        return r.read(), r.headers.get("X-S3-Gpu-Process"), r.headers.get("X-S3-Index-Version")
+
+
+def _diff(a: bytes, b: bytes) -> dict:
+    """Where two responses first differ: totals, page lengths, the first differing hit and both sides of it."""
+    x, y = json.loads(a), json.loads(b)
+    hx, hy = x["hits"]["hits"], y["hits"]["hits"]
+    first = next((k for k, (p, q) in enumerate(zip(hx, hy)) if p != q), None)
+    other = sorted(set(x) ^ set(y)) + [k for k in set(x) & set(y) if k not in ("hits", "took_ms") and x[k] != y[k]]
+    return {"total": [x["hits"].get("total"), y["hits"].get("total")], "len": [len(hx), len(hy)],
+            "first_differing_hit": first, "hits_differing": sum(p != q for p, q in zip(hx, hy)),
+            "at_first": [hx[first], hy[first]] if first is not None else None, "other_keys_differing": other}
+
+
+def compare_unloaded(url, bodies, runs, limit=2000):
     """Replay sampled requests one at a time after the ladder and compare with what the loaded runs returned: a
     response changed by load (or emptied) shows as a mismatch; a query with no matches has 0 hits both ways."""
-    seen, out = {}, {"checked": 0, "mismatch": [], "zero_hits_loaded": 0, "zero_hits_unloaded_too": 0}
+    seen, out = {}, {"checked": 0, "mismatch": [], "zero_hits_loaded": 0, "zero_hits_unloaded_too": 0,
+                     "answered_by": {}}
     for r in runs:
-        for i, n, dg in r.get("samples", []):
-            seen.setdefault(i, []).append((r["target_qps"], n, dg))
+        for smp in r.get("samples", []):
+            i, n, dg = smp[:3]
+            gpu, ver = (smp[3], smp[4]) if len(smp) > 4 else (None, None)
+            bs = smp[5] if len(smp) > 5 else None
+            seen.setdefault(i, []).append((r["target_qps"], n, dg, gpu, ver, bs))
+            out["answered_by"][f"{gpu}@{ver}"] = out["answered_by"].get(f"{gpu}@{ver}", 0) + 1
+    n_gpus = max(1, GPUS if FRONTS else 1)
     for i in sorted(seen)[:limit]:
-        raw = urllib.request.urlopen(urllib.request.Request(url, data=bodies[i % len(bodies)], method="POST",
-                                     headers={"Content-Type": "application/json"}), timeout=60).read()
+        body = bodies[i % len(bodies)]
+        raw, g0, v0 = _post(url, body)
         n0, d0 = result_digest(raw)
-        for rate, n, dg in seen[i]:
+        for rate, n, dg, gpu, ver, bs in seen[i]:
             out["checked"] += 1
             if n == 0:
                 out["zero_hits_loaded"] += 1
                 out["zero_hits_unloaded_too"] += n0 == 0
-            if dg != d0:
-                out["mismatch"].append({"i": i, "rate": rate, "hits_loaded": n, "hits_unloaded": n0})
+            if dg != d0:                                     # keep everything: both bodies, who answered, replays
+                m = {"i": i, "body": i % len(bodies), "rate": rate, "hits_loaded": n, "hits_unloaded": n0,
+                     "loaded_by": [gpu, ver], "loaded_batch_size": bs, "unloaded_by": [g0, v0]}
+                loaded = open(f"{SAMPLES}/{int(rate)}-{i}.json", "rb").read()
+                open(f"{SAMPLES}/{int(rate)}-{i}.unloaded.json", "wb").write(raw)
+                m["diff"] = _diff(loaded, raw)
+                m["replays"] = {}
+                for j in range(n_gpus):                       # each GPU process, three times, alone
+                    m["replays"][str(j)] = [result_digest(_post(url, body, j if FRONTS else None)[0])[1] == dg
+                                            for _ in range(3)]
+                out["mismatch"].append(m)
     return out
 
 
@@ -477,6 +517,7 @@ def main():
             continue
         try:
             bodies = [json.dumps(make_body(t)).encode() for t in texts]
+            os.makedirs(SAMPLES, exist_ok=True)
             for b in bodies[:200]:                               # warm-up, one at a time
                 urllib.request.urlopen(urllib.request.Request(url, data=b, method="POST",
                                                               headers={"Content-Type": "application/json"}),

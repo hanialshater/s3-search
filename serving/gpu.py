@@ -293,7 +293,7 @@ class GpuServer:
         except Exception as exc:  # noqa: BLE001 - not one request's failure: one at a time, capped
             return self._one_by_one(index, version, mi, items, waits, exc)
         for it, resp, w in zip(items, out, waits):
-            self._answer(it, resp, version, w, mi)
+            self._answer(it, resp, version, w, mi, len(items))
 
     def _one_by_one(self, index, version, mi, items, waits, exc) -> None:
         failures = 0
@@ -310,7 +310,7 @@ class GpuServer:
             failures = 0
             self._answer(it, resp, version, w, mi)
 
-    def _answer(self, it: _Item, resp: dict, version: tuple, wait_ms: float, mi) -> None:
+    def _answer(self, it: _Item, resp: dict, version: tuple, wait_ms: float, mi, size: int = 1) -> None:
         if isinstance(resp, dict) and set(resp) == {"error"}:
             status, body = classify_entry(resp["error"])
             mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="error")
@@ -324,7 +324,7 @@ class GpuServer:
             except Exception as exc:  # noqa: BLE001
                 return self._fail([it], exc)
         mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
-        self._reply(it, ("search", it.id, "ok", resp, version, wait_ms))
+        self._reply(it, ("search", it.id, "ok", resp, version, wait_ms, size))
 
     # -- what the process is doing, every 5 s in its log (and gauges): batches, queue, device memory
     def _stats(self, every: float = 5.0) -> None:

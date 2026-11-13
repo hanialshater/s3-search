@@ -113,7 +113,7 @@ class FrontApp:
         m = _INDEX_ROUTE.match(bare)
         action = m.group(2) if m else None
         if m and action in ("_search", "_msearch") and method == "POST":
-            return action.lstrip("_"), (self._search(m.group(1), body) if action == "_search"
+            return action.lstrip("_"), (self._search(m.group(1), body, headers) if action == "_search"
                                         else self._msearch(m.group(1), body))
         if len(self.gpus) > 1 and m and not (method == "GET" or action in _READ_ACTIONS):
             raise MethodNotAllowed(f"this server runs {len(self.gpus)} GPU processes and serves reads only; writes "
@@ -162,9 +162,11 @@ class FrontApp:
             return min(self.gpus, key=lambda g: g.inflight)
         return min(enumerate(self.gpus), key=lambda jg: (self.load.get(jg[0]), jg[1].inflight))[1]
 
-    def _submit(self, name: str, request: dict):
+    def _submit(self, name: str, request: dict, route: int | None = None):
+        """Send one search to a GPU process: the least loaded, or ``route`` (the ``X-S3-Route-Gpu`` request header, for
+        diagnosis). The future's result carries which process answered (``fut.gpu``)."""
         with self._vlock:
-            g = self._pick()
+            g = self.gpus[route] if route is not None and 0 <= route < len(self.gpus) else self._pick()
             g.inflight += 1
 
         def done(_f):
@@ -176,18 +178,21 @@ class FrontApp:
             done(None)
             raise
         fut.add_done_callback(done)
+        fut.gpu = self.gpus.index(g)
         return fut
 
-    def _one(self, name: str, request: dict, fut=None):
-        """``(response, info)`` or raises the named error."""
+    def _one(self, name: str, request: dict, fut=None, route: int | None = None):
+        """``(response, version, info)`` or raises the named error. ``info`` names the GPU process that answered."""
         t0 = time.perf_counter()
-        msg = self._wait(fut if fut is not None else self._submit(name, request), "search")
+        fut = fut if fut is not None else self._submit(name, request, route)
+        msg = self._wait(fut, "search")
         if msg[2] == "error":
             raise _Answered(msg[3], msg[4])
-        _, _, _, resp, version, queue_ms = msg
-        return resp, version, {"cache": "miss", "queue_ms": queue_ms, "serve_ms": (time.perf_counter() - t0) * 1000.0}
+        resp, version, queue_ms = msg[3], msg[4], msg[5]
+        return resp, version, {"cache": "miss", "queue_ms": queue_ms, "serve_ms": (time.perf_counter() - t0) * 1000.0,
+                               "gpu": getattr(fut, "gpu", 0), "batch": msg[6] if len(msg) > 6 else 1}
 
-    def _search(self, name: str, body: bytes) -> Response:
+    def _search(self, name: str, body: bytes, headers: dict | None = None) -> Response:
         request = self._parse(body)
         if not isinstance(request, dict):
             raise InvalidRequestBody("a search request is a JSON object", path="")
@@ -199,14 +204,19 @@ class FrontApp:
             if hit is not None:
                 return _search_json(hit, {"X-S3-Cache": "hit", "X-S3-Queue-Ms": "0.000",
                                           "X-S3-Serve-Ms": f"{(time.perf_counter() - t0) * 1000.0:.3f}"})
+        route = None
+        if headers and headers.get("x-s3-route-gpu", "").strip().isdigit():
+            route = int(headers["x-s3-route-gpu"])
         try:
-            resp, version, info = self._one(name, request)
+            resp, version, info = self._one(name, request, route=route)
         except _Answered as a:
             return _json(a.status, a.body)
         if cacheable:
             self.cache.put((name, tuple(version), request_key(request)), resp)
         return _search_json(resp, {"X-S3-Cache": info["cache"], "X-S3-Queue-Ms": f"{info['queue_ms']:.3f}",
-                                   "X-S3-Serve-Ms": f"{info['serve_ms']:.3f}"})
+                                   "X-S3-Serve-Ms": f"{info['serve_ms']:.3f}", "X-S3-Gpu-Process": str(info["gpu"]),
+                                   "X-S3-Index-Version": f"{version[0]}:{version[1]}",
+                                   "X-S3-Batch-Size": str(info["batch"])})
 
     def _msearch(self, name: str, body: bytes) -> Response:
         requests = self._parse(body)

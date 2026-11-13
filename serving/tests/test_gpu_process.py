@@ -2,6 +2,7 @@
 on the toy dataset."""
 import json
 import os
+import urllib.request
 import stat
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -137,5 +138,15 @@ def test_two_gpu_processes_are_read_only(built, single):
         _same(single, _answers(port))
         st, body, _ = _http("POST", f"http://127.0.0.1:{port}/indexes/toy/_docs", [])
         assert st == 405 and json.loads(body)["error"]["type"] == "method_not_allowed"
+        url = f"http://127.0.0.1:{port}/indexes/toy/_search"           # which process answered, and its index version
+        versions = set()
+        for j in (0, 1):
+            req = urllib.request.Request(url, data=json.dumps(REQS[0]).encode(), method="POST",
+                                         headers={"Content-Type": "application/json", "X-S3-Route-Gpu": str(j)})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                assert r.headers["X-S3-Gpu-Process"] == str(j)
+                versions.add(r.headers["X-S3-Index-Version"])
+                assert _hits(r.read()) == _hits(single[0][1])
+        assert len(versions) == 1 and next(iter(versions)).startswith("seg-")   # both hold the same index state
     finally:
         assert _stop(p) == 0
