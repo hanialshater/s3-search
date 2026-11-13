@@ -1,7 +1,7 @@
 #!/usr/bin/env -S colab run --gpu A100 --timeout 1200
 """Matched load test, the engine against OpenSearch on one Colab GPU machine: speed only, development only.
 
-    colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000] [--k=2000]
+    colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch]
 
 What is matched, for each engine in turn (never both at once):
@@ -12,13 +12,15 @@ What is matched, for each engine in turn (never both at once):
   OpenSearch 2.19.1 single node, as the prototype ran it;
 - each engine's own tuned lexical request: the engine's tuned BM25F (referee/requests/bm25f-tuned*.json),
   OpenSearch's tuned cross_fields (opensearch-cross-fields-tuned.json, `english` analyzer, as the prototype);
-- the load: open loop at each --qps for --duration seconds. Request i is due at t0 + i/qps whatever happened
+- the load: open loop at each --qps for --duration seconds, climbing until an engine cannot sustain a rate
+  (under 90% of it achieved, or over 1% timeouts or errors), the same rule for both. Request i is due at t0 + i/qps whatever happened
   before it, and its latency counts from that due time, so a slow engine queues instead of slowing the clock.
 - the CPUs: the load generator (4 processes) is pinned to 4 cores; the engine under test gets the others.
   OpenSearch runs on those CPUs; the engine on the GPU plus those CPUs.
 
 Reports, per engine and rate: achieved QPS, latency p50/p95/p99/max from the due time, errors, timeouts, hits per
-response (sampled), and the client's send lag (if it falls behind, the client was the limit and the run says so).
+response (sampled), GPU utilisation and the server's CPU use (sampled every 0.5 s: which one was the limit),
+and the client's send lag (if it falls behind, the client was the limit and the run says so).
 Quality at the same depth is the referee's: `referee full --k=2000` for each engine. Writes /content/fair-bench.json.
 """
 from __future__ import annotations
@@ -50,7 +52,7 @@ def opt(name, default):
 
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 REF = ARGS[0] if ARGS else "main"
-RATES = [float(x) for x in opt("qps", "250,500,1000").split(",")]
+RATES = [float(x) for x in opt("qps", "250,500,1000,2000,4000").split(",")]
 K = int(opt("k", "2000"))
 DURATION = float(opt("duration", "60"))
 ENGINES = opt("engines", "engine,opensearch").split(",")
@@ -258,6 +260,62 @@ def engine_target(ds, server_cpus):
     return proc, "http://localhost:8080/indexes/esci/_search", body, build_s
 
 
+class Sampler:
+    """Every 0.5 s during a run: GPU utilisation and memory (nvidia-smi), and the server's CPU use (its whole process
+    tree, in cores). Says whether the GPU or the host was the limit."""
+
+    def __init__(self, pid):
+        import threading
+        self.pid, self.gpu, self.mem, self.cpu = pid, [], [], []
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        import psutil
+        root = psutil.Process(self.pid)
+        procs = {}
+        while not self._stop.wait(0.5):
+            try:
+                g = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                                   capture_output=True, text=True, timeout=5).stdout.split(",")
+                self.gpu.append(float(g[0])); self.mem.append(float(g[1]))
+            except Exception:
+                pass
+            try:
+                total = 0.0
+                for p in [root] + root.children(recursive=True):
+                    if p.pid not in procs:
+                        procs[p.pid] = p
+                        p.cpu_percent(None)                     # the first call only starts the counter
+                        continue
+                    total += procs[p.pid].cpu_percent(None)
+                self.cpu.append(total / 100.0)
+            except Exception:
+                pass
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._t.join(10)
+
+    def summary(self, n_server_cpus):
+        import numpy as np
+
+        def s(x):
+            return {"mean": float(np.mean(x)), "p95": float(np.percentile(x, 95)), "max": float(np.max(x))} if x else None
+        out = {"gpu_util_pct": s(self.gpu[2:]), "gpu_mem_mib": s(self.mem), "server_cpu_cores": s(self.cpu[2:]),
+               "server_cpus_available": n_server_cpus}
+        g, c = out["gpu_util_pct"], out["server_cpu_cores"]
+        if g and c:
+            out["limit"] = ("gpu" if g["mean"] >= 85 else
+                            "host cpu (one core: the Python process)" if c["p95"] >= 0.9 and c["p95"] < 1.6 else
+                            "host cpu" if c["p95"] >= 0.85 * n_server_cpus else "neither saturated")
+        return out
+
+
 def main():
     subprocess.run(["bash", "-lc", f"[ -d {REPO} ] || git clone --quiet {REPO_URL} {REPO}"], check=True)
     subprocess.run(["git", "-C", REPO, "fetch", "--quiet", "origin", REF], check=True)
@@ -290,12 +348,19 @@ def main():
             runs = []
             for rate in RATES:
                 say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s")
-                r = load(url, bodies, rate, DURATION, client_cpus)
+                with Sampler(proc.pid) as smp:
+                    r = load(url, bodies, rate, DURATION, client_cpus)
+                r["resources"] = smp.summary(len(server_cpus))
+                say(f"{name}: {rate:.0f} QPS resources: GPU {r['resources']['gpu_util_pct']}, server CPU cores "
+                    f"{r['resources']['server_cpu_cores']} of {len(server_cpus)}; limit: {r['resources'].get('limit')}")
                 say(f"{name}: {rate:.0f} QPS -> achieved {r['achieved_qps']:.0f}, p50 {r['latency_ms']['p50']:.1f} ms, "
                     f"p99 {r['latency_ms']['p99']:.1f} ms, errors {r['errors']}, timeouts {r['timeouts']}, "
                     f"hits {r['hits_per_response']}, client lag p99 {r['client_send_lag_ms_p99']:.1f} ms"
                     + (" (CLIENT-LIMITED)" if r["client_limited"] else ""))
                 runs.append(r)
+                if r["achieved_qps"] < 0.9 * rate or r["timeouts"] + r["errors"] > 0.01 * r["sent"]:
+                    say(f"{name}: cannot sustain {rate:.0f} QPS; no higher rates (the same rule for every engine)")
+                    break
                 time.sleep(5)
             out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs}
         finally:
