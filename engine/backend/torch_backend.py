@@ -138,6 +138,13 @@ class TorchBackend:
     def segment_count(self, keys, n):
         return torch.bincount(keys, minlength=n).to(torch.int32)
 
+    def accumulator(self, n):
+        return torch.zeros(n, dtype=torch.float32 if self.accumulate == "float32" else torch.float64,
+                           device=self.device)
+
+    def add_unique(self, out, keys, values):
+        out[keys] = out[keys] + values.to(out.dtype)
+
     # ---- dense
     def matmul(self, a, b, chunk=65_536):
         # float64 accumulation, float32 result (see the numpy backend); a float32 GEMM is an S6 fast path.
@@ -158,15 +165,17 @@ class TorchBackend:
         if k == 0 or Q == 0:
             return (torch.full((Q, k), -1, dtype=torch.int32, device=self.device),
                     torch.full((Q, k), float("-inf"), device=self.device))
-        kth = torch.topk(s, k, dim=1).values[:, -1:]
-        gt = s > kth
-        need = k - gt.sum(dim=1, keepdim=True)
-        eq = s == kth
-        sel = gt | (eq & (torch.cumsum(eq.to(torch.int64), dim=1) <= need))
-        cols = torch.nonzero(sel, as_tuple=True)[1].view(Q, k)        # ascending index within each row
+        # S6-14: one top-k over a unique int64 key, (the score's order-preserving bits, then N-1-index), so the
+        # order is score descending, then index ascending, with no tie pass (the kth value, a cumsum over the row,
+        # a nonzero and a sort before). -0.0 is made +0.0 first: they compare equal as floats.
+        s = s + 0.0
+        bits = s.view(torch.int32).to(torch.int64)
+        ordered = torch.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+        shift = max(1, (N - 1).bit_length())
+        key = (ordered << shift) | (N - 1 - torch.arange(N, device=self.device, dtype=torch.int64))
+        top = torch.topk(key, k, dim=1).values
+        cols = (N - 1) - (top & ((1 << shift) - 1))
         vals = s.gather(1, cols)
-        order = torch.sort(vals, dim=1, descending=True, stable=True).indices
-        cols, vals = cols.gather(1, order), vals.gather(1, order)
         cols = cols.masked_fill(torch.isneginf(vals), -1)
         return cols.to(torch.int32), vals
 
