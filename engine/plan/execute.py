@@ -606,6 +606,42 @@ class Executor:
         out.append(int(doc))
         return out
 
+    def _sort_columns(self, plan, rows, first_offset, has_tier):
+        """``_sort_values`` for a whole page at once (S6-7, INTERFACES §5 "Columnar hits"): one column per position of
+        a hit's ``sort`` list, ``{"values", "missing"}``, so that expanding them gives exactly ``_sort_values``."""
+        st = self.st
+        out = []
+        j = 0
+        if has_tier:
+            out.append({"values": rows[:, 0].astype(np.int64), "missing": None})
+            j = 1
+        for k in plan.sort:
+            v = rows[:, j]
+            j += 1
+            miss = None
+            if k.field == "_score":
+                vals = v.astype(np.float64)
+            elif k.field == "_doc":
+                vals = v.astype(np.int64)
+            else:
+                inf = np.isinf(v)
+                miss = inf if inf.any() else None
+                safe = np.where(inf, 0.0, v)
+                if k.geo is not None:
+                    vals = safe.astype(np.float64)
+                elif k.field in st.keywords:
+                    kv = st.keywords[k.field].values
+                    vals = [kv[c] for c in safe.astype(np.int64).tolist()]
+                elif st.num_dtype[k.field] == "bool":
+                    vals = safe.astype(bool)
+                elif st.num_dtype[k.field].startswith("int"):
+                    vals = safe.astype(np.int64)
+                else:
+                    vals = safe.astype(np.float64)
+            out.append({"values": vals, "missing": miss})
+        out.append({"values": first_offset.astype(np.int64), "missing": None})
+        return out
+
     # ---- the ranker
     def _rescore(self, plan, score, match, ctx, timer):
         from ..rank.features import candidate_features
@@ -636,7 +672,7 @@ class Executor:
         return new, tier
 
     # ---- one batch
-    def run(self, plans: list[Plan]) -> list[dict]:
+    def run(self, plans: list[Plan], columns: bool = False) -> list[dict]:
         b, st = self.b, self.st
         timer = Timer(b)
         shared_t0 = time.perf_counter()
@@ -669,6 +705,23 @@ class Executor:
             if plan.collapse is not None:
                 group, group_keys = self._facet_codes(plan.collapse)
             extra_cols = [score, st.first_offset_dev] + ([group] if group is not None else [])
+            if columns and group is None and plan.highlight is None and not plan.explain:
+                ids_a, rows_a, extra_a = ops.page_arrays(b, keys, hits_mask, plan.from_, plan.size, after,
+                                                         extra=extra_cols, tiekey=st.first_offset_dev)
+                cols = {"_id": st.ids[ids_a].tolist(), "_score": extra_a[:, 0].astype(np.float32),
+                        "sort": self._sort_columns(plan, rows_a, extra_a[:, 1], tier is not None)}
+                t.lap("page")
+                resp = {"hits": {"total": total, "columns": cols}, **resp}
+                knn = _knn_methods(b, plan, self.knn_outcome)
+                if knn:
+                    resp["knn"] = knn
+                took = {k: round(v, 3) for k, v in shared.items()}
+                for k, v in t.laps.items():
+                    took[k] = round(took.get(k, 0.0) + v, 3)
+                took["total"] = round(shared_ms + t.total(), 3)
+                resp["took_ms"] = took
+                out.append(resp)
+                continue
             ids, rows, extra = ops.page(b, keys, hits_mask, plan.from_, plan.size, after, extra=extra_cols,
                                         tiekey=st.first_offset_dev, collapse=group)
             score_h = [e[0] for e in extra]

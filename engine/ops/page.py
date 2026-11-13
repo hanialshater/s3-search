@@ -6,6 +6,8 @@ float32 scores, doc ids and int32 values exactly).
 """
 from __future__ import annotations
 
+import numpy as np
+
 
 def after_mask(b, keys, after, tiekey=None):
     """``bool[N]``: entries strictly after ``after`` (one value per key, then the tie key) in the sort order. The tie
@@ -25,12 +27,23 @@ def page(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None
     """``keys``: list of ``(array[N], descending)``; the first may be the float32 score. ``extra``: arrays[N] to read
     at the page's docs (e.g. the score). Returns host ``(doc_ids list[int], key_values list[list], extra_values
     list[list])``."""
+    ids, kv, ev = page_arrays(b, keys, mask, from_, size, after, extra, tiekey, collapse)
+    return ids.tolist(), kv.tolist(), ev.tolist()
+
+
+def page_arrays(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None, collapse=None):
+    """``page`` as host arrays (S6-7): ``(doc_ids int64[h], key_values float64[h, len(keys)], extra_values
+    float64[h, len(extra)])``."""
+    nk, ne = len(keys), len(extra)
+
+    def empty():
+        return np.zeros(0, np.int64), np.zeros((0, nk)), np.zeros((0, ne))
     # collapse: int64[N] group codes (S7-3): only the first doc of each group in sort order is kept, and
     # from/size count groups.
     valid = mask if after is None else mask & after_mask(b, keys, after, tiekey)
     need = from_ + size
     if need == 0:
-        return [], [], []
+        return empty()
     if collapse is None and len(keys) == 1 and keys[0][1] and str(keys[0][0].dtype).endswith("float32"):
         idx, _ = b.topk(keys[0][0].reshape(1, -1), need, valid.reshape(1, -1))
         sel = b.astype(idx[0][from_:need], "int64")
@@ -48,12 +61,10 @@ def page(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None
             cand = cand[firsts[b.argsort(firsts)]]   # back in sort order
         sel = cand[from_:need]
     if sel.shape[0] == 0:
-        return [], [], []
+        return empty()
     safe = b.where(sel >= 0, sel, 0)
     cols = [b.astype(sel, "float64")] + [b.astype(k[safe], "float64") for k, _ in keys] + \
         [b.astype(e[safe], "float64") for e in extra]
     host = b.to_numpy(b.stack(cols, 1))             # the one transfer
     host = host[host[:, 0] >= 0]
-    nk = len(keys)
-    ids = host[:, 0].astype("int64").tolist()
-    return ids, host[:, 1:1 + nk].tolist(), host[:, 1 + nk:].tolist()
+    return host[:, 0].astype("int64"), host[:, 1:1 + nk], host[:, 1 + nk:]

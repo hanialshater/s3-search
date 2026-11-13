@@ -25,7 +25,7 @@ from .plan.execute import Executor
 from .plan.plan import plan as make_plan
 from .segment import SegmentArrays, read_segment, write_segment
 
-__all__ = ["build_index", "Index", "available_devices", "UnsupportedQuery", "InvalidRequest", "InvalidMapping",
+__all__ = ["build_index", "expand_hits", "Index", "available_devices", "UnsupportedQuery", "InvalidRequest", "InvalidMapping",
            "OverBudget", "DeviceUnavailable", "NoSuchKey", "CorruptSegment",
            "NotHot", "save_ranker", "load_ranker", "RANKER_FORMAT"]
 
@@ -198,19 +198,23 @@ class Index:
         return self._st.parts[0].segment_id if len(self._st.parts) == 1 else ""
 
     # ---- search
-    def search(self, request: dict) -> dict:
-        return self.search_batch([request])[0]
+    def search(self, request: dict, hits: str = "dicts") -> dict:
+        return self.search_batch([request], hits=hits)[0]
 
-    def search_batch(self, requests: list[dict]) -> list[dict]:
+    def search_batch(self, requests: list[dict], hits: str = "dicts") -> list[dict]:
+        """``hits``: "dicts" (the default) or "columns" (S6-7, INTERFACES §5 "Columnar hits"; ``expand_hits`` turns a
+        response back into the dict form)."""
         if not isinstance(requests, (list, tuple)):
             raise InvalidRequest("$", "search_batch takes a list of requests")
+        if hits not in ("dicts", "columns"):
+            raise ValueError(f"hits: 'dicts' or 'columns', not {hits!r}")
         st = self._st                     # one state for the whole batch, read once: no lock (S8-2c)
         plans, parse_ms = [], []
         for r in requests:
             t0 = time.perf_counter()
             plans.append(make_plan(r, st))
             parse_ms.append((time.perf_counter() - t0) * 1000.0)
-        out = Executor(st, self.rankers).run(plans) if plans else []
+        out = Executor(st, self.rankers).run(plans, columns=hits == "columns") if plans else []
         for resp, ms in zip(out, parse_ms):
             resp["took_ms"] = {"parse": round(ms, 3), **resp["took_ms"]}
             resp["took_ms"]["total"] = round(resp["took_ms"]["total"] + ms, 3)
@@ -301,6 +305,29 @@ def _copy_for_write(seg):
     c = copy.copy(seg)
     c.manifest = dict(seg.manifest)
     return c
+
+
+def expand_hits(response: dict) -> dict:
+    """A ``hits="columns"`` response in the dict form, exactly as ``hits="dicts"`` gives it (INTERFACES §5). A response
+    already in the dict form is returned unchanged."""
+    h = response.get("hits", {})
+    if "columns" not in h:
+        return response
+    c = h["columns"]
+
+    def py(col):
+        v, miss = col["values"], col["missing"]
+        vals = v if isinstance(v, list) else v.tolist()        # numpy -> int, float or bool
+        return vals if miss is None else [None if m else x for x, m in zip(vals, miss.tolist())]
+
+    sorts = [py(col) for col in c["sort"]]
+    hits = [{"_id": i, "_score": s, "sort": list(row)}
+            for i, s, row in zip(c["_id"], np.asarray(c["_score"], np.float32).astype(np.float64).tolist(),
+                                 zip(*sorts) if sorts else [()] * len(c["_id"]))]
+    out = dict(response)
+    out["hits"] = {k: v for k, v in h.items() if k != "columns"}
+    out["hits"]["hits"] = hits
+    return {"hits": out["hits"], **{k: v for k, v in out.items() if k != "hits"}}
 
 
 def build_index(catalogue: pd.DataFrame, mapping: dict, device: str = "cpu", accumulate: str | None = None) -> Index:
