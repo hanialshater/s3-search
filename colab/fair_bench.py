@@ -3,7 +3,7 @@
 
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
-        [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log]
+        [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97]
 
 --columns defaults to 1 since S6-7 (s3-search 67c1cd0): serving asks the engine for columnar hits. Runs before that
 commit were the dict form (--columns=0 now). --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
@@ -67,7 +67,8 @@ COLUMNS = opt("columns", "1")
 MPS = opt("mps", "0") == "1"
 FRONTS = int(opt("fronts", "0"))                             # S6-10s: front processes (0: not that layout)
 GPUS = int(opt("gpu-processes", "1"))
-LOG = opt("log", "/content/serving.log")                     # one server log per configuration
+LOG = opt("log", "/content/serving.log")
+SAMPLE_EVERY = int(opt("sample-every", "97"))               # every n-th request is kept and replayed unloaded                     # one server log per configuration
 OUT = opt("out", "/content/fair-bench.json")
 t_start = time.time()
 
@@ -141,7 +142,7 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                             why[str(r.status)] = why.get(str(r.status), 0) + 1
                             return
                     lat.append((time.time() - due) * 1e3)
-                    if i % 97 == 0:                          # sampled: hits, a digest, the bytes, who answered
+                    if i % SAMPLE_EVERY == 0:                # sampled: hits, a digest, the bytes, who answered
                         n_hits, digest = result_digest(raw)
                         hits.append(n_hits)
                         samples.append([i, n_hits, digest, r.headers.get("X-S3-Gpu-Process"),
