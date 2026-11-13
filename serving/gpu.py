@@ -125,11 +125,14 @@ class GpuServer:
         self.calls = ThreadPoolExecutor(1, thread_name_prefix="gpu-call")
         self.listener = unix_listen(sock_path)
         self._stop = threading.Event()
+        self.n_batches = self.n_requests = 0
+        self.busy_s = 0.0                                       # time inside search_batch (the batch loop's work)
 
     # -- connections
     def serve_forever(self) -> None:
         threading.Thread(target=self._batch_loop, name="gpu-batches", daemon=True).start()
         threading.Thread(target=self._publish_versions, name="gpu-versions", daemon=True).start()
+        threading.Thread(target=self._stats, name="gpu-stats", daemon=True).start()
         self.listener.settimeout(0.5)
         while not self._stop.is_set():
             try:
@@ -234,7 +237,11 @@ class GpuServer:
         if not items:
             return
         try:
+            tb = time.perf_counter()
             out, per_request = _search_batch(index, [it.request for it in items])
+            self.busy_s += time.perf_counter() - tb
+            self.n_batches += 1
+            self.n_requests += len(items)
             if len(out) != len(items):
                 raise RuntimeError(f"search_batch returned {len(out)} responses for {len(items)} requests")
         except Exception as exc:  # noqa: BLE001 - not one request's failure: one at a time, capped
@@ -273,6 +280,24 @@ class GpuServer:
         mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
         self._reply(it, ("search", it.id, "ok", resp, version, wait_ms))
 
+    # -- what the process is doing, every 5 s in its log (and gauges): batches, queue, device memory
+    def _stats(self, every: float = 5.0) -> None:
+        last = (0, 0, 0.0, time.perf_counter())
+        while not self._stop.wait(every):
+            nb, nr, busy, t = self.n_batches, self.n_requests, self.busy_s, time.perf_counter()
+            dt = t - last[3]
+            mem = device_memory()
+            m = self.app.metrics
+            m.set("s3_gpu_queue_depth", self.q.qsize())
+            for k, v in mem.items():
+                m.set("s3_device_memory_bytes", v, kind=k)
+            if nb != last[0] or self.q.qsize():
+                log.info("gpu process %d: %.0f req/s in %.1f batches/s (mean %.1f), search_batch busy %.0f%%, "
+                         "queue %d, device MiB %s", self.index, (nr - last[1]) / dt, (nb - last[0]) / dt,
+                         (nr - last[1]) / max(1, nb - last[0]), 100 * (busy - last[2]) / dt, self.q.qsize(),
+                         {k: round(v / 2**20) for k, v in mem.items()})
+            last = (nb, nr, busy, t)
+
     # -- versions for the fronts' caches
     def _publish_versions(self) -> None:
         if not self.state_dir:
@@ -291,6 +316,18 @@ class GpuServer:
                 os.replace(tmp, path)
                 last = now
             self._stop.wait(0.02)
+
+
+def device_memory() -> dict:
+    """torch's caching allocator on cuda: allocated (live tensors), reserved (held by the cache), peak allocated."""
+    try:
+        import torch
+        if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+            return {}
+        return {"allocated": torch.cuda.memory_allocated(), "reserved": torch.cuda.memory_reserved(),
+                "max_allocated": torch.cuda.max_memory_allocated()}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # ---- the front's client ---------------------------------------------------------------------------------------------------

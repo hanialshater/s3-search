@@ -350,6 +350,20 @@ def engine_target(ds, server_cpus):
     return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
 
 
+def _role(p) -> str:
+    """What a server process is, from its command line (supervisor, worker i, front i, gpu process j)."""
+    try:
+        a = p.cmdline()
+    except Exception:
+        return "?"
+    for flag, name in (("--gpu-process", "gpu process"), ("--gpu-sockets", "front"), ("--worker-index", "worker")):
+        if flag in a:
+            i = a.index(flag)
+            j = a[i + 1] if flag != "--gpu-sockets" else a[a.index("--worker-index") + 1] if "--worker-index" in a else "?"
+            return f"{name} {j}"
+    return "supervisor" if "serving" in " ".join(a) else a[0] if a else "?"
+
+
 class Sampler:
     """Every 0.5 s during a run: GPU utilisation and memory (nvidia-smi), and the server's CPU use (its whole process
     tree, in cores). Says whether the GPU or the host was the limit."""
@@ -357,6 +371,7 @@ class Sampler:
     def __init__(self, pid):
         import threading
         self.pid, self.gpu, self.mem, self.cpu = pid, [], [], []
+        self.per_cpu, self.per_mem, self.role = {}, {}, {}      # per process: cores and device MiB samples
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
 
@@ -377,9 +392,20 @@ class Sampler:
                     if p.pid not in procs:
                         procs[p.pid] = p
                         p.cpu_percent(None)                     # the first call only starts the counter
+                        self.role[p.pid] = _role(p)
                         continue
-                    total += procs[p.pid].cpu_percent(None)
+                    c = procs[p.pid].cpu_percent(None)
+                    total += c
+                    self.per_cpu.setdefault(p.pid, []).append(c / 100.0)
                 self.cpu.append(total / 100.0)
+            except Exception:
+                pass
+            try:                                                 # device memory per process (what grows, and where)
+                apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                                      capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+                for line in apps:
+                    pid, mib = (x.strip() for x in line.split(","))
+                    self.per_mem.setdefault(int(pid), []).append(float(mib))
             except Exception:
                 pass
 
@@ -398,11 +424,18 @@ class Sampler:
             return {"mean": float(np.mean(x)), "p95": float(np.percentile(x, 95)), "max": float(np.max(x))} if x else None
         out = {"gpu_util_pct": s(self.gpu[2:]), "gpu_mem_mib": s(self.mem), "server_cpu_cores": s(self.cpu[2:]),
                "server_cpus_available": n_server_cpus}
+        out["per_process"] = sorted(
+            ({"pid": pid, "role": self.role.get(pid, "?"), "cpu_cores": s(v[2:] or v),
+              "device_mib": s(self.per_mem.get(pid, []))} for pid, v in self.per_cpu.items() if v),
+            key=lambda r: -(r["cpu_cores"] or {}).get("p95", 0))[:12]
+        busiest = out["per_process"][0] if out["per_process"] else None
         g, c = out["gpu_util_pct"], out["server_cpu_cores"]
         if g and c:
             out["limit"] = ("gpu" if g["mean"] >= 85 else
                             "host cpu (one core: the Python process)" if WORKERS == 1 and not FRONTS and 0.9 <= c["p95"] < 1.6 else
-                            "host cpu" if c["p95"] >= 0.85 * n_server_cpus else "neither saturated")
+                            "host cpu" if c["p95"] >= 0.85 * n_server_cpus else
+                            f"one process at a core: {busiest['role']}" if busiest and busiest["cpu_cores"]
+                            and busiest["cpu_cores"]["p95"] >= 0.9 else "neither saturated")
         return out
 
 
