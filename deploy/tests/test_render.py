@@ -149,3 +149,10 @@ def test_merge_patch_nulls_what_vanished():
     new = {"phase": "Indexing", "indexJob": {"hash": "b", "state": "Active"}}
     assert merge_patch(prev, new) == {"phase": "Indexing", "gone": None,
                                       "indexJob": {"hash": "b", "state": "Active", "segmentId": None}}
+
+
+def test_serving_workers_reach_the_replica_env():
+    c = pod_spec(render.render_deployment(si(device="cuda", serving={"workers": 4}), "seg-1-aaaaaaaa"))["containers"][0]
+    assert {"name": "S3_SERVING_WORKERS", "value": "4"} in c["env"]
+    c = pod_spec(render.render_deployment(si(), "seg-1-aaaaaaaa"))["containers"][0]
+    assert not any(e["name"] == "S3_SERVING_WORKERS" for e in c["env"])
