@@ -689,7 +689,7 @@ class Executor:
         timer = Timer(b)
         shared_t0 = time.perf_counter()
         self._prefetch(plans, timer)
-        if self.BATCHED:
+        if self.BATCHED and len(plans) > 1:              # a batch of one: the per-plan path is cheaper (S6-9 profile)
             self._batched_fusion(plans, timer)
         shared = dict(timer.laps)
         shared_ms = (time.perf_counter() - shared_t0) * 1000.0
