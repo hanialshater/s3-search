@@ -2,10 +2,11 @@
 """Matched load test, the engine against OpenSearch on one Colab GPU machine: speed only, development only.
 
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
-        [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1]
+        [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
 
 --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
-its own copy of the index on the GPU); --columns=0 makes serving ask the engine for the dict form of the hits.
+its own copy of the index on the GPU); --columns=0 makes serving ask the engine for the dict form of the hits; --mps=1 starts the CUDA MPS daemon before
+the server, so the workers' kernels run on the GPU together instead of taking turns.
 
 What is matched, for each engine in turn (never both at once):
 - the corpus: every ESCI-US product (1,215,854), through referee/loader.py;
@@ -61,6 +62,7 @@ DURATION = float(opt("duration", "60"))
 ENGINES = opt("engines", "engine,opensearch").split(",")
 WORKERS = int(opt("workers", "1"))
 COLUMNS = opt("columns", "1")
+MPS = opt("mps", "0") == "1"
 OUT = opt("out", "/content/fair-bench.json")
 t_start = time.time()
 
@@ -269,6 +271,9 @@ def engine_target(ds, server_cpus):
     env = {**os.environ, "S3_SERVING_CACHE": "0", "S3_SERVING_MAX_BATCH": opt("max-batch", "64"),
            "S3_SERVING_MAX_WAIT_MS": opt("max-wait-ms", "2"), "S3_SEARCH_DEVICE": "cuda",
            "S3_SERVING_WORKERS": str(WORKERS), "S3_SERVING_COLUMNS": COLUMNS}
+    if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
+        subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
+        say("engine: CUDA MPS daemon started")
     port = free_port()
     cmd = ["taskset", "-c", ",".join(map(str, server_cpus)), sys.executable, "-m", "serving", "--data-dir",
            str(SERVE_DIR), "--device", "cuda", "--preload", "esci", "--port", str(port)]
@@ -372,7 +377,7 @@ def main():
     out = {"kind": "fair-bench", "label": "development only, never a score", "ref": REF, "commit": commit,
            "runtime": env, "cpus": os.cpu_count(), "client_cpus": client_cpus, "server_cpus": server_cpus,
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
-           "columns": COLUMNS, "engines": {}}
+           "columns": COLUMNS, "mps": MPS, "engines": {}}
     for name in ENGINES:
         target = engine_target if name == "engine" else opensearch_target
         try:
@@ -410,6 +415,8 @@ def main():
             stop(proc)
             time.sleep(5)
         json.dump(out, open(OUT, "w"), indent=1)
+    if MPS:
+        subprocess.run(["bash", "-c", "echo quit | nvidia-cuda-mps-control"])
     say("DONE")
     print(json.dumps(out, indent=1), flush=True)
 
