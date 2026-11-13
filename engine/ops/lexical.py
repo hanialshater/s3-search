@@ -92,21 +92,36 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
     w = b.asarray(w, "float32")
     bb = b.asarray(bb, "float32")
     for g in groups:
-        q_of, entry = b.csr_expand(st.term_ptr, [rows[i] for i in g], [owners[i] for i in g])
-        t_rep = b.csr_expand(st.term_ptr, [rows[i] for i in g], [rows[i] for i in g])[0]
-        if getattr(st, "post_live", None) is not None:      # a segment of a multi-segment index: dead copies out
-            keep = st.post_live[entry]
-            q_of, entry, t_rep = q_of[keep], entry[keep], t_rep[keep]
-        docs = st.doc_ids[entry]
-        tf = b.astype(st.tf[entry], "float32")
-        norm = (1.0 - bb) + bb * st.rel_len[docs]
-        norm = b.where(norm > 1e-6, norm, 1e-6)
-        ptf = sum_lr(w * tf / norm, 1)
-        imp = idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf)
-        keys = q_of * N + docs
-        scores = scores + b.segment_sum(keys, imp, Q * N)
-        hit = ptf > 0
-        nmatch = nmatch + b.segment_count(keys[hit], Q * N)
+        # S6-13: a group's addends summed by rounds, round r holding each query's r-th term of the group: within a
+        # round no (query, doc) key repeats (a query's terms are distinct, a term's postings name each doc once), so
+        # one gather-add-scatter per round sums them, in the accumulation dtype, in entry order, as segment_sum's
+        # sort-based kernel did. The result is bit for bit the same, without the sort.
+        acc = b.accumulator(Q * N)
+        cnt = b.zeros(Q * N, "int32")
+        rank, by_round = {}, []
+        for i in g:
+            r = rank.get(owners[i], 0)
+            rank[owners[i]] = r + 1
+            if r == len(by_round):
+                by_round.append([])
+            by_round[r].append(i)
+        for rr in by_round:
+            q_of, entry = b.csr_expand(st.term_ptr, [rows[i] for i in rr], [owners[i] for i in rr])
+            t_rep = b.csr_expand(st.term_ptr, [rows[i] for i in rr], [rows[i] for i in rr])[0]
+            if getattr(st, "post_live", None) is not None:      # a segment of a multi-segment index: dead copies out
+                keep = st.post_live[entry]
+                q_of, entry, t_rep = q_of[keep], entry[keep], t_rep[keep]
+            docs = st.doc_ids[entry]
+            tf = b.astype(st.tf[entry], "float32")
+            norm = (1.0 - bb) + bb * st.rel_len[docs]
+            norm = b.where(norm > 1e-6, norm, 1e-6)
+            ptf = sum_lr(w * tf / norm, 1)
+            imp = idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf)
+            keys = q_of * N + docs
+            b.add_unique(acc, keys, imp)
+            b.add_unique(cnt, keys, b.astype(ptf > 0, "int32"))
+        scores = scores + b.astype(acc, "float32")
+        nmatch = nmatch + cnt
     return scores.reshape(Q, N), nmatch.reshape(Q, N)
 
 

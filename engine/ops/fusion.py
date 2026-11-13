@@ -21,6 +21,8 @@ def rrf(b, ranked_ids, N: int, k: int = 60):
         flat = (rows.reshape(Q, 1) * N + ids)[ok]
         rb = b.zeros(Q * N, "float32")
         rb[flat] = r_full[ok]
-        score = score + b.segment_sum(flat, 1.0 / (k + r_full[ok]), Q * N)
+        # each list names a doc once per row, so its keys are distinct: one gather-add-scatter (S6-13) instead of a
+        # sort-based segment sum; one addend per key, so the float32 sum is the same
+        b.add_unique(score, flat, 1.0 / (k + r_full[ok]))
         ranks.append(rb.reshape(Q, N))
     return score.reshape(Q, N), ranks

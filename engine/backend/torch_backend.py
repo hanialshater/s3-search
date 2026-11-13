@@ -138,6 +138,13 @@ class TorchBackend:
     def segment_count(self, keys, n):
         return torch.bincount(keys, minlength=n).to(torch.int32)
 
+    def accumulator(self, n):
+        return torch.zeros(n, dtype=torch.float32 if self.accumulate == "float32" else torch.float64,
+                           device=self.device)
+
+    def add_unique(self, out, keys, values):
+        out[keys] = out[keys] + values.to(out.dtype)
+
     # ---- dense
     def matmul(self, a, b, chunk=65_536):
         # float64 accumulation, float32 result (see the numpy backend); a float32 GEMM is an S6 fast path.
