@@ -88,7 +88,7 @@ def handle_frame(app: App, req: dict) -> dict:
     return {"id": rid, "status": resp.status, "body": out, "headers": resp.headers}
 
 
-def make_rpc_server(app: App, host: str = "0.0.0.0", port: int = 0) -> socketserver.ThreadingTCPServer:
+def make_rpc_server(app: App, host: str = "0.0.0.0", port: int = 0, sock=None) -> socketserver.ThreadingTCPServer:
     class Handler(socketserver.BaseRequestHandler):
         def handle(self) -> None:
             sock = self.request
@@ -114,7 +114,10 @@ def make_rpc_server(app: App, host: str = "0.0.0.0", port: int = 0) -> socketser
         allow_reuse_address = True
         request_queue_size = 256
 
-    return Server((host, port), Handler)
+    if sock is None:
+        return Server((host, port), Handler)
+    from .workers import adopt
+    return adopt(Server((host, port), Handler, bind_and_activate=False), sock)
 
 
 class RpcClient:

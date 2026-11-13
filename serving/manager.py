@@ -25,7 +25,7 @@ from .config import ServingConfig
 from .errors import (IndexExists, InvalidRequestBody, NotReady, UnknownIndex, UnknownSegment)
 from .metrics import Metrics
 from .ports import Ports, read_manifest
-from .scheduler import BatchScheduler
+from .scheduler import BatchScheduler, search_batch
 
 log = logging.getLogger("serving")
 INTERVAL_RE = re.compile(r"^(-1|\d+(?:\.\d+)?)(ms|s|m|h)?$")
@@ -72,7 +72,8 @@ class ManagedIndex:
         self._store: Any = None
         self.cache = LRUCache(cfg.cache_size)
         self.scheduler = BatchScheduler(lambda: self.index, name=name, max_batch=cfg.max_batch,
-                                        max_wait_ms=cfg.max_wait_ms, max_queue=cfg.max_queue, metrics=metrics)
+                                        max_wait_ms=cfg.max_wait_ms, max_queue=cfg.max_queue, metrics=metrics,
+                                        columns=cfg.columns)
 
     # -- state ------------------------------------------------------------------------------------------------------
     @property
@@ -593,7 +594,7 @@ class ManagedIndex:
         if miss:
             self.metrics.inc("s3_batches_total", index=self.name)
             self.metrics.observe("s3_batch_size", len(miss), index=self.name)
-            resp = index.search_batch([requests[i] for i in miss])
+            resp = search_batch(index, [requests[i] for i in miss], self.cfg.columns)
             for i, r in zip(miss, resp):
                 out[i] = r
                 self.cache.put(keys[i], r)

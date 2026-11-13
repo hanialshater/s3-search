@@ -2,7 +2,12 @@
 """Matched load test, the engine against OpenSearch on one Colab GPU machine: speed only, development only.
 
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
-        [--duration=60] [--engines=engine,opensearch]
+        [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
+
+--columns defaults to 1 since S6-7 (s3-search 67c1cd0): serving asks the engine for columnar hits. Runs before that
+commit were the dict form (--columns=0 now). --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
+its own copy of the index on the GPU); --columns=0 makes serving ask the engine for the dict form of the hits; --mps=1 starts the CUDA MPS daemon before
+the server, so the workers' kernels run on the GPU together instead of taking turns.
 
 What is matched, for each engine in turn (never both at once):
 - the corpus: every ESCI-US product (1,215,854), through referee/loader.py;
@@ -56,6 +61,10 @@ RATES = [float(x) for x in opt("qps", "250,500,1000,2000,4000").split(",")]
 K = int(opt("k", "2000"))
 DURATION = float(opt("duration", "60"))
 ENGINES = opt("engines", "engine,opensearch").split(",")
+WORKERS = int(opt("workers", "1"))
+COLUMNS = opt("columns", "1")
+MPS = opt("mps", "0") == "1"
+OUT = opt("out", "/content/fair-bench.json")
 t_start = time.time()
 
 
@@ -245,6 +254,10 @@ def opensearch_target(ds, server_cpus):
     return proc, f"{base}/{ix.name}/_search", body, build_s
 
 
+def stop_mps():
+    subprocess.run(["bash", "-c", "echo quit | nvidia-cuda-mps-control"], check=False)
+
+
 def engine_target(ds, server_cpus):
     SERVE_DIR.mkdir(parents=True, exist_ok=True)
     m = copy.deepcopy(ds.mapping)
@@ -261,7 +274,13 @@ def engine_target(ds, server_cpus):
                        check=True)
     build_s = time.time() - t0
     env = {**os.environ, "S3_SERVING_CACHE": "0", "S3_SERVING_MAX_BATCH": opt("max-batch", "64"),
-           "S3_SERVING_MAX_WAIT_MS": opt("max-wait-ms", "2"), "S3_SEARCH_DEVICE": "cuda"}
+           "S3_SERVING_MAX_WAIT_MS": opt("max-wait-ms", "2"), "S3_SEARCH_DEVICE": "cuda",
+           "S3_SERVING_WORKERS": str(WORKERS), "S3_SERVING_COLUMNS": COLUMNS}
+    if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
+        import atexit
+        subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
+        atexit.register(stop_mps)                            # stopped however the run ends
+        say("engine: CUDA MPS daemon started")
     port = free_port()
     cmd = ["taskset", "-c", ",".join(map(str, server_cpus)), sys.executable, "-m", "serving", "--data-dir",
            str(SERVE_DIR), "--device", "cuda", "--preload", "esci", "--port", str(port)]
@@ -273,8 +292,12 @@ def engine_target(ds, server_cpus):
     except Exception:
         stop(proc)
         raise
+    if WORKERS > 1:                                          # every worker loaded, not only the first (/readyz says)
+        wait_until(lambda: http_json("GET", f"http://localhost:{port}/readyz", timeout=5).get("workers_ready", 0)
+                   >= WORKERS, f"{WORKERS} workers loaded", 1800, proc=proc, log="/content/serving.log")
     say(f"engine: serving on cuda (index built in {build_s:.0f} s; query cache off, max_batch "
-        f"{env['S3_SERVING_MAX_BATCH']}, max_wait {env['S3_SERVING_MAX_WAIT_MS']} ms)")
+        f"{env['S3_SERVING_MAX_BATCH']}, max_wait {env['S3_SERVING_MAX_WAIT_MS']} ms, workers {WORKERS}, "
+        f"columns {COLUMNS})")
     tmpl = json.loads(Path("referee/requests/bm25f-tuned.json").read_text())
 
     def body(q):
@@ -336,7 +359,7 @@ class Sampler:
         g, c = out["gpu_util_pct"], out["server_cpu_cores"]
         if g and c:
             out["limit"] = ("gpu" if g["mean"] >= 85 else
-                            "host cpu (one core: the Python process)" if c["p95"] >= 0.9 and c["p95"] < 1.6 else
+                            "host cpu (one core: the Python process)" if WORKERS == 1 and 0.9 <= c["p95"] < 1.6 else
                             "host cpu" if c["p95"] >= 0.85 * n_server_cpus else "neither saturated")
         return out
 
@@ -365,7 +388,8 @@ def main():
     say(f"{len(ds.catalogue):,} products, {len(texts):,} query texts, depth {K}, rates {RATES} QPS x {DURATION:.0f} s")
     out = {"kind": "fair-bench", "label": "development only, never a score", "ref": REF, "commit": commit,
            "runtime": env, "cpus": os.cpu_count(), "client_cpus": client_cpus, "server_cpus": server_cpus,
-           "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "engines": {}}
+           "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
+           "columns": COLUMNS, "mps": MPS, "engines": {}}
     for name in ENGINES:
         target = engine_target if name == "engine" else opensearch_target
         try:
@@ -373,7 +397,7 @@ def main():
         except Exception as e:                                   # recorded; the other engine still runs
             say(f"{name}: FAILED to start: {e}")
             out["engines"][name] = {"error": str(e)[-3000:]}
-            json.dump(out, open("/content/fair-bench.json", "w"), indent=1)
+            json.dump(out, open(OUT, "w"), indent=1)
             continue
         try:
             bodies = [json.dumps(make_body(t)).encode() for t in texts]
@@ -402,7 +426,7 @@ def main():
         finally:
             stop(proc)
             time.sleep(5)
-        json.dump(out, open("/content/fair-bench.json", "w"), indent=1)
+        json.dump(out, open(OUT, "w"), indent=1)
     say("DONE")
     print(json.dumps(out, indent=1), flush=True)
 
