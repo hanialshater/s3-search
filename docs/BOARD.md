@@ -76,6 +76,7 @@ Status values: open · claimed · in review · done.
 | S6-4 | Query encode reads only the components rows a query uses (the A100 profile at 87baeec: encode 150.8 ms of a 272.6 ms pipeline query, from copying all V x 128 components to float64 per call); bit-equal to before | in review | architect, 2026-11-13 |
 | S6-5 | The rank stage (100.7 ms p50 at batch 1): the profile's ranker ran the engine's own tree walk (`add_ranker` defaults to `runtime="engine"`: one small kernel per tree and depth), not XGBoost; measure `runtime="auto"`/`"fil"`, and walk all trees at once | in review | architect, 2026-11-13 (e108d2b; A100 profile: rank 100.7 -> 3.62 ms, pipeline batch 1 p50 272.6 -> 23.4 ms) |
 | S6-6 | Batching does not pay: lexical `search_batch` stays at about 200 QPS at batch 16, 64 and 128, and the pipeline at 4 QPS (per-query work inside the batch: encode, rescore, facets, page) | open | |
+| S6-7 | At depth 2,000 over HTTP the engine's server is one saturated Python core with the GPU at 7% (load test of 2026-11-13: 50 QPS sustained, collapse at 100; OpenSearch the same on 8 cores): hit materialisation and JSON per hit in `Executor.run`, and `serving`'s single GIL-bound `ThreadingHTTPServer`. Engine side (vectorised hits) for the architect; the server (processes or a faster encoder) is the platform-engineer's area | open | |
 
 ## S7 · Feature coverage (architect, platform-engineer, tools-engineer, evaluation-steward)
 
