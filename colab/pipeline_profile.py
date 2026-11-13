@@ -102,8 +102,13 @@ def main():
     threading.Thread(target=heartbeat, args=(stop,), daemon=True).start()
     if not os.path.isdir(REPO):
         subprocess.run(["git", "clone", "--quiet", REPO_URL, REPO], check=True)
-    subprocess.run(["git", "-C", REPO, "fetch", "--quiet", "origin", REF], check=True)
-    subprocess.run(["git", "-C", REPO, "checkout", "--quiet", "FETCH_HEAD"], check=True)
+    # a branch or a full sha fetches by name; a short sha does not, so then fetch every branch and resolve it
+    if subprocess.run(["git", "-C", REPO, "fetch", "--quiet", "origin", REF]).returncode == 0:
+        subprocess.run(["git", "-C", REPO, "checkout", "--quiet", "FETCH_HEAD"], check=True)
+    else:
+        subprocess.run(["git", "-C", REPO, "fetch", "--quiet", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+                       check=True)
+        subprocess.run(["git", "-C", REPO, "checkout", "--quiet", REF], check=True)
     os.chdir(REPO)
     sys.path.insert(0, REPO)
     os.environ.setdefault("S3_SEARCH_DATA", os.path.join(REPO, "data", "esci"))
