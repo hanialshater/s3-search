@@ -2,6 +2,7 @@
 """Profile the full search pipeline on a Colab GPU: speed only, development only, never a score.
 
     colab run --gpu A100 --timeout 900 colab/pipeline_profile.py [branch-or-commit] [--queries=1000]
+        [--runtime=engine[,auto,...]]  (the pipeline is measured once per ranker runtime)
 
 The pipeline is the prototype's (S6): tuned BM25F and dense retrieval (tfidf-svd-128), RRF over a 20,000 window, the
 GBDT ranker over the top 1,000, two terms facets and page 1. It reads only what members may read (referee/loader.py):
@@ -25,6 +26,8 @@ REPO = "/content/s3-search"
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 REF = args[0] if args else "main"
 N_QUERIES = next((int(a.split("=", 1)[1]) for a in sys.argv[1:] if a.startswith("--queries=")), 1000)
+# The ranker's runtime (Index.add_ranker): "engine" (its own device walk) was the only one before 2026-11-13.
+RUNTIMES = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--runtime=")), "engine").split(",")
 BATCHES = (1, 16, 64, 128)
 S6_QPS, S6_P99_MS = 694, 35.0
 
@@ -136,19 +139,23 @@ def main():
     model = train_ranker(index, ds.fit, lambda q: {"query": pipeline_request(q)["query"],
                                                    "rank": pipeline_request(q)["rank"]},
                          window=1000, n_random=20, max_queries=2000)
-    index.add_ranker("gbdt", model)
+    index.add_ranker("gbdt", model, runtime=RUNTIMES[0])
     train_s = time.perf_counter() - t0
     say(f"ranker: trained on 2,000 fit queries in {train_s:.1f} s")
     texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
     result = {"kind": "pipeline-profile", "label": "development only, never a score", "ref": REF, "commit": commit,
               "runtime": env, "n_products": int(len(ds.catalogue)), "n_queries": len(texts),
-              "build_s": build_s, "ranker_train_s": train_s,
+              "build_s": build_s, "ranker_train_s": train_s, "ranker_runtime": RUNTIMES[0],
               "lexical": measure(index, lexical_request, texts, "lexical"),
               "pipeline": measure(index, pipeline_request, texts, "pipeline")}
     best = max(result["pipeline"]["throughput"].values(), key=lambda v: v["qps"] if v["batch_p99_ms"] <= S6_P99_MS else -1)
     result["s6"] = {"bar": {"qps": S6_QPS, "p99_ms": S6_P99_MS},
                     "best_qps_within_p99": best["qps"] if best["batch_p99_ms"] <= S6_P99_MS else None,
                     "page1_p99_ms_batch_1": result["pipeline"]["batch_1"]["p99_ms"]}
+    for rt in RUNTIMES[1:]:                       # the same pipeline with the ranker on another runtime
+        index.add_ranker("gbdt", model, runtime=rt)
+        say(f"pipeline with the ranker on runtime {rt!r} ({type(index.rankers['gbdt']).__name__})")
+        result.setdefault("pipeline_by_runtime", {})[rt] = measure(index, pipeline_request, texts, f"pipeline/{rt}")
     stop.set()
     json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
     say("DONE")
