@@ -123,8 +123,12 @@ class App:
                 return "healthz", _json(200, {"status": "ok"})
             if path == "/readyz":
                 ok = self.manager.ready() and not self.draining
-                return "readyz", _json(200 if ok else 503, {"ready": ok, "draining": self.draining,
-                                                           "indexes": self.manager.names()})
+                body = {"ready": ok, "draining": self.draining, "indexes": self.manager.names()}
+                if self.cfg.worker_index is not None:
+                    from .workers import workers_ready
+                    body.update(worker=self.cfg.worker_index, workers=self.cfg.workers,
+                                workers_ready=workers_ready(self.cfg.worker_state))
+                return "readyz", _json(200 if ok else 503, body)
             if path == "/metrics":
                 return "metrics", Response(200, self.metrics.render().encode(), "text/plain; version=0.0.4")
             return "indexes", _json(200, [self.manager.get(n).info() for n in self.manager.names()])

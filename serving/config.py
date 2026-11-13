@@ -36,6 +36,7 @@ class ServingConfig:
     workers: int = 1                  # worker processes (serving/workers.py); more than 1 is read-only
     read_only: bool = False           # set in each worker when workers > 1: writes and admin calls are refused
     worker_index: int | None = None   # this process's number among the workers (None: not a worker)
+    worker_state: str | None = None   # the supervisor's state directory (ready-<i> files), S3_SERVING_WORKER_STATE
     refresh_interval: str = "500ms"     # default index.refresh_interval (-1 turns the background refresh off)
     bulk_chunk: int = 2000            # actions applied per store batch while a _bulk body streams in
     request_timeout_s: float = 30.0
@@ -61,6 +62,7 @@ class ServingConfig:
         cfg.cache_size = int(e.get("S3_SERVING_CACHE", cfg.cache_size))
         cfg.columns = e.get("S3_SERVING_COLUMNS", "1").strip().lower() not in ("0", "false", "no", "off")
         cfg.workers = max(1, int(e.get("S3_SERVING_WORKERS", cfg.workers)))
+        cfg.worker_state = e.get("S3_SERVING_WORKER_STATE") or None
         cfg.refresh_interval = e.get("S3_SERVING_REFRESH_INTERVAL", cfg.refresh_interval)
         cfg.bulk_chunk = int(e.get("S3_SERVING_BULK_CHUNK", cfg.bulk_chunk))
         cfg.drain_seconds = float(e.get("S3_SERVING_DRAIN_SECONDS", cfg.drain_seconds))

@@ -13,6 +13,9 @@ kernel's accept queue spreads connections over the workers and a connection stay
 - **Start-up.** Worker 0 accepts at once, so ``/healthz`` answers while the segment loads and ``/readyz`` says 503 until
   it is loaded. The other workers accept only once their own preload is done, so a request never reaches a worker that
   is still loading once worker 0 is ready.
+- **Readiness of the set.** ``/readyz`` (any worker) also says ``"workers"`` (N) and ``"workers_ready"`` (how many
+  have loaded their indexes), from a state directory the supervisor shares with its workers. Readiness itself stays
+  the answering worker's own.
 - **Per worker:** the query cache, the batching scheduler and ``/metrics`` (a scrape reads the worker that took the
   connection). Every response carries ``X-S3-Worker`` (the worker's number).
 - **Threads.** Each worker's OpenMP/BLAS pools default to its share of the CPUs (``OMP_NUM_THREADS`` and the like,
@@ -25,14 +28,43 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 log = logging.getLogger("serving.workers")
+
+
+def mark_ready(state_dir: str | None, i: int) -> None:
+    """A worker says it has loaded its preloaded indexes (the supervisor's state directory)."""
+    if state_dir:
+        try:
+            open(os.path.join(state_dir, f"ready-{i}"), "w").close()
+        except OSError:
+            pass
+
+
+def clear_ready(state_dir: str | None, i: int) -> None:
+    if state_dir:
+        try:
+            os.unlink(os.path.join(state_dir, f"ready-{i}"))
+        except OSError:
+            pass
+
+
+def workers_ready(state_dir: str | None) -> int | None:
+    """How many workers have loaded (None outside a supervisor)."""
+    if not state_dir:
+        return None
+    try:
+        return sum(1 for f in os.listdir(state_dir) if f.startswith("ready-"))
+    except OSError:
+        return 0
 
 
 def _cores() -> int:
@@ -92,6 +124,7 @@ class Supervisor:
         self.procs: list[subprocess.Popen | None] = [None] * n
         self.started = [0.0] * n
         self.stopping = threading.Event()
+        self.state_dir = tempfile.mkdtemp(prefix="s3-workers-")   # ready-<i> per loaded worker (``/readyz``)
 
     def _cmd(self, i: int) -> list[str]:
         cmd = [sys.executable, "-m", "serving", *self.argv, "--worker-index", str(i),
@@ -102,7 +135,8 @@ class Supervisor:
 
     def _start(self, i: int) -> None:
         fds = (self.http.fileno(),) + ((self.rpc.fileno(),) if self.rpc is not None else ())
-        env = {**os.environ, "S3_SERVING_WORKERS": str(self.n)}
+        clear_ready(self.state_dir, i)
+        env = {**os.environ, "S3_SERVING_WORKERS": str(self.n), "S3_SERVING_WORKER_STATE": self.state_dir}
         share = str(max(1, _cores() // self.n))                  # N workers x all-core thread pools oversubscribe
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             env.setdefault(var, share)
@@ -135,6 +169,7 @@ class Supervisor:
                 if self.stopping.is_set() or p is None or p.poll() is None:
                     continue
                 if i not in due:
+                    clear_ready(self.state_dir, i)
                     young = now - self.started[i] < 60
                     pause[i] = min(60.0, pause[i] * 2) if young else self.restart_pause_s
                     log.error("worker %d (pid %d) exited with %s; starting it again in %.0f s", i, p.pid,
@@ -151,6 +186,7 @@ class Supervisor:
         self.http.close()
         if self.rpc is not None:
             self.rpc.close()
+        shutil.rmtree(self.state_dir, ignore_errors=True)
         stopped = (-signal.SIGTERM, -signal.SIGINT)              # a worker still loading dies of the signal itself
         return max((abs(p.returncode) for p in self.procs
                     if p is not None and p.returncode is not None and p.returncode not in stopped), default=0)

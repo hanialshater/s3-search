@@ -54,6 +54,8 @@ def _serve(args: argparse.Namespace) -> int:
     if sock is not None and args.worker_index:                  # workers after the first accept once loaded
         app.preload()
         logging.info("worker %s preloaded %s", args.worker_index, [n for n, _ in cfg.preload])
+        from .workers import mark_ready
+        mark_ready(cfg.worker_state, args.worker_index)
     server = make_server(app, sock=sock)
     extra = ()
     if cfg.rpc_port or rpc_sock is not None:
@@ -66,6 +68,9 @@ def _serve(args: argparse.Namespace) -> int:
         try:
             app.preload()
             logging.info("preloaded %s", [n for n, _ in cfg.preload])
+            if cfg.worker_index is not None:
+                from .workers import mark_ready
+                mark_ready(cfg.worker_state, cfg.worker_index)
         except Exception:  # noqa: BLE001
             logging.exception("preload failed; staying not-ready")
 

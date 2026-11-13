@@ -90,7 +90,12 @@ def test_workers_share_the_port_and_answer_the_same(built):
     proc = _start(built, 3, port)
     url = f"http://127.0.0.1:{port}/indexes/toy/_search"
     try:
-        time.sleep(3)                                  # workers 1 and 2 start accepting once their preload is done
+        t_end = time.time() + 120                      # workers 1 and 2 start accepting once their preload is done
+        while json.loads(_http("GET", f"http://127.0.0.1:{port}/readyz")[1]).get("workers_ready") != 3:
+            assert time.time() < t_end, "the workers did not all load"
+            time.sleep(0.2)
+        rz = json.loads(_http("GET", f"http://127.0.0.1:{port}/readyz")[1])
+        assert rz["workers"] == 3 and rz["ready"] is True and rz["worker"] in (0, 1, 2)
         seen = set()
 
         def one(i):
