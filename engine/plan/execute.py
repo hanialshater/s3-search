@@ -689,7 +689,7 @@ class Executor:
     # kept the host from queueing the next plan's work); its took_ms stages are then host times. True: as before.
     SYNC_PLAN_TIMES = False
 
-    def run(self, plans: list[Plan], columns: bool = False) -> list[dict]:
+    def run(self, plans: list[Plan], columns: bool = False, ids_bytes: bool = False) -> list[dict]:
         b, st = self.b, self.st
         timer = Timer(b)
         shared_t0 = time.perf_counter()
@@ -753,7 +753,8 @@ class Executor:
                                                    count=sx["hits_mask"])
                 ids_a = None
             if want_columns:
-                cols = {"_id": st.ids[ids_a].tolist(), "_score": extra_a[:, 0].astype(np.float32),
+                cols = {"_id": st.ids_bytes()[ids_a] if ids_bytes else st.ids[ids_a].tolist(),
+                        "_score": extra_a[:, 0].astype(np.float32),
                         "sort": self._sort_columns(plan, rows_a, extra_a[:, 1], tier is not None)}
                 t.lap("page")
                 resp = {"hits": {"total": total, "columns": cols}, **resp}
@@ -962,6 +963,8 @@ class Executor:
 
         totals, pages = {}, {}
         for tiered in (False, True):
+            if tiered and len(states) == 1:              # a batch of one: the per-plan page is cheaper (S6-12)
+                continue
             want = is_tiered if tiered else is_plain
             for ch in self._chunks([i for i, sx in enumerate(states) if self.BATCHED and want(sx)]):
                 t0 = time.perf_counter()
