@@ -80,15 +80,38 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
         return scores.reshape(Q, N), nmatch.reshape(Q, N)
     host_ptr = st.host_term_ptr
     lens = [int(host_ptr[t + 1] - host_ptr[t]) for t in rows]
-    chunk, start, acc = [], 0, 0
-    groups = []
-    for i, n in enumerate(lens):
-        if acc + n > MAX_POSTINGS_PER_CHUNK and chunk:
+    # Chunks of at most MAX_POSTINGS_PER_CHUNK postings (device memory), ending only between queries (S6-16): a query
+    # cut over two chunks would sum its terms as float32 partials, which can round differently from the same query
+    # alone, so batch invariance would break when a batch is large. A query that alone exceeds the limit starts its
+    # own chunks and is cut at the same terms as when it is alone.
+    groups, chunk, acc = [], [], 0
+    i = 0
+    for q, ts in enumerate(terms):
+        idx = list(range(i, i + len(ts)))
+        i += len(ts)
+        if not idx:
+            continue
+        n_q = sum(lens[j] for j in idx)
+        if chunk and acc + n_q > MAX_POSTINGS_PER_CHUNK:
             groups.append(chunk)
             chunk, acc = [], 0
-        chunk.append(i)
-        acc += n
-    groups.append(chunk)
+        if n_q > MAX_POSTINGS_PER_CHUNK:                 # alone too big: cut by its own cumulative count, as alone
+            if chunk:
+                groups.append(chunk)
+                chunk, acc = [], 0
+            for j in idx:
+                if acc + lens[j] > MAX_POSTINGS_PER_CHUNK and chunk:
+                    groups.append(chunk)
+                    chunk, acc = [], 0
+                chunk.append(j)
+                acc += lens[j]
+            groups.append(chunk)
+            chunk, acc = [], 0
+            continue
+        chunk += idx
+        acc += n_q
+    if chunk:
+        groups.append(chunk)
     w = b.asarray(w, "float32")
     bb = b.asarray(bb, "float32")
     for g in groups:
