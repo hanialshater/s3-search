@@ -16,6 +16,7 @@ Status values: open · claimed · in review · done.
 | B1-4 | The freshness check: 10,000 hot-field changes; time to visible at p99; results equal to a rebuild | in review | evaluation-steward, 2026-11-09 |
 | B1-5 | The DSL conformance suite: 200 requests, replayed against OpenSearch and the engine (feeds S3) | in review | evaluation-steward, 2026-11-09 |
 | B1-6 | `referee full` and the Colab notebook wired to the engine's API | in review | evaluation-steward, 2026-11-09 |
+| B1-7 | Review of the referee changes the coordinator made out of process (ba28176: `--bm25`, per-field b in the reference, the three request files); results that record what ran (request and BM25 files with sha256, OpenSearch analyzer and version, clean tree, caveats); no score of record with the contract skipped; the notebook's OpenSearch cell (title-only and cross_fields). Claimed after the review had started (the steward was sent the task directly); recorded here per P4 | in review | evaluation-steward, 2026-11-13 |
 
 ## S1 · GPU operators (architect)
 
