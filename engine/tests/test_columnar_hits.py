@@ -68,3 +68,36 @@ def test_dict_form_passes_through_and_bad_values_are_refused(ds):
     assert api.expand_hits(r) is r
     with pytest.raises(ValueError):
         ix.search({"query": {"match_all": {}}}, hits="arrays")
+
+
+@pytest.mark.parametrize("device", api.available_devices())
+def test_ids_as_bytes_expand_to_the_same_dicts(device, ds):
+    """S6-12: ids="bytes" gives _id as one S<w> array; expanded, the response equals the dict form."""
+    ix = api.build_index(ds.catalogue, ds.mapping, device=device)
+    reqs = _requests(ds)
+    for d, c in zip(ix.search_batch(reqs), ix.search_batch(reqs, hits="columns", ids="bytes")):
+        if "columns" in c["hits"]:
+            col = c["hits"]["columns"]["_id"]
+            assert isinstance(col, np.ndarray) and col.dtype.kind == "S"
+        assert _without_took(api.expand_hits(c)) == _without_took(d)
+    with pytest.raises(ValueError):
+        ix.search(reqs[0], ids="bytes")                        # only with hits="columns"
+
+
+def test_ids_bytes_follow_writes_and_unicode(ds):
+    """The bytes copy is extended by add_segment, carried over by clones, and holds UTF-8 of any id."""
+    from engine.build import build_segment
+    cat = ds.catalogue.copy()
+    id_field = ds.mapping["_meta"]["engine"]["id_field"]
+    cat[id_field] = [f"é-{i}" if i % 7 == 0 else str(v) for i, v in enumerate(cat[id_field])]
+    ix = api.Index(build_segment(cat.iloc[:150], ds.mapping, version=1))
+    q = {"query": {"match_all": {}}, "size": 300}
+    before = ix.search(q, hits="columns", ids="bytes")
+    assert _without_took(api.expand_hits(before)) == _without_took(ix.search(q))
+    delta = cat.iloc[150:].copy()
+    delta[id_field] = [f"longer-unicode-id-ü-{i}" for i in range(len(delta))]    # wider than any id before
+    ix.add_segment(build_segment(delta, ds.mapping, version=2), version=2)
+    ix.patch(ds.mapping["_meta"]["engine"]["hot"][0], [cat[id_field].iloc[0]], [1.0])   # a clone of the state
+    after = ix.search(q, hits="columns", ids="bytes")
+    assert _without_took(api.expand_hits(after)) == _without_took(ix.search(q))
+    assert ix._st.ids_bytes().tolist() == [str(i).encode("utf-8") for i in ix._st.ids]

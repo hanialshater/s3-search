@@ -627,6 +627,16 @@ engine.api.expand_hits(response) -> dict                        # columns -> the
   form is returned unchanged.
 - Serving owns the bytes (JSON or otherwise) it builds from the columns; the HTTP response it sends is unchanged
   (section 7). Columns are host arrays (numpy), never device tensors.
+- **Ids as one bytes array (S6-12, additive, opt-in; 2026-11-13, architect).** `search(request, hits="columns",
+  ids="bytes")` and `search_batch(requests, hits="columns", ids="bytes")` return `hits.columns._id` as one numpy
+  array of dtype `S<w>` (h entries): each id UTF-8 encoded, `w` the index's longest encoded id, shorter ids padded
+  with NUL bytes (numpy drops trailing NULs when an entry is read; ids never end in NUL). `ids="str"` (the default)
+  is the `list[str]` above. It applies only with `hits="columns"` (`ValueError` otherwise) and to the responses in
+  the columnar form. Why: a GPU process pickles 64 replies of 2,000 ids per batch, and a list of 2,000 str pickles
+  about seven times slower than one bytes array (23.8 against 3.3 ms per batch of 64 on CPU; unpickling 13.9
+  against 1.7 ms). `engine.api.expand_hits` decodes it (`_id` = `entry.decode("utf-8")`), so the dict form, and
+  serving's bytes, are unchanged. The engine keeps a bytes copy of its ids, updated with each segment added, so a
+  page reads it with one gather.
 
 **The engine in one GPU process (S6-10, engine side; 2026-11-13, architect).** Serving may run one GPU process that
 holds the only `Index` (one index copy on the device) and calls `search_batch` for requests gathered from several CPU
@@ -1015,3 +1025,6 @@ status:
   and the architect proposed the same shape): section 5 says what `search_batch` promises a GPU process serving
   several front processes. New, additive: `search_batch(..., errors="return")` puts a refused request's error in its
   slot instead of failing the batch (default `"raise"`, unchanged). The process architecture is section 7's.
+- 2026-11-13, architect (S6-12, from the platform-engineer's S6-10s finding that one GPU process spends its own core on
+  pickling replies): section 5's columnar hits gain `ids="bytes"`, `_id` as one numpy `S<w>` array instead of a list
+  of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.

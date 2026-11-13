@@ -47,10 +47,10 @@ def test_an_execution_time_refusal_is_attributed_to_its_request(segment, catalog
     ix = ranked_index(segment, catalogue, "cpu")
     real = E.Executor.run
 
-    def run(self, plans, columns=False):
+    def run(self, plans, columns=False, **kw):
         if any(p.size == 7 for p in plans):
             raise api.InvalidRequest("size", "refused while running (test)")
-        return real(self, plans, columns=columns)
+        return real(self, plans, columns=columns, **kw)
     monkeypatch.setattr(E.Executor, "run", run)
     reqs = [{"query": {"match_all": {}}, "size": 3}, {"query": {"match_all": {}}, "size": 7}]
     out = ix.search_batch(reqs, errors="return")
