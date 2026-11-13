@@ -46,6 +46,42 @@ def build_index(catalogue: pd.DataFrame, mapping: dict, device: str = "cpu") -> 
     return ReferenceIndex(catalogue, mapping)
 
 
+BM25_KEYS = ("k1", "b", "b_default")
+
+
+def bm25_params(bm25, text_fields) -> tuple:
+    """``_meta.engine.bm25`` (INTERFACES section 2): ``k1`` >= 0 (default 1.2) and ``b`` in [0, 1] (default 0.75), where
+    ``b`` is one number for every text field, or a map of text field -> b with ``b_default`` (default 0.75) for the
+    fields it does not name. ``b_default`` without a map, a map key that is not a text field, or a value out of range
+    is an InvalidMapping naming the path. Returns (k1, b for unnamed fields, {field: b}). Written by the steward from
+    the interface, not from the engine's parser, so the reference stays an independent oracle."""
+    if not isinstance(bm25, dict):
+        raise InvalidMapping("_meta.engine.bm25: an object with k1 and b")
+
+    def number(path, v, lo, hi):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise InvalidMapping(f"{path}: a number") from None
+        if not (lo <= v <= hi):
+            raise InvalidMapping(f"{path}: a number in [{lo}, {hi}]")
+        return v
+
+    k1 = number("_meta.engine.bm25.k1", bm25.get("k1", 1.2), 0.0, math.inf)
+    raw_b = bm25.get("b", 0.75)
+    if isinstance(raw_b, dict):
+        b_default = number("_meta.engine.bm25.b_default", bm25.get("b_default", 0.75), 0.0, 1.0)
+        field_b = {}
+        for f, v in raw_b.items():
+            if f not in text_fields:
+                raise InvalidMapping(f"_meta.engine.bm25.b.{f}: not a text field")
+            field_b[f] = number(f"_meta.engine.bm25.b.{f}", v, 0.0, 1.0)
+        return k1, b_default, field_b
+    if "b_default" in bm25:
+        raise InvalidMapping("_meta.engine.bm25.b_default: only with a per-field b map")
+    return k1, number("_meta.engine.bm25.b", raw_b, 0.0, 1.0), {}
+
+
 def _clauses(x):
     return [] if x is None else (list(x) if isinstance(x, list) else [x])
 
@@ -57,11 +93,9 @@ class ReferenceIndex:
         eng = mapping.get("_meta", {}).get("engine", {})
         self.mapping = mapping
         self.id_field = eng.get("id_field", "product_id")
-        bm = eng.get("bm25", {})
-        self.k1 = float(bm.get("k1", 1.2))
-        raw_b = bm.get("b", 0.75)                 # a number, or a map of text field -> b (b_default for the rest)
-        self.b = float(bm.get("b_default", 0.75)) if isinstance(raw_b, dict) else float(raw_b)
-        self.field_b = {f: float(v) for f, v in raw_b.items()} if isinstance(raw_b, dict) else {}
+        text_fields = [f for f, sp in mapping["properties"].items() if isinstance(sp, dict) and sp.get("type") == "text"]
+        # k1, and b as a number or a map of text field -> b (b_default for the rest); refused as the engine refuses
+        self.k1, self.b, self.field_b = bm25_params(eng.get("bm25", {}), text_fields)
         self.hot = set(eng.get("hot", []))
         self.ids = catalogue[self.id_field].astype(str).to_numpy(dtype=object)
         self.row_of = {d: i for i, d in enumerate(self.ids)}
