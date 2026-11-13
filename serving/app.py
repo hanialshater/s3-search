@@ -37,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl
 
 from . import bulk as bulk_mod
+from . import encode as encode_mod
 from . import metrics as metrics_mod
 from .config import ServingConfig
 from .errors import (BadJSON, InvalidRequestBody, MethodNotAllowed, NotFound, NotReady, ServingError, classify)
@@ -64,6 +65,16 @@ class Response:
 
 def _json(status: int, obj, headers: dict | None = None) -> Response:
     return Response(status, json.dumps(obj, separators=(",", ":")).encode(), headers=headers or {})
+
+
+def _search_json(obj, headers: dict | None = None) -> Response:
+    """A search response (or an ``_msearch`` list): the same bytes as ``_json``, columnar hits encoded without a dict
+    per hit (serving/encode.py, S6-7)."""
+    return Response(200, encode_mod.encode(obj), headers=headers or {})
+
+
+# what a read-only worker (``workers`` > 1) still answers; every other route is refused with 405
+_READ_ACTIONS = {"_search", "_msearch", "_mapping", "versions"}
 
 
 class App:
@@ -98,6 +109,8 @@ class App:
             self.metrics.inc("s3_errors_total", type=obj["error"]["type"])
             resp = _json(status, obj)
         resp.headers["X-Request-Id"] = rid
+        if self.cfg.worker_index is not None:
+            resp.headers["X-S3-Worker"] = str(self.cfg.worker_index)
         self.metrics.inc("s3_http_requests_total", route=route, status=str(resp.status))
         log.debug("req=%s %s %s -> %s %.1fms", rid, method, path, resp.status, (time.perf_counter() - t0) * 1000)
         return resp
@@ -119,6 +132,9 @@ class App:
         if not m:
             raise NotFound(f"no route {path}", path=path)
         name, action = m.group(1), m.group(2)
+        if self.cfg.read_only and not (method == "GET" or action in _READ_ACTIONS):
+            raise MethodNotAllowed(f"this server runs {self.cfg.workers} worker processes and serves reads only; "
+                                   "writes and admin calls go to a single-worker server (S3_SERVING_WORKERS=1)")
         if action is None:
             if method == "PUT":
                 return "create", self._create(name, body)
@@ -167,8 +183,9 @@ class App:
             raise
         mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
         if src not in (None, False):
+            resp = encode_mod.expand_columns(resp)        # a new dict: the cached response is not changed
             mi.attach_source(resp, src)
-        return _json(200, resp, {"X-S3-Cache": info["cache"], "X-S3-Queue-Ms": f"{info['queue_ms']:.3f}",
+        return _search_json(resp, {"X-S3-Cache": info["cache"], "X-S3-Queue-Ms": f"{info['queue_ms']:.3f}",
                                  "X-S3-Serve-Ms": f"{info['serve_ms']:.3f}"})
 
     def _msearch(self, mi, body: bytes) -> Response:
@@ -181,10 +198,11 @@ class App:
             mi.metrics.inc("s3_search_requests_total", len(requests), index=mi.name, outcome="error")
             raise
         mi.metrics.inc("s3_search_requests_total", len(requests), index=mi.name, outcome="ok")
-        for r, resp in zip(requests, out):
+        for i, r in enumerate(requests):
             if r.get("_source") not in (None, False):
-                mi.attach_source(resp, r["_source"])
-        return _json(200, out)
+                out[i] = encode_mod.expand_columns(out[i])
+                mi.attach_source(out[i], r["_source"])
+        return _search_json(out)
 
     def _create(self, name: str, body: bytes) -> Response:
         spec = self._parse(body)
@@ -250,7 +268,8 @@ def create_app(config: ServingConfig | None = None, ports: Ports | None = None) 
 
 
 # ---- the standard-library server --------------------------------------------------------------------------------------
-def make_server(app: App, host: str | None = None, port: int | None = None) -> ThreadingHTTPServer:
+def make_server(app: App, host: str | None = None, port: int | None = None, sock=None) -> ThreadingHTTPServer:
+    """``sock``: an inherited listening socket to accept from (a worker of ``serving/workers.py``) instead of binding."""
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "s3-serving"
@@ -282,7 +301,11 @@ def make_server(app: App, host: str | None = None, port: int | None = None) -> T
         daemon_threads = True
         request_queue_size = 256
 
-    return Server((host if host is not None else app.cfg.host, app.cfg.port if port is None else port), Handler)
+    addr = (host if host is not None else app.cfg.host, app.cfg.port if port is None else port)
+    if sock is None:
+        return Server(addr, Handler)
+    from .workers import adopt
+    return adopt(Server(addr, Handler, bind_and_activate=False), sock)
 
 
 def serve_forever(app: App, server: ThreadingHTTPServer, extra: tuple = ()) -> None:
