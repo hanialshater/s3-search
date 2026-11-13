@@ -80,6 +80,7 @@ Status values: open · claimed · in review · done.
 | S6-8 | Batched rescoring: the candidates' features and the ranker for every rescored plan of a batch at once (the A100 profile at 3ea8950: features 4.3 ms and rank 1.4 ms per query, pipeline 75 QPS at batch 64), equal to the per-plan path | in review | architect, 2026-11-13 (1b3256b; A100 profile: pipeline batch 64 75 -> 113 QPS) |
 | S6-9 | Batched fusion: the dense top-k masks and each hybrid query's RRF windows and fusion for every plan of a batch at once (the A100 profile at 1b3256b: fuse 4.7 ms per query, pipeline 113 QPS at batch 64), equal to the per-plan path | in review | architect, 2026-11-13 (b75d708, dcdcadb; A100 profile: pipeline batch 64 113 -> 177 QPS) |
 | S6-10 | One GPU process for every worker, engine side: INTERFACES §5 "The engine in one GPU process" (what search_batch promises, errors="return"); the process architecture and section 7 are the platform-engineer's | in review | architect, 2026-11-13 (contract 2da9b47, errors="return" 211a50c) |
+| S6-11 | The per-plan work left in a batch: device syncs per plan and stage, the per-plan filter and mask kernels, the candidate stacking; measured with a kernel and sync count (the A100 profile at 211a50c: 179 QPS pipeline, 693 lexical at batch 64, per GPU process) | claimed | architect, 2026-11-13 |
 
 ## S7 · Feature coverage (architect, platform-engineer, tools-engineer, evaluation-steward)
 
