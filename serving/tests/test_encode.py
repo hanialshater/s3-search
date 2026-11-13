@@ -75,3 +75,23 @@ def test_ids_as_a_bytes_array_encode_the_same():
         as_bytes = {**r, "hits": {**r["hits"], "columns": {**r["hits"]["columns"], "_id": arr}}}
         assert enc.encode(as_bytes) == enc.encode(as_str) == _dumps(enc.expand(as_str))
         assert enc.expand(as_bytes) == enc.expand(as_str)
+
+
+def test_bytes_ids_from_the_engine_encode_the_same():
+    """S6-12 on every device: ids="bytes" responses encode to the bytes of the dict form."""
+    import inspect
+    if "ids" not in inspect.signature(api.Index.search_batch).parameters:
+        pytest.skip("the engine has no ids= yet")
+    from engine.tests.test_columnar_hits import _requests, _without_took
+    from referee import loader
+    ds = loader.load_dataset("toy")
+    for device in api.available_devices():
+        ix = api.build_index(ds.catalogue, ds.mapping, device=device)
+        reqs = _requests(ds)
+        n = 0
+        for r, d, c in zip(reqs, ix.search_batch(reqs), ix.search_batch(reqs, hits="columns", ids="bytes")):
+            if "columns" in c["hits"]:
+                n += isinstance(c["hits"]["columns"]["_id"], np.ndarray)
+            assert enc.encode(_without_took(c)) == _dumps(_without_took(d)), r
+            assert enc.expand_columns(c) == api.expand_hits(c), r
+        assert n >= len(reqs) // 2

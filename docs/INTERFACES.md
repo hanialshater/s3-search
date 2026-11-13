@@ -575,7 +575,9 @@ Scoring, exactly:
   `first_offset` (the global tie key; for an index built from a catalogue it is 0..N-1, the doc id, as before). A missing field value sorts as `None`. Under
   `rescore`, the first value is the tier (1 inside the rescored window, 0 below it), so the window comes first.
 - `aggregations` is present only when requested. `took_ms` always has `total`, plus each stage that ran; stage names
-  are the closed set above plus `encode` (additive).
+  are the closed set above plus `encode` (additive). Inside a `search_batch` of two or more requests, a request's own stages are host times
+  (the device is not synchronised between plans, S6-11); its shared stages, and every stage of a single request, are
+  device times as before.
 - `explain` (when requested) is a list in hit order, Lucene-shaped: `{_id, op, value, description, details}` per hit,
   with per term and per field contributions and, under `rescore`, each feature's contribution. Every node has `op`,
   which says how its value comes from its `details` (`description` is for people; tools check by `op`):
@@ -625,6 +627,16 @@ engine.api.expand_hits(response) -> dict                        # columns -> the
   form is returned unchanged.
 - Serving owns the bytes (JSON or otherwise) it builds from the columns; the HTTP response it sends is unchanged
   (section 7). Columns are host arrays (numpy), never device tensors.
+- **Ids as one bytes array (S6-12, additive, opt-in; 2026-11-13, architect).** `search(request, hits="columns",
+  ids="bytes")` and `search_batch(requests, hits="columns", ids="bytes")` return `hits.columns._id` as one numpy
+  array of dtype `S<w>` (h entries): each id UTF-8 encoded, `w` the index's longest encoded id, shorter ids padded
+  with NUL bytes (numpy drops trailing NULs when an entry is read; ids never end in NUL). `ids="str"` (the default)
+  is the `list[str]` above. It applies only with `hits="columns"` (`ValueError` otherwise) and to the responses in
+  the columnar form. Why: a GPU process pickles 64 replies of 2,000 ids per batch, and a list of 2,000 str pickles
+  about seven times slower than one bytes array (23.8 against 3.3 ms per batch of 64 on CPU; unpickling 13.9
+  against 1.7 ms). `engine.api.expand_hits` decodes it (`_id` = `entry.decode("utf-8")`), so the dict form, and
+  serving's bytes, are unchanged. The engine keeps a bytes copy of its ids, updated with each segment added, so a
+  page reads it with one gather.
 
 **The engine in one GPU process (S6-10, engine side; 2026-11-13, architect).** Serving may run one GPU process that
 holds the only `Index` (one index copy on the device) and calls `search_batch` for requests gathered from several CPU
@@ -766,7 +778,10 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     with the fewest requests in flight.
   - **GPU processes** (`serving/gpu.py`) each hold one copy of each preloaded index and a full `App`. A batch loop
     makes one `search_batch(requests, hits="columns", errors="return")` call at a time, with at most 64 requests:
-    whatever has queued when the last call returned, with no batch window. **Only `explain` and `highlight` requests
+    whatever has queued when the last call returned, with no batch window. When the engine takes `ids` (S6-12) the GPU process and
+    the single-process scheduler ask for `ids="bytes"`: `_id` is one numpy `S<w>` array. It pickles about 7x faster,
+    and the encoder writes its bytes as they are when they are plain ASCII (else it decodes and escapes them); the
+    HTTP bytes are unchanged. **Only `explain` and `highlight` requests
     run in batches of their own.** Filters, field sorts, aggregations and collapse share a batch: §5 makes them cost
     more, never answer differently. Route more only if a measurement shows it is needed.
   - **Errors.** An `{"error": {"type": <engine class name>, ...}}` entry maps to §7's snake_case type and status
@@ -1083,3 +1098,8 @@ status:
   - the transport's trust boundary is stated;
   - K > 1 runs under MPS from the start;
   - columns are pickled as they are.
+- 2026-11-13, architect (S6-12, from the platform-engineer's S6-10s finding that one GPU process spends its own core on
+  pickling replies): section 5's columnar hits gain `ids="bytes"`, `_id` as one numpy `S<w>` array instead of a list
+  of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.
+- 2026-11-13, platform-engineer (S6-12s): serving asks for `ids="bytes"` when the engine takes it, and encodes it to the
+  same bytes (section 7, "One GPU process").

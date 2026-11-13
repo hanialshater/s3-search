@@ -87,5 +87,6 @@ def candidate_features_batch(ex, ctxs, cand):
     mf = st.match_fields()
     match_codes = [[st.keywords[f].matched_codes(t) for t in q_tokens] for f in mf]
     kw_codes = [st.keywords[f].codes for f in mf]
-    X = ops.gather_features(b, cand, *bufs, match_codes, kw_codes, st.static_features(), q_len, n_match)
+    kw_sizes = [len(st.keywords[f].values) for f in mf]
+    X = ops.gather_features(b, cand, *bufs, match_codes, kw_codes, st.static_features(), q_len, n_match, kw_sizes)
     return X, cand

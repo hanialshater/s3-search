@@ -78,12 +78,14 @@ def _knn_methods(b, plan, outcome=None) -> dict:
     return out
 
 class Timer:
-    def __init__(self, b):
+    def __init__(self, b, sync: bool = True):
         self.b, self.laps, self.t0 = b, defaultdict(float), time.perf_counter()
         self.t = self.t0
+        self.sync = sync
 
     def lap(self, name):
-        self.b.synchronize()
+        if self.sync:                                 # a device sync, so the lap holds the stage's device time
+            self.b.synchronize()
         now = time.perf_counter()
         self.laps[name] += (now - self.t) * 1000.0
         self.t = now
@@ -683,8 +685,11 @@ class Executor:
     # plain score-sorted pages for the whole batch, each in one transfer; the rest per plan, as before.
     BATCH_ROWS = 64                                   # plans stacked per [B, N] step (bounds the device memory)
     BATCHED = True                                    # False: every plan on the per-plan path (the reference)
+    # S6-11: inside a batch of two or more, a plan's own stage laps do not sync the device (a sync per plan and stage
+    # kept the host from queueing the next plan's work); its took_ms stages are then host times. True: as before.
+    SYNC_PLAN_TIMES = False
 
-    def run(self, plans: list[Plan], columns: bool = False) -> list[dict]:
+    def run(self, plans: list[Plan], columns: bool = False, ids_bytes: bool = False) -> list[dict]:
         b, st = self.b, self.st
         timer = Timer(b)
         shared_t0 = time.perf_counter()
@@ -695,7 +700,7 @@ class Executor:
         shared_ms = (time.perf_counter() - shared_t0) * 1000.0
         states = []
         for plan in plans:
-            t = Timer(b)
+            t = Timer(b, sync=self.SYNC_PLAN_TIMES or len(plans) == 1)
             ctx = {"explain": {} if plan.explain else None}
             self.knn_outcome = {}
             score, match = self.eval(plan.root, ctx)
@@ -748,7 +753,8 @@ class Executor:
                                                    count=sx["hits_mask"])
                 ids_a = None
             if want_columns:
-                cols = {"_id": st.ids[ids_a].tolist(), "_score": extra_a[:, 0].astype(np.float32),
+                cols = {"_id": st.ids_bytes()[ids_a] if ids_bytes else st.ids[ids_a].tolist(),
+                        "_score": extra_a[:, 0].astype(np.float32),
                         "sort": self._sort_columns(plan, rows_a, extra_a[:, 1], tier is not None)}
                 t.lap("page")
                 resp = {"hits": {"total": total, "columns": cols}, **resp}
@@ -949,27 +955,59 @@ class Executor:
                     and p.sort[0].field == "_score" and p.sort[0].descending and p.from_ + p.size > 0
                     and str(sx["score"].dtype).endswith("float32"))
 
+        def is_tiered(sx):                                # S6-11: a rescored plan sorted by score: tier, then score
+            p = sx["plan"]
+            return (sx["tier"] is not None and p.collapse is None and not p.search_after and len(p.sort) == 1
+                    and p.sort[0].field == "_score" and p.sort[0].descending and p.from_ + p.size > 0
+                    and str(sx["score"].dtype).endswith("float32"))
+
         totals, pages = {}, {}
-        for ch in self._chunks([i for i, sx in enumerate(states) if self.BATCHED and is_plain(sx)]):
-            t0 = time.perf_counter()
-            G = len(ch)
-            V = b.stack([states[i]["hits_mask"] for i in ch], 0)
-            S = b.stack([states[i]["score"] for i in ch], 0)
-            idx, _ = b.topk(S, max(states[i]["plan"].from_ + states[i]["plan"].size for i in ch), V)
-            need = idx.shape[1]                           # min(the largest from + size, N)
-            idx = b.astype(idx, "int64")
-            safe = b.where(idx >= 0, idx, 0)
-            rows = b.arange(G).reshape(G, 1)
-            buf = b.stack([b.astype(idx, "float64"), b.astype(S[rows, safe], "float64"),
-                           b.astype(st.first_offset_dev[safe], "float64")], 2)         # [G, need, 3]
-            host = b.to_numpy(b.concatenate([b.astype(b.count_nonzero(V, axis=1), "float64"), buf.reshape(-1)], 0))
-            pg = host[G:].reshape(G, need, 3)                # one transfer for the chunk: totals, then pages
-            ms = (time.perf_counter() - t0) * 1000.0 / G
-            for r, i in enumerate(ch):
-                p = states[i]["plan"]
-                totals[i] = int(host[r])
-                h = pg[r, p.from_:p.from_ + p.size]
-                h = h[h[:, 0] >= 0]
-                pages[i] = (h[:, 0].astype("int64"), h[:, 1:2], h[:, 1:3])
-                states[i]["page_ms"] = ms
+        for tiered in (False, True):
+            if tiered and len(states) == 1:              # a batch of one: the per-plan page is cheaper (S6-12)
+                continue
+            want = is_tiered if tiered else is_plain
+            for ch in self._chunks([i for i, sx in enumerate(states) if self.BATCHED and want(sx)]):
+                t0 = time.perf_counter()
+                G = len(ch)
+                V = b.stack([states[i]["hits_mask"] for i in ch], 0)
+                S = b.stack([states[i]["score"] for i in ch], 0)
+                k = max(states[i]["plan"].from_ + states[i]["plan"].size for i in ch)
+                rows = b.arange(G).reshape(G, 1)
+                if not tiered:
+                    idx, _ = b.topk(S, k, V)
+                    idx = b.astype(idx, "int64")
+                    tier_col = None
+                else:
+                    # The page order is tier descending, then score descending, then doc id: the top-k of the window's
+                    # docs (tier 1), then the top-k of the rest (tier 0). Each top-k's valid entries are a prefix of
+                    # its row, so row r takes its first c1 entries from the first list and the rest from the second.
+                    T = b.stack([states[i]["tier"] for i in ch], 0) > 0
+                    i1, _ = b.topk(S, k, V & T)
+                    i0, _ = b.topk(S, k, V & ~T)
+                    i1, i0 = b.astype(i1, "int64"), b.astype(i0, "int64")
+                    kk = i1.shape[1]
+                    c1 = b.sum(b.astype(i1 >= 0, "int64"), axis=1).reshape(G, 1)
+                    pos = b.arange(kk).reshape(1, kk)
+                    first = pos < c1
+                    j0 = b.where(first, 0, pos - c1)
+                    idx = b.where(first, i1, i0[rows, j0])
+                    tier_col = b.astype(first, "float64")
+                need = idx.shape[1]                       # min(the largest from + size, N)
+                safe = b.where(idx >= 0, idx, 0)
+                cols = [b.astype(idx, "float64")] + ([tier_col] if tiered else []) + \
+                    [b.astype(S[rows, safe], "float64"), b.astype(st.first_offset_dev[safe], "float64")]
+                w = len(cols)
+                buf = b.stack(cols, 2)                    # [G, need, w]
+                host = b.to_numpy(b.concatenate([b.astype(b.count_nonzero(V, axis=1), "float64"), buf.reshape(-1)],
+                                                0))
+                pg = host[G:].reshape(G, need, w)            # one transfer for the chunk: totals, then pages
+                ms = (time.perf_counter() - t0) * 1000.0 / G
+                for r, i in enumerate(ch):
+                    p = states[i]["plan"]
+                    totals[i] = int(host[r])
+                    h = pg[r, p.from_:p.from_ + p.size]
+                    h = h[h[:, 0] >= 0]
+                    # key values (tier and score, or score) and extra values (score, first_offset), as page_arrays
+                    pages[i] = (h[:, 0].astype("int64"), h[:, 1:w - 1], h[:, w - 2:w])
+                    states[i]["page_ms"] = ms
         return totals, pages

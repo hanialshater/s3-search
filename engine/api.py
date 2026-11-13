@@ -198,10 +198,11 @@ class Index:
         return self._st.parts[0].segment_id if len(self._st.parts) == 1 else ""
 
     # ---- search
-    def search(self, request: dict, hits: str = "dicts") -> dict:
-        return self.search_batch([request], hits=hits)[0]
+    def search(self, request: dict, hits: str = "dicts", ids: str = "str") -> dict:
+        return self.search_batch([request], hits=hits, ids=ids)[0]
 
-    def search_batch(self, requests: list[dict], hits: str = "dicts", errors: str = "raise") -> list[dict]:
+    def search_batch(self, requests: list[dict], hits: str = "dicts", errors: str = "raise",
+                     ids: str = "str") -> list[dict]:
         """``hits``: "dicts" (the default) or "columns" (S6-7, INTERFACES §5 "Columnar hits"; ``expand_hits`` turns a
         response back into the dict form). ``errors`` (S6-10, §5 "The engine in one GPU process"): "raise" (the
         default: a refused request raises) or "return" (a refused request gets ``{"error": {type, path, reason}}``
@@ -212,6 +213,8 @@ class Index:
             raise ValueError(f"hits: 'dicts' or 'columns', not {hits!r}")
         if errors not in ("raise", "return"):
             raise ValueError(f"errors: 'raise' or 'return', not {errors!r}")
+        if ids not in ("str", "bytes") or (ids == "bytes" and hits != "columns"):
+            raise ValueError(f"ids: 'str', or 'bytes' with hits='columns' (S6-12), not {ids!r} with hits={hits!r}")
         st = self._st                     # one state for the whole batch, read once: no lock (S8-2c)
         plans, parse_ms, refused = [], [], {}
         for i, r in enumerate(requests):
@@ -229,14 +232,14 @@ class Index:
             parse_ms.append((time.perf_counter() - t0) * 1000.0)
         columns = hits == "columns"
         try:
-            done = Executor(st, self.rankers).run([p for _, p in plans], columns=columns) if plans else []
+            done = Executor(st, self.rankers).run([p for _, p in plans], columns=columns, ids_bytes=ids == "bytes") if plans else []
         except UnsupportedQuery:          # refused while it ran (one request's): find which, the rest answered alone
             if errors == "raise":
                 raise
             done = []
             for i, p in plans:
                 try:
-                    done.extend(Executor(st, self.rankers).run([p], columns=columns))
+                    done.extend(Executor(st, self.rankers).run([p], columns=columns, ids_bytes=ids == "bytes"))
                 except UnsupportedQuery as e:
                     done.append(_error_entry(e))
         for (i, _), resp, ms in zip(plans, done, parse_ms):
@@ -352,9 +355,12 @@ def expand_hits(response: dict) -> dict:
         return vals if miss is None else [None if m else x for x, m in zip(vals, miss.tolist())]
 
     sorts = [py(col) for col in c["sort"]]
+    id_list = c["_id"]
+    if isinstance(id_list, np.ndarray):                     # ids="bytes" (S6-12): UTF-8, NUL-padded
+        id_list = [x.decode("utf-8") for x in id_list.tolist()]
     hits = [{"_id": i, "_score": s, "sort": list(row)}
-            for i, s, row in zip(c["_id"], np.asarray(c["_score"], np.float32).astype(np.float64).tolist(),
-                                 zip(*sorts) if sorts else [()] * len(c["_id"]))]
+            for i, s, row in zip(id_list, np.asarray(c["_score"], np.float32).astype(np.float64).tolist(),
+                                 zip(*sorts) if sorts else [()] * len(id_list))]
     out = dict(response)
     out["hits"] = {k: v for k, v in h.items() if k != "columns"}
     out["hits"]["hits"] = hits

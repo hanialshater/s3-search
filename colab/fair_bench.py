@@ -361,7 +361,7 @@ def _role(p) -> str:
             i = a.index(flag)
             j = a[i + 1] if flag != "--gpu-sockets" else a[a.index("--worker-index") + 1] if "--worker-index" in a else "?"
             return f"{name} {j}"
-    return "supervisor" if "serving" in " ".join(a) else a[0] if a else "?"
+    return "server" if "serving" in " ".join(a) else a[0] if a else "?"     # the supervisor, or a single process
 
 
 class Sampler:
