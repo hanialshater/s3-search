@@ -79,6 +79,7 @@ Status values: open · claimed · in review · done.
 | S6-6 | Batching does not pay: lexical `search_batch` stays at about 200 QPS at batch 16, 64 and 128, and the pipeline at 4 QPS (per-query work inside the batch: encode, rescore, facets, page) | in review | architect, 2026-11-13 (3ea8950; A100 profile: lexical batch 64 201 -> 689 QPS, pipeline 58.7 -> 75 QPS) |
 | S6-7 | At depth 2,000 over HTTP the engine's server is one saturated Python core with the GPU at 7% (load test of 2026-11-13: 50 QPS sustained, collapse at 100; OpenSearch the same on 8 cores): hit materialisation and JSON per hit in `Executor.run`, and `serving`'s single GIL-bound `ThreadingHTTPServer`. Engine side (vectorised hits) for the architect; the server (processes or a faster encoder) is the platform-engineer's area | in review (engine side, 043205e, 8119836) | architect, 2026-11-13 (engine side: columnar hits, INTERFACES §5); the server side is the platform-engineer's |
 | S6-8 | Batched rescoring: the candidates' features and the ranker for every rescored plan of a batch at once (the A100 profile at 3ea8950: features 4.3 ms and rank 1.4 ms per query, pipeline 75 QPS at batch 64), equal to the per-plan path | in review | architect, 2026-11-13 (1b3256b; A100 profile: pipeline batch 64 75 -> 113 QPS) |
+| S6-9 | Batched fusion: the dense top-k masks and each hybrid query's RRF windows and fusion for every plan of a batch at once (the A100 profile at 1b3256b: fuse 4.7 ms per query, pipeline 113 QPS at batch 64), equal to the per-plan path | in review | architect, 2026-11-13 (b75d708, dcdcadb; A100 profile: pipeline batch 64 113 -> 177 QPS) |
 
 ## S7 · Feature coverage (architect, platform-engineer, tools-engineer, evaluation-steward)
 
@@ -142,7 +143,7 @@ for an engine change.
 
 | Id | Item | Owner | Status | Claimed |
 |---|---|---|---|---|
-| CI-1 | `colab/gpu_ci.py` (referee fast and the engine tests on a Colab GPU) and `engine/tests/test_write_paths_devices.py` (every write path on each device against cpu). Built out of process by the coordinator (ba28176); reviewed by the architect | architect | in review | architect, 2026-11-13 |
+| CI-1 | `colab/gpu_ci.py` (referee fast and the engine tests on a Colab GPU) and `engine/tests/test_write_paths_devices.py` (every write path on each device against cpu). Built out of process by the coordinator (ba28176); reviewed by the architect; a serving-tests suite and short shas (b75d708, from the platform-engineer) | architect | in review | architect, 2026-11-13 |
 | CI-2 | A CPU Colab runner for the referee and the engine tests at `requirements.txt`'s versions, for machines whose local Python cannot run them | architect | open | |
 
 ## S10 · A PyTerrier-style pipeline DSL (architect)
