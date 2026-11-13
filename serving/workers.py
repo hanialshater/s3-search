@@ -18,7 +18,8 @@ kernel's accept queue spreads connections over the workers and a connection stay
 - **Threads.** Each worker's OpenMP/BLAS pools default to its share of the CPUs (``OMP_NUM_THREADS`` and the like,
   unless set).
 - **Signals.** SIGTERM or SIGINT to the supervisor is passed to every worker, which drains as a single server does
-  (readiness fails, ``drain_seconds``, then stop). A worker that exits on its own is started again after a pause.
+  (readiness fails, ``drain_seconds``, then stop). A worker that exits on its own is started again after a pause (2 s, doubling to 60 s while it keeps dying
+  within a minute of its start).
 """
 from __future__ import annotations
 
@@ -83,12 +84,13 @@ def inherited(fd: int | None) -> socket.socket | None:
 class Supervisor:
     """Starts ``n`` workers on shared sockets, restarts one that dies, passes SIGTERM/SIGINT on."""
 
-    def __init__(self, n: int, host: str, port: int, rpc_port: int, argv: list[str], restart_pause_s: float = 2.0):
+    def __init__(self, n: int, host: str, port: int, rpc_port: int, argv: list[str], restart_pause_s: float = 1.0):
         self.n, self.argv, self.restart_pause_s = n, list(argv), restart_pause_s
         self.http = listen(host, port)
         self.rpc = listen(host, rpc_port) if rpc_port else None
         self.port = self.http.getsockname()[1]
         self.procs: list[subprocess.Popen | None] = [None] * n
+        self.started = [0.0] * n
         self.stopping = threading.Event()
 
     def _cmd(self, i: int) -> list[str]:
@@ -105,6 +107,7 @@ class Supervisor:
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             env.setdefault(var, share)
         self.procs[i] = subprocess.Popen(self._cmd(i), pass_fds=fds, env=env)
+        self.started[i] = time.monotonic()
         log.info("worker %d started (pid %d) on port %d", i, self.procs[i].pid, self.port)
 
     def start(self) -> "Supervisor":
@@ -124,13 +127,22 @@ class Supervisor:
     def wait(self, timeout: float | None = None) -> int:
         """Supervise until every worker has exited after a stop; returns the highest worker exit code."""
         t_end = None if timeout is None else time.monotonic() + timeout
+        due: dict[int, float] = {}                              # worker -> when to start it again
+        pause = [self.restart_pause_s] * self.n                  # doubles while a worker keeps dying young (to 60 s)
         while True:
+            now = time.monotonic()
             for i, p in enumerate(self.procs):
-                if p is not None and p.poll() is not None and not self.stopping.is_set():
-                    log.error("worker %d (pid %d) exited with %s; starting it again", i, p.pid, p.returncode)
-                    time.sleep(self.restart_pause_s)
-                    if not self.stopping.is_set():
-                        self._start(i)
+                if self.stopping.is_set() or p is None or p.poll() is None:
+                    continue
+                if i not in due:
+                    young = now - self.started[i] < 60
+                    pause[i] = min(60.0, pause[i] * 2) if young else self.restart_pause_s
+                    log.error("worker %d (pid %d) exited with %s; starting it again in %.0f s", i, p.pid,
+                              p.returncode, pause[i])
+                    due[i] = now + pause[i]
+                elif now >= due[i]:
+                    del due[i]
+                    self._start(i)
             if self.stopping.is_set() and all(p is None or p.poll() is not None for p in self.procs):
                 break
             if t_end is not None and time.monotonic() > t_end:
