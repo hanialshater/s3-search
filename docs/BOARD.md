@@ -28,6 +28,7 @@ Status values: open · claimed · in review · done.
 | S1-5 | RRF fusion and feature gather; the GBDT trained on judged items plus random negatives, not top unjudged | in review | architect, 2026-11-09 |
 | S1-6 | `engine/api.py` and the referee's contract checks on `toy` | in review | architect, 2026-11-09 |
 | S1-7 | Reproduce 0.304 nDCG@10 on ESCI-US in Colab, with title-only parity against OpenSearch | open | |
+| S1-8 | Per-field BM25F `b` in the mapping (`_meta.engine.bm25.b` as a map, `b_default`), on every scoring path (lexical, term groups, phrase, explain, segments and merges), so S1-7's tuned BM25F can be expressed; a segment with other parameters is refused. Built out of process by the coordinator (ba28176); reviewed and amended by the architect | in review | architect, 2026-11-13 |
 
 ## S2 · Data plane (dataplane-engineer)
 
@@ -70,6 +71,8 @@ Status values: open · claimed · in review · done.
 | Id | Item | Status | Claimed |
 |---|---|---|---|
 | S6-1 | A compiled query encoder, CUDA graphs, fused fusion and features; measured only in Colab | open | |
+| S6-2 | `colab/pipeline_profile.py`: the S6 pipeline's per-stage latency and throughput on a Colab GPU (development only). Built out of process by the coordinator (dd319a7); reviewed by the architect | in review | architect, 2026-11-13 |
+| S6-3 | `colab/fair_bench.py`: a matched open-loop load test, the engine against OpenSearch, with GPU and server CPU sampled (development only). Built out of process by the coordinator (d0ae1a6, a702cc4); reviewed by the architect | in review | architect, 2026-11-13 |
 
 ## S7 · Feature coverage (architect, platform-engineer, tools-engineer, evaluation-steward)
 
@@ -105,6 +108,7 @@ is searchable only after a full rebuild. Predictions are in the lab's `company/m
 | S8-5 | Intake speed: at least 20,000 docs/s lexical, the encoder fit under 10 s | dataplane-engineer | claimed | dataplane-engineer, 2026-11-10 |
 | S8-6 | `POST _bulk` (NDJSON), refresh interval and index-lag metrics | platform-engineer | in review | platform-engineer 2026-11-10 |
 | S8-7 | The write-stream judge: 200 upserts/s, visibility, equality with a rebuild, query p99 under writes | evaluation-steward | open | |
+| S8-8 | `Index.patch` with an id repeated in one call keeps the last value on every device (cuda does not order a scatter with repeated indices; found by `referee fast` on an L4). Built out of process by the coordinator (8053055); reviewed and amended by the architect (a deterministic CPU test) | architect | in review | architect, 2026-11-13 |
 
 ## S9 · GPU-friendly coverage (architect, evaluation-steward, tools-engineer)
 
@@ -118,7 +122,32 @@ encoder stay the reference and the fallback.
 | S9-1 | cuVS approximate knn: CAGRA and IVF-PQ, filtered; built per segment, rebuilt on merge; exact knn as the CPU fallback, the method named in the response | architect | in review | architect, 2026-11-10 |
 | S9-2 | The tfidf-svd encoder fitted and applied with cuML on the GPU; the fitted encoder stored as now | architect | in review | architect, 2026-11-10 |
 | S9-3 | GBDT inference on the GPU (cuML FIL or XGBoost), equal to the reference within 1e-5 | architect | in review | architect, 2026-11-10 |
+| S9-3b | The XGBoost export in sibling order (each right child right after its left), as XGBoost's GPU predictor assumes; the depth-first export was off by up to 6.57 on cuda. Built out of process by the coordinator (87baeec); reviewed by the architect | architect | in review | architect, 2026-11-13 |
 | S9-4 | Geo: the `geo_point` type, `geo_distance`, `geo_bounding_box`, `_geo_distance` sort | architect | in review | architect, 2026-11-10 |
 | S9-5 | Nested documents: the `nested` type, the `nested` query with `score_mode`, the `nested` aggregation | architect | in review | architect, 2026-11-10 |
 | S9-6 | Conformance families for geo and nested against OpenSearch 2.19; the Colab judges for S9-1 to S9-3 | evaluation-steward | open | |
 | S9-7 | Demo: a geo filter and nested facets | tools-engineer | claimed | tools-engineer, 2026-11-10 |
+
+## CI · GPU CI (architect)
+
+Added by the architect, 2026-11-13. CI runs on CPU, so cuda-only bugs (S8-8, S9-3b) reached a GPU before a test saw
+them. The round's landing rule (lab `company/decisions/2026-11-13-search-floor-round.md`) needs `colab/gpu_ci.py` green
+for an engine change.
+
+| Id | Item | Owner | Status | Claimed |
+|---|---|---|---|---|
+| CI-1 | `colab/gpu_ci.py` (referee fast and the engine tests on a Colab GPU) and `engine/tests/test_write_paths_devices.py` (every write path on each device against cpu). Built out of process by the coordinator (ba28176); reviewed by the architect | architect | in review | architect, 2026-11-13 |
+| CI-2 | A CPU Colab runner for the referee and the engine tests at `requirements.txt`'s versions, for machines whose local Python cannot run them | architect | open | |
+
+## S10 · A PyTerrier-style pipeline DSL (architect)
+
+Added by the architect, 2026-11-13, from the lab's milestone S10 (predictions in `company/milestones.json`, written
+before any work). The JSON request stays the wire format; the DSL is a client of `engine/api.py`.
+
+| Id | Item | Owner | Status | Claimed |
+|---|---|---|---|---|
+| S10-1 | Interfaces: the pipeline section (the transformers, their DataFrame columns, which chains compile into one request and which fall back) | architect | open | |
+| S10-2 | The adapter: engine retrievers (lexical, dense, hybrid) and the GBDT re-ranker as PyTerrier transformers; `>>`, `%`, `+`, `**`; hits and scores equal to `Index.search` for the same request | architect | open | |
+| S10-3 | `pt.Experiment` over at least three engine pipelines on ESCI-sample's fit queries, on CPU (judgments of the fit split only, through `referee/loader.py`) | architect | open | |
+| S10-4 | The compiler: a chain of engine stages (`retrieve % k >> rerank`, filters, fusion) into one batched engine request, with results identical to the DataFrame path | architect | open | |
+| S10-5 | Its speed on an A100 against the DataFrame path and the hand-written JSON request (needs a GPU run within the round's cost target) | architect | open | |
