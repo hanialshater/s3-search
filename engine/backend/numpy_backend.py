@@ -193,7 +193,10 @@ class NumpyBackend:
         return np.isin(a, np.asarray(values))
 
     def count_nonzero(self, mask, axis=None):
-        return np.count_nonzero(mask, axis=axis)
+        # A numpy integer, never a Python int: numpy < 2 returns int for axis=None, which has no .astype and broke
+        # range aggregations (aggs.range_agg) on numpy 1.26, which requirements.txt allows.
+        n = np.count_nonzero(mask, axis=axis)
+        return np.int64(n) if axis is None else n
 
     # ---- facets
     def bincount(self, codes, n, weights=None):
