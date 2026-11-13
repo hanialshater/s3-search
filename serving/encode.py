@@ -12,6 +12,7 @@ same bytes whichever form the engine answered in; only the cost differs. At dept
 from __future__ import annotations
 
 import json
+import os
 from json.encoder import encode_basestring_ascii as _esc
 from typing import Any
 
@@ -116,6 +117,79 @@ def encode_hits(columns: dict) -> str:
     return "[" + ",".join(body) + "]"
 
 
+# ---- the fast path (S6-15s) ------------------------------------------------------------------------------------------
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - the slow path below writes the same bytes
+    _orjson = None
+if os.environ.get("S3_SERVING_FAST_ENCODE", "1").strip().lower() in ("0", "false", "no", "off"):
+    _orjson = None                                              # the pure-Python path only (for comparison)
+
+_TEMPLATES: dict = {}
+
+
+def _safe_floats(a) -> bool:
+    """Whether orjson writes exactly what ``float.__repr__`` writes for every value: finite, and 0 or 1e-4 <= |x| <
+    1e16 (outside that, repr switches to exponent notation and orjson does not; orjson writes NaN and inf as null)."""
+    import numpy as np
+    m = np.abs(a)
+    return bool(np.isfinite(a).all() and ((m == 0) | ((m >= 1e-4) & (m < 1e16))).all())
+
+
+def _orjson_items(values) -> list[bytes]:
+    out = _orjson.dumps(values)
+    return out[1:-1].split(b",") if len(out) > 2 else []
+
+
+def _fast_hits(columns: dict) -> bytes | None:
+    """``encode_hits``'s bytes without a Python string per value: orjson writes the numbers (only where it agrees with
+    repr), the ids are quoted with one vectorised operation, and one bytes template per page shape joins them.
+    None when a column falls outside what this path handles (the caller takes ``encode_hits``)."""
+    import numpy as np
+    if _orjson is None:
+        return None
+    ids = columns["_id"]
+    h = len(ids)
+    if h == 0:
+        return b"[]"
+    if isinstance(ids, np.ndarray) and ids.dtype.kind == "S":
+        b = np.frombuffer(ids.tobytes(), np.uint8)
+        if ((b >= 0x7F) | ((b < 0x20) & (b != 0)) | (b == 0x22) | (b == 0x5C)).any():
+            return None
+        id_b = np.char.add(np.char.add(b'"', ids), b'"').tolist()
+    else:
+        id_b = [_esc(i).encode() if isinstance(i, str) else None for i in ids]
+        if any(x is None for x in id_b):
+            return None
+    s64 = np.asarray(columns["_score"], np.float32).astype(np.float64)
+    if len(s64) != h or not _safe_floats(s64):
+        return None
+    score_b = _orjson_items(s64.tolist())
+    cols = []
+    for c in columns.get("sort") or []:
+        v, miss = c.get("values"), c.get("missing")
+        if miss is not None or not isinstance(v, np.ndarray) or len(v) != h:
+            return None
+        if v.dtype == np.float64 and np.array_equal(v, s64):
+            cols.append(score_b)
+        elif v.dtype.kind in "iu":
+            cols.append(_orjson_items(v.astype(np.int64).tolist()))
+        elif v.dtype.kind == "f" and _safe_floats(v.astype(np.float64)):
+            cols.append(_orjson_items(v.astype(np.float64).tolist()))
+        else:
+            return None
+    k = len(cols)
+    tpl = _TEMPLATES.get((h, k))
+    if tpl is None:
+        one = b'{"_id":%b,"_score":%b,"sort":[' + b",".join([b"%b"] * k) + b"]}"
+        tpl = b"[" + b",".join([one] * h) + b"]"
+        if len(_TEMPLATES) > 256:
+            _TEMPLATES.clear()
+        _TEMPLATES[(h, k)] = tpl
+    import itertools
+    return tpl % tuple(itertools.chain.from_iterable(zip(id_b, score_b, *cols)))
+
+
 def _shell(resp: dict, hits_value) -> dict:
     """The dict form's key order, as ``engine.api.expand_hits`` makes it: ``hits`` first, and inside it the other keys
     (``total``) and then ``hits``."""
@@ -125,22 +199,25 @@ def _shell(resp: dict, hits_value) -> dict:
     return {"hits": inner, **{k: v for k, v in resp.items() if k != "hits"}}
 
 
-def _encode_response(resp: dict) -> str:
-    text = json.dumps(_shell(resp, _PLACEHOLDER), separators=_SEP)
-    marker = '"hits":' + json.dumps(_PLACEHOLDER)
+def _encode_response(resp: dict, fast: bool = True) -> bytes:
+    text = json.dumps(_shell(resp, _PLACEHOLDER), separators=_SEP).encode()
+    marker = b'"hits":' + json.dumps(_PLACEHOLDER).encode()
     if text.count(marker) != 1:                                 # the placeholder must be ours alone
-        return json.dumps(expand(resp), separators=_SEP)
-    return text.replace(marker, '"hits":' + encode_hits(resp["hits"]["columns"]), 1)
+        return json.dumps(expand(resp), separators=_SEP).encode()
+    hits = _fast_hits(resp["hits"]["columns"]) if fast else None
+    if hits is None:
+        hits = encode_hits(resp["hits"]["columns"]).encode()
+    return text.replace(marker, b'"hits":' + hits, 1)
 
 
 def encode(obj: Any) -> bytes:
     """A response, a list of responses (``_msearch``) or any JSON value, as the bytes ``json.dumps`` gives for its
     dict form (compact separators, ASCII)."""
     if _is_columnar(obj):
-        return _encode_response(obj).encode()
+        return _encode_response(obj)
     if isinstance(obj, list) and any(_is_columnar(r) for r in obj):
-        return ("[" + ",".join(_encode_response(r) if _is_columnar(r) else json.dumps(r, separators=_SEP)
-                               for r in obj) + "]").encode()
+        return b"[" + b",".join(_encode_response(r) if _is_columnar(r) else json.dumps(r, separators=_SEP).encode()
+                                for r in obj) + b"]"
     return json.dumps(obj, separators=_SEP).encode()
 
 

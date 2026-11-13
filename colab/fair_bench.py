@@ -452,7 +452,7 @@ def main():
     os.chdir(REPO)
     sys.path.insert(0, REPO)
     os.environ.setdefault("S3_SEARCH_DATA", os.path.join(REPO, "data", "esci"))
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "aiohttp", "snowballstemmer"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "aiohttp", "snowballstemmer", "orjson"], check=True)
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     from referee import loader, runtime
     env = runtime.environment()

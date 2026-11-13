@@ -95,3 +95,41 @@ def test_bytes_ids_from_the_engine_encode_the_same():
             assert enc.encode(_without_took(c)) == _dumps(_without_took(d)), r
             assert enc.expand_columns(c) == api.expand_hits(c), r
         assert n >= len(reqs) // 2
+
+
+def test_the_fast_path_writes_the_slow_paths_bytes():
+    """S6-15s: orjson numbers and one bytes template give exactly encode_hits' bytes, across magnitudes (repr's
+    exponent boundaries at 1e-4 and 1e16 fall back), id forms, sort column kinds, missing values and empty pages."""
+    if enc._orjson is None:
+        pytest.skip("orjson is not installed")
+    rng = np.random.default_rng(7)
+    cases = 0
+    for h in (0, 1, 3, 500, 2000):
+        for scale in (1e-6, 1e-4, 1e-2, 1.0, 30.0, 1e6, 1e15, 3e16):
+            sc = (rng.random(h) * scale).astype(np.float32)
+            if h:
+                sc[0] = np.float32(scale)
+            ids = np.array([f"B{i:09d}".encode() for i in range(h)], dtype="S10") if h else np.array([], "S1")
+            for idform in ("bytes", "str", "odd"):
+                if idform == "bytes":
+                    idv = ids
+                elif idform == "str":
+                    idv = [x.decode() for x in ids.tolist()]
+                else:
+                    idv = [f'q"{i}é' for i in range(h)]
+                for sort in ([], [{"values": sc.astype(np.float64), "missing": None}],
+                             [{"values": sc.astype(np.float64), "missing": None},
+                              {"values": rng.integers(-10**12, 10**12, h), "missing": None}],
+                             [{"values": (rng.random(h) * scale), "missing": None}],
+                             [{"values": rng.integers(0, 9, h), "missing": (rng.random(h) < 0.2)}],
+                             [{"values": ["a"] * h, "missing": None}],
+                             [{"values": rng.random(h) < 0.5, "missing": None}]):
+                    cols = {"_id": idv, "_score": sc, "sort": sort}
+                    fast = enc._fast_hits(cols)
+                    slow = enc.encode_hits(cols).encode()
+                    if fast is not None:
+                        assert fast == slow, (h, scale, idform, len(sort))
+                        cases += 1
+                    r = {"hits": {"total": h, "columns": cols}, "took_ms": {"total": 1.0}}
+                    assert enc.encode(r) == _dumps(enc.expand(r))
+    assert cases > 50

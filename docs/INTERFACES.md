@@ -803,6 +803,12 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     arrays plus a list of `_id` strings (the largest part), so they pickle as they are. **Unpickling is code
     execution:** the socket is for the service user's own processes only, inside one trust boundary, and is never
     exposed on TCP.
+  - **The encoder's fast path (S6-15s).** orjson writes the numbers, but only where it writes exactly what
+    `float.__repr__` writes: finite values that are 0 or have 1e-4 <= |x| < 1e16. The ids are quoted in one
+    vectorised step, and one bytes template per page shape joins everything. Any other column (missing values,
+    keywords, booleans, out-of-range floats, ids that need escaping) takes the pure-Python path, which writes the
+    same bytes (checked in `serving/tests/test_encode.py`). One front's CPU per 2,000-hit search fell from 4.8 to
+    2.8 ms on a laptop core. `S3_SERVING_FAST_ENCODE=0` turns the fast path off.
   - **Picking a GPU process:** each GPU process writes its load (queued plus in its batch) to its own slot of
     `load.bin` in the state directory. Every front reads the same table and picks the least loaded process, with its
     own in-flight count breaking ties.
@@ -1114,3 +1120,5 @@ status:
   same bytes (section 7, "One GPU process").
 - 2026-11-13, platform-engineer (S6-12s, the GPU process's transport): replies batched per front and sent by a writer
   thread, a shared load table for picking a GPU process, and `S3_SERVING_GPU_MEMORY_FRACTION` (section 7).
+- 2026-11-13, platform-engineer (S6-15s): the encoder gains a fast path (orjson numbers, one bytes template) that
+  writes the same bytes (section 7); `orjson` is added to `requirements.txt`.
