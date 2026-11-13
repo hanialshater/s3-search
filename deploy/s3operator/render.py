@@ -196,7 +196,7 @@ def render_deployment(si: dict, segment_id: str) -> dict:
            {"name": "S3_SERVING_RPC_PORT", "value": str(RPC_PORT)},
            {"name": "S3_SERVING_DRAIN_SECONDS", "value": str(DRAIN_SECONDS)}]
     for key, var in (("maxBatch", "S3_SERVING_MAX_BATCH"), ("maxWaitMs", "S3_SERVING_MAX_WAIT_MS"),
-                     ("cacheSize", "S3_SERVING_CACHE")):
+                     ("cacheSize", "S3_SERVING_CACHE"), ("workers", "S3_SERVING_WORKERS")):
         if key in serving:
             env.append({"name": var, "value": str(serving[key])})
     http = {"port": "http"}

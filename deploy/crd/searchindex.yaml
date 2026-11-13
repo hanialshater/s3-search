@@ -105,6 +105,7 @@ spec:
                     maxBatch: {type: integer, minimum: 1}
                     maxWaitMs: {type: number, minimum: 0}
                     cacheSize: {type: integer, minimum: 0}
+                    workers: {type: integer, minimum: 1, description: Read-only worker processes per replica pod (S3_SERVING_WORKERS; each holds its own copy of the segment).}
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
