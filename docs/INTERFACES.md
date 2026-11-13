@@ -740,6 +740,49 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
   "headers"}`, response `{"id", "status", "body", "headers"}`, with the same method and path as the HTTP route and the
   same `App.handle`, so responses equal HTTP's (checked on the 200 conformance requests). Client: `serving.rpc.RpcClient`.
   The `SearchIndex` Service also exposes port 9090 as `rpc`.
+- **Response bytes and columnar hits (S6-7).** Serving asks the engine for `hits="columns"` (§5) whenever the loaded
+  index's `search`/`search_batch` takes `hits` (`S3_SERVING_COLUMNS=1`, the default; `0` asks for the dict form) and
+  encodes the columns itself (`serving/encode.py`). The HTTP and RPC bodies are unchanged: byte for byte what
+  `json.dumps(engine.api.expand_hits(resp), separators=(",", ":"))` gives (checked against the engine on every
+  device in `serving/tests/test_encode.py`). A response the engine answers in the dict form (collapse, highlight,
+  explain) is encoded as before; `_source` expands that one response to dicts first. The cache holds what the engine
+  returned.
+- **Workers (S6-7).** `python -m serving --workers N` (`S3_SERVING_WORKERS`, default 1): a supervisor binds the HTTP
+  (and RPC) port once and starts N `python -m serving` workers that share the listening socket (`serving/workers.py`).
+  Each worker loads its own copy of the preloaded indexes (N copies in GPU memory on cuda) and has its own cache,
+  scheduler and `/metrics`; every response carries `X-S3-Worker: <i>`. **N > 1 is read-only:** `GET` routes,
+  `_search`, `_msearch`, `_mapping` and `versions` are served, every other route is 405 `method_not_allowed` (each
+  worker's index is its own, so a write would reach one of them). Worker 0 accepts at once (`/healthz` while loading,
+  `/readyz` 503 until loaded); the others accept only after their preload. SIGTERM to the supervisor drains every
+  worker; a worker that dies is started again. For the replica Deployment, which preloads a segment the indexer Job
+  built and takes no writes.
+- **One GPU process (S6-10s, proposed by the platform-engineer, 2026-11-13; for the architect's review before it is
+  built).** `python -m serving --fronts F --gpu-processes K` (default K = 1; `S3_SERVING_FRONTS`,
+  `S3_SERVING_GPU_PROCESSES`). It replaces N independent workers, each with its own index copy and CUDA context (S6-7:
+  40.4 of 41 GB at 7 workers; without MPS the contexts taking turns cost most of the GPU time). The parts:
+  - **The fronts** are F CPU processes on the shared listening socket, as the workers are now. Each parses HTTP and
+    the JSON body and answers what needs no index (`/healthz`, `/metrics`, the cache). It sends each search to a GPU
+    process and encodes the returned columns (`serving/encode.py`). A front holds no `Index`.
+  - **The GPU processes** each hold one `Index` (§5, "The engine in one GPU process"). Each makes one
+    `search_batch(requests, hits="columns", errors="return")` call at a time, with at most 64 requests. A batch is
+    what has arrived from every front since the last call began, so batches grow with the load and no batch window
+    is needed. Requests that §5 says stay per request (filters, field sorts, collapse, highlight, explain, other
+    aggregations) go to batches of their own. An entry with `"error"` maps to the §7 named error (400 for
+    `UnsupportedQuery` and `InvalidRequest`). A whole-batch failure is retried one by one, as the scheduler does now.
+  - **More than one GPU process (K > 1) runs under CUDA MPS** with one index copy each: S6-7's MPS run sustained 600
+    QPS at a p99 of 240 ms, against 2,157 ms without MPS. K > 1 is needed only if one GPU process's own Python (the
+    per-request parse, plan and per-batch work) saturates its core before the GPU does. The first measurement
+    decides K.
+  - **The transport:** a Unix-domain socket from each front to each GPU process, carrying a length-prefixed pickle
+    in each direction (a request batch one way, numpy columns the other). Columns are host arrays (§5), so they
+    pickle as raw buffers with no JSON on this hop. A front picks the GPU process with the fewest requests in flight.
+  - **Writes:** with K = 1 every route is served again. A front forwards writes and admin calls to the GPU process,
+    which applies them to its `Index` between batches; the next batch sees them (§5's one state per batch). With
+    K > 1 the set stays read-only, as N workers are now.
+  - **Readiness:** `/readyz` is ready when every GPU process has loaded. It reports `fronts`, `gpu_processes` and
+    `gpu_ready`.
+  - **What it must show before it lands:** byte-equal responses against a single process (the serving and
+    conformance tests), and a load test against 7 workers with MPS, with predictions first.
 - **Bulk** (`serving/bulk.py`). The body is streamed (Content-Length or chunked), grouped into chunks of `bulk_chunk`
   actions (default 2000), and each chunk is planned, applied to the store as one atomic batch through
   `dataplane.intake.apply_changes` (bad records are rejected one by one) and replayed onto the live index before the next
@@ -806,7 +849,7 @@ spec:
   segmentVersion: null                                      # null: latest; a segment_id pins it (rollback)
   reindexToken: ""                                          # change it to build again from the same inputs
   storage: {size: 5Gi, accessModes: [ReadWriteOnce]}        # the segment volume; {existingClaim: name} uses one
-  serving: {maxBatch: 32, maxWaitMs: 2.0, cacheSize: 1024}
+  serving: {maxBatch: 32, maxWaitMs: 2.0, cacheSize: 1024, workers: 1}
   image: s3-search:cpu                                      # default by device: s3-search:cpu | s3-search:cuda
 status:
   phase: Pending | Indexing | Ready | Swapping | Failed
@@ -1009,7 +1052,14 @@ status:
   Python dict per hit. Additive and opt-in: the default response is unchanged, and so is serving's HTTP response.
   Also recorded today: one set of BM25F parameters per index (section 4), the last-write rule for a repeated id in one
   `patch` call, and that nested text fields keep the default BM25F parameters (section 2).
+- 2026-11-13, platform-engineer (S6-7, the server side): section 7 gains **response bytes and columnar hits** (serving
+  asks for `hits="columns"` and encodes them to the same bytes as the dict form) and **workers** (`--workers N`, N
+  read-only processes behind one port). The HTTP and RPC responses are unchanged but for a new `X-S3-Worker` header.
 - 2026-11-13, architect (S6-10, the engine in one GPU process; asked by the coordinator after the platform-engineer
   and the architect proposed the same shape): section 5 says what `search_batch` promises a GPU process serving
   several front processes. New, additive: `search_batch(..., errors="return")` puts a refused request's error in its
   slot instead of failing the batch (default `"raise"`, unchanged). The process architecture is section 7's.
+- 2026-11-13, platform-engineer (S6-10s, proposed, not built): section 7 proposes **one GPU process**. CPU fronts
+  (HTTP, parsing, encoding) feed one GPU process, or K of them under MPS, over Unix sockets. Each GPU process makes
+  one `search_batch(hits="columns", errors="return")` call of at most 64 requests at a time. With K = 1 writes are
+  served again. For the architect's review.
