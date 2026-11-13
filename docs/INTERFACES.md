@@ -71,6 +71,12 @@ Decision record: `docs/decisions/2026-11-09-gpu-portable-backend.md`.
 - **torch is optional.** `requirements.txt` stays numpy-only; `requirements-gpu.txt` adds torch for Colab and GPU
   nodes.
 
+- **How the host waits (S6-15, 2026-11-13, architect).** On cuda the host waits for the device with CUDA's default
+  (spinning) wait. `S3_CUDA_BLOCKING_SYNC=1` makes the torch backend wait on a blocking CUDA event before every host
+  read (a copy to the host, a host-side count), so the waiting thread sleeps instead. Results are the same either
+  way. It is off by default: on an A100 at depth 2,000 it saved no host CPU (the process was busy with its own work,
+  not waiting) and added about 0.3 ms to a single request (the profile at 3bfeea4).
+
 ## 1. Datasets (evaluation-steward → everyone)
 
 Served only through `referee/loader.py`; nobody reads ESCI files any other way, and nobody loads test judgments.
@@ -795,7 +801,11 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     and every write or admin call gets 405.
   - **Front caches** are keyed by `(index, segment_id, epoch)`. GPU process 0 republishes these values in
     `versions-0.json` in the state directory within 20 ms of any swap, patch, delete or background refresh. Every
-    batch reply also carries the version it read. So a write forwarded by any front leaves no stale entry reachable.
+    batch reply also carries a version, read just before its `search_batch` call; a write that lands during the call
+    can be in that batch's results under the older version. That is safe for the caches: an entry is never stored
+    under a version newer than the state it came from, so a write leaves no stale entry reachable under the new
+    version. (The architect offers a state version in §5's responses if exactness is ever needed.)
+    `S3_SERVING_STATE_DIR` names the state directory instead of a fresh temporary one (it must be empty).
   - **Transport.** One Unix-domain socket per GPU process, in the supervisor's state directory (`mkdtemp`, mode 0700);
     the socket itself is mode 0600. A frame is an 8-byte big-endian length and a pickle. The replies of one batch to one front
     travel as one `("multi", [...])` frame, written by that connection's writer thread, so the batch loop never waits
@@ -1108,6 +1118,12 @@ status:
   and the architect proposed the same shape): section 5 says what `search_batch` promises a GPU process serving
   several front processes. New, additive: `search_batch(..., errors="return")` puts a refused request's error in its
   slot instead of failing the batch (default `"raise"`, unchanged). The process architecture is section 7's.
+- 2026-11-13, architect (S6-12, from the platform-engineer's S6-10s finding that one GPU process spends its own core on
+  pickling replies): section 5's columnar hits gain `ids="bytes"`, `_id` as one numpy `S<w>` array instead of a list
+  of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.
+- 2026-11-13, architect (S6-15): section 0 says how the host waits for the device on cuda: CUDA's spinning wait by
+  default, a blocking event with `S3_CUDA_BLOCKING_SYNC=1`. It changes no result. The blocking wait was the default
+  in 3bfeea4 and was made opt-in after its profile measured no host CPU saved.
 - 2026-11-13, platform-engineer (S6-10s): section 7 gains **one GPU process**, proposed and then built with the
   architect's seven changes:
   - only explain and highlight run in batches of their own;
@@ -1117,9 +1133,6 @@ status:
   - the transport's trust boundary is stated;
   - K > 1 runs under MPS from the start;
   - columns are pickled as they are.
-- 2026-11-13, architect (S6-12, from the platform-engineer's S6-10s finding that one GPU process spends its own core on
-  pickling replies): section 5's columnar hits gain `ids="bytes"`, `_id` as one numpy `S<w>` array instead of a list
-  of str. Opt-in and additive; `expand_hits` decodes it; nothing else changes.
 - 2026-11-13, platform-engineer (S6-12s): serving asks for `ids="bytes"` when the engine takes it, and encodes it to the
   same bytes (section 7, "One GPU process").
 - 2026-11-13, platform-engineer (S6-12s, the GPU process's transport): replies batched per front and sent by a writer

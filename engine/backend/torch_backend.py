@@ -17,6 +17,13 @@ class TorchBackend:
             raise ValueError("accumulate: float64 | float32")
         self.name, self.accumulate = name, accumulate
         self.device = torch.device("cuda" if name == "cuda" else "cpu")
+        # S6-15: optionally wait for the device without spinning. A host read (a copy to the host, a scalar) waits
+        # for the stream; CUDA's default wait spins a host core while the device runs. With blocking_sync the wait is
+        # on a blocking event and the thread sleeps. Off by default: the A100 profile at 3bfeea4 measured no host CPU
+        # saved at depth 2,000 (1.224 against 1.248 ms per request, the process CPU-bound by its own work) and
+        # 0.34 ms more batch-1 latency. S3_CUDA_BLOCKING_SYNC=1 turns it on. Results are the same either way.
+        import os
+        self.blocking_sync = self.device.type == "cuda" and os.environ.get("S3_CUDA_BLOCKING_SYNC", "0") == "1"
 
     # ---- creation and transfer
     def asarray(self, x, dtype=None):
@@ -30,8 +37,17 @@ class TorchBackend:
             raise TypeError("object arrays stay on the host")
         return torch.as_tensor(np.ascontiguousarray(a), device=self.device, dtype=dt)
 
+    def _wait(self):
+        """Block (not spin) until the current stream's work is done, when ``blocking_sync`` is on."""
+        if self.blocking_sync:
+            ev = torch.cuda.Event(blocking=True)
+            ev.record()
+            ev.synchronize()
+
     def to_numpy(self, a):
         if isinstance(a, torch.Tensor):
+            if a.device.type == "cuda":
+                self._wait()
             return a.detach().cpu().numpy()
         return np.asarray(a)
 
@@ -112,7 +128,9 @@ class TorchBackend:
         owners = self.asarray(owners, "int64")
         starts = ptr[rows]
         n = ptr[rows + 1] - starts
-        total = int(n.sum())
+        total_t = n.sum()
+        self._wait()
+        total = int(total_t)
         offsets = torch.cumsum(n, 0) - n
         entry = torch.arange(total, device=self.device, dtype=torch.int64) + torch.repeat_interleave(starts - offsets, n)
         return torch.repeat_interleave(owners, n), entry
@@ -222,4 +240,5 @@ class TorchBackend:
 
     def synchronize(self):
         if self.device.type == "cuda":
+            self._wait()
             torch.cuda.synchronize()

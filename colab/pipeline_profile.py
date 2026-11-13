@@ -97,15 +97,19 @@ def measure(index, make, texts, label, kw=None):
         reqs = [make(t) for t in texts]
         index.search_batch(reqs[:bs], **(kw or {}))        # warm-up at this shape
         walls = []
+        c0 = time.process_time()                           # this process's CPU time: the host core it uses
         t0 = time.perf_counter()
         for i in range(0, len(reqs), bs):
             s = time.perf_counter()
             index.search_batch(reqs[i:i + bs], **(kw or {}))
             walls.append((time.perf_counter() - s) * 1e3)
         total = time.perf_counter() - t0
+        cpu = time.process_time() - c0
         qps = len(reqs) / total
-        out["throughput"][str(bs)] = {"qps": qps, "batch_p50_ms": pct(walls, 50), "batch_p99_ms": pct(walls, 99)}
-        say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms")
+        out["throughput"][str(bs)] = {"qps": qps, "batch_p50_ms": pct(walls, 50), "batch_p99_ms": pct(walls, 99),
+                                      "cpu_ms_per_request": cpu * 1e3 / len(reqs), "cpu_cores": cpu / total}
+        say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms, "
+            f"host CPU {cpu * 1e3 / len(reqs):.3f} ms per request ({cpu / total:.2f} cores)")
     return out
 
 
@@ -204,6 +208,14 @@ def main():
         result.setdefault("pipeline_by_runtime", {})[rt] = measure(index, pipeline_request, texts, f"pipeline/{rt}")
     if DEEP:
         result["deep"] = measure(index, deep_request, texts, "deep", {"hits": "columns", "ids": "bytes"})
+        b = index._st.b
+        if hasattr(b, "blocking_sync"):                    # S6-15: the same with the other kind of host wait
+            was = b.blocking_sync
+            b.blocking_sync = not was
+            result["deep_blocking" if not was else "deep_spinning"] = measure(
+                index, deep_request, texts, "deep/blocking" if not was else "deep/spinning",
+                {"hits": "columns", "ids": "bytes"})
+            b.blocking_sync = was
     if TORCH_PROFILE:
         result["torch_profile"] = {}
         kinds = [("lexical", lexical_request), ("pipeline", pipeline_request)] + ([("deep", deep_request)] if DEEP else [])
