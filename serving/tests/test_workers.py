@@ -119,18 +119,23 @@ def test_workers_share_the_port_and_answer_the_same(built):
     assert out.count("preloaded") >= 3, out[-3000:]
 
 
+def _children(pid: int) -> list[int]:
+    """Child pids, with the standard tools only (pgrep on Linux and macOS; no psutil in CI)."""
+    out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+    return [int(x) for x in out.split()]
+
+
 def test_a_dead_worker_is_started_again(built):
     port = _free_port()
     proc = _start(built, 2, port)
     try:
-        import psutil
-        kids = psutil.Process(proc.pid).children()
+        kids = _children(proc.pid)
         assert len(kids) == 2
-        kids[1].kill()
+        os.kill(kids[1], signal.SIGKILL)
         t_end = time.time() + 60
         while time.time() < t_end:
-            now = [k.pid for k in psutil.Process(proc.pid).children()]
-            if len(now) == 2 and kids[1].pid not in now:
+            now = _children(proc.pid)
+            if len(now) == 2 and kids[1] not in now:
                 break
             time.sleep(0.2)
         else:

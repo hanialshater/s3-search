@@ -212,6 +212,17 @@ class Part:
         return seg
 
 
+def _encode_ids(ids) -> np.ndarray:
+    """Ids as a numpy ``S<w>`` array of their UTF-8 bytes (``w`` the longest; at least 1)."""
+    enc = [str(i).encode("utf-8") for i in ids]
+    return np.array(enc, dtype=f"S{max([1] + [len(e) for e in enc])}")
+
+
+def _concat_bytes(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    w = max(a.dtype.itemsize, b.dtype.itemsize)
+    return np.concatenate([a.astype(f"S{w}"), b.astype(f"S{w}")])
+
+
 class IndexState:
     def __init__(self, segs, b: Backend, check_budget: bool = True, version: int | None = None,
                  newest_wins: bool = True):
@@ -432,6 +443,13 @@ class IndexState:
             self._exists[field] = m
         return self._exists[field]
 
+    def ids_bytes(self) -> np.ndarray:
+        """The ids as one numpy ``S<w>`` array, UTF-8 (INTERFACES §5, ``ids="bytes"``), cached for this ``ids``."""
+        cached = self.__dict__.get("_ids_bytes")
+        if cached is None or cached[0] is not self.ids:
+            cached = self._ids_bytes = (self.ids, _encode_ids(self.ids))
+        return cached[1]
+
     @property
     def has_positions(self) -> bool:
         return all(p.host_positions is not None for p in self.parts)
@@ -557,6 +575,9 @@ class IndexState:
         c.host_live, c.live = self.host_live.copy(), b.copy(self.live)
         c.slot_part, c.slot_local = self.slot_part.copy(), self.slot_local.copy()
         c.first_offset, c.ids = self.first_offset.copy(), self.ids.copy()
+        cached = self.__dict__.get("_ids_bytes")
+        if cached is not None and cached[0] is self.ids:   # the same ids: the bytes copy carries over (S6-12)
+            c._ids_bytes = (c.ids, cached[1])
         c.host_field_len = self.host_field_len.copy()
         c.numerics = {f: b.copy(v) for f, v in self.numerics.items()}
         c.missing = {f: b.copy(v) for f, v in self.missing.items()}
@@ -659,7 +680,11 @@ class IndexState:
             self.first_offset = np.concatenate([self.first_offset, p.first_offset[rest]])
             self.first_offset_dev = b.concatenate([self.first_offset_dev, b.asarray(p.first_offset[rest], "int64")])
             self.max_fo = int(p.first_offset[rest][-1])
+            cached = self.__dict__.get("_ids_bytes")
+            old_ids = self.ids
             self.ids = np.concatenate([self.ids, np.asarray(ids[rest], dtype=object)])
+            if cached is not None and cached[0] is old_ids:   # extend the bytes copy rather than rebuild it (S6-12)
+                self._ids_bytes = (self.ids, _concat_bytes(cached[1], _encode_ids(self.ids[N0:])))
             self.host_live = np.concatenate([self.host_live, np.ones(a, bool)])
             self.live = b.concatenate([self.live, b.full(a, True, "bool")])
             self.host_field_len = np.concatenate([self.host_field_len, p.host_field_len[rest]])

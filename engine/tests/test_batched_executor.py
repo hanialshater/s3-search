@@ -75,9 +75,12 @@ def test_rescored_plans_in_a_batch(segment, catalogue, device, runtime, monkeypa
     for k, t in enumerate(texts):
         lex = {"match": {"product_title": t}}
         hyb = {"hybrid": {"queries": [lex, {"neural": {"embedding": {"query_text": t, "k": 20}}}]}}
-        reqs.append({"query": hyb if k % 2 else lex, "size": [10, 3, 30][k % 3],
+        reqs.append({"query": hyb if k % 2 else lex, "size": [10, 3, 30][k % 3], "from": [0, 4, 0, 2, 0][k],
                      "rescore": {"window_size": [20, 5, 100, 1, 7][k], "s3_ranker": {"model": "m"}}})
         reqs.append({"query": lex})
+    reqs.append({"query": {"match": {"product_title": "shoes"}}, "size": 40, "from": 3,     # deep into tier 0
+                 "post_filter": {"range": {"price": {"lte": 80}}},
+                 "rescore": {"window_size": 4, "s3_ranker": {"model": "m"}}})
     reqs.append({"query": {"match": {"product_title": "shoes"}}, "explain": True, "size": 3,
                  "rescore": {"window_size": 10, "s3_ranker": {"model": "m"}}})
     got = ix.search_batch(reqs)
