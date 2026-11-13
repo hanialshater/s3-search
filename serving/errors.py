@@ -5,6 +5,8 @@ fake index in a test can raise a stand-in with the same name.
 """
 from __future__ import annotations
 
+import re
+
 
 class ServingError(Exception):
     """Base of the errors serving raises itself. ``status`` is the HTTP status, ``type`` the named error."""
@@ -82,3 +84,11 @@ def classify(exc: BaseException) -> tuple[int, dict]:
             return status, {"error": {"type": type_, "path": getattr(exc, "path", "") or "",
                                       "reason": getattr(exc, "reason", "") or str(exc)}}
     return 500, {"error": {"type": "internal_error", "path": "", "reason": f"{type(exc).__name__}: {exc}"}}
+
+
+def classify_entry(err: dict) -> tuple[int, dict]:
+    """An engine ``{"error": {"type": <class name>, "path", "reason"}}`` slot (``search_batch(errors="return")``) as
+    ``(http_status, body)``, the same as ``classify`` gives for that exception raised."""
+    name = str(err.get("type") or "")
+    status, type_ = _BY_NAME.get(name, (400, re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower() or "invalid_request"))
+    return status, {"error": {"type": type_, "path": err.get("path", "") or "", "reason": err.get("reason", "") or ""}}

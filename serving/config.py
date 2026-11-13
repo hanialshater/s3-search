@@ -11,6 +11,11 @@ Environment (all optional):
   S3_SERVING_REFRESH_INTERVAL  default index.refresh_interval (500ms; -1 off)
   S3_SERVING_BULK_CHUNK   actions per store batch in _bulk (default 2000)
   S3_SERVING_CACHE        query cache entries per index, 0 disables (default 1024)
+  S3_SERVING_COLUMNS      1 (default): ask the engine for columnar hits and encode them (S6-7); 0: the dict form
+  S3_SERVING_FRONTS       S6-10s: this many front processes (HTTP, encoding) feeding S3_SERVING_GPU_PROCESSES GPU
+                          processes (default 1; more than 1 is read-only and wants CUDA MPS); see serving/gpu.py
+  S3_SERVING_WORKERS      HTTP worker processes behind the one port, each with its own copy of the preloaded
+                          indexes (default 1; more than 1 serves reads only, see serving/workers.py)
 """
 from __future__ import annotations
 
@@ -29,6 +34,13 @@ class ServingConfig:
     max_wait_ms: float = 2.0
     max_queue: int = 4096
     cache_size: int = 1024
+    columns: bool = True              # columnar hits from the engine, encoded by serving/encode.py (S6-7)
+    workers: int = 1                  # worker processes (serving/workers.py); more than 1 is read-only
+    read_only: bool = False           # set in each worker when workers > 1: writes and admin calls are refused
+    worker_index: int | None = None   # this process's number among the workers (None: not a worker)
+    fronts: int = 0                   # S6-10s: front processes (serving/front.py); 0: not this layout
+    gpu_processes: int = 1            # S6-10s: GPU processes (serving/gpu.py), each one index copy; > 1 read-only
+    worker_state: str | None = None   # the supervisor's state directory (ready-<i> files), S3_SERVING_WORKER_STATE
     refresh_interval: str = "500ms"     # default index.refresh_interval (-1 turns the background refresh off)
     bulk_chunk: int = 2000            # actions applied per store batch while a _bulk body streams in
     request_timeout_s: float = 30.0
@@ -52,6 +64,11 @@ class ServingConfig:
         cfg.max_batch = int(e.get("S3_SERVING_MAX_BATCH", cfg.max_batch))
         cfg.max_wait_ms = float(e.get("S3_SERVING_MAX_WAIT_MS", cfg.max_wait_ms))
         cfg.cache_size = int(e.get("S3_SERVING_CACHE", cfg.cache_size))
+        cfg.columns = e.get("S3_SERVING_COLUMNS", "1").strip().lower() not in ("0", "false", "no", "off")
+        cfg.workers = max(1, int(e.get("S3_SERVING_WORKERS", cfg.workers)))
+        cfg.worker_state = e.get("S3_SERVING_WORKER_STATE") or None
+        cfg.fronts = max(0, int(e.get("S3_SERVING_FRONTS", cfg.fronts)))
+        cfg.gpu_processes = max(1, int(e.get("S3_SERVING_GPU_PROCESSES", cfg.gpu_processes)))
         cfg.refresh_interval = e.get("S3_SERVING_REFRESH_INTERVAL", cfg.refresh_interval)
         cfg.bulk_chunk = int(e.get("S3_SERVING_BULK_CHUNK", cfg.bulk_chunk))
         cfg.drain_seconds = float(e.get("S3_SERVING_DRAIN_SECONDS", cfg.drain_seconds))
