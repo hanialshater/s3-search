@@ -783,7 +783,7 @@ spec:
   segmentVersion: null                                      # null: latest; a segment_id pins it (rollback)
   reindexToken: ""                                          # change it to build again from the same inputs
   storage: {size: 5Gi, accessModes: [ReadWriteOnce]}        # the segment volume; {existingClaim: name} uses one
-  serving: {maxBatch: 32, maxWaitMs: 2.0, cacheSize: 1024}
+  serving: {maxBatch: 32, maxWaitMs: 2.0, cacheSize: 1024, workers: 1}
   image: s3-search:cpu                                      # default by device: s3-search:cpu | s3-search:cuda
 status:
   phase: Pending | Indexing | Ready | Swapping | Failed
