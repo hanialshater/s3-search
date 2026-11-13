@@ -5,6 +5,7 @@
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97]
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
+        --engines=zvec [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
 --columns defaults to 1 since S6-7 (s3-search 67c1cd0): serving asks the engine for columnar hits. Runs before that
 commit were the dict form (--columns=0 now). --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
@@ -369,6 +370,50 @@ def stop_mps():
     subprocess.run(["bash", "-c", "echo quit | nvidia-cuda-mps-control"], check=False)
 
 
+ZVEC_VERSION = "0.8.1"
+
+
+def zvec_target(ds, server_cpus):
+    """zvec 0.8.1 behind colab/competitors/zvec_server.py (serving's HTTP stack and encoder) on the server CPUs.
+    Configuration for the steward: --zvec-fields (default the engine's tuned fields and weights), --zvec-fusion
+    (weighted or rrf), --zvec-workers (processes; default one per server CPU) and --zvec-query-threads (zvec's own query
+    threads per process; default 1, so workers x threads = the server CPUs). Development only until approved."""
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", f"zvec=={ZVEC_VERSION}"], check=True)
+    from colab.competitors.zvec_build import build
+    path = "/content/zvec/esci"
+    t0 = time.time()
+    if not os.path.exists(path):
+        say(f"zvec {ZVEC_VERSION}: building the collection")
+        info = build(ds.catalogue, path)
+        say(f"zvec: built {info}")
+    build_s = time.time() - t0
+    port = free_port()
+    workers = int(opt("zvec-workers", str(len(server_cpus))))
+    cmd = ["taskset", "-c", ",".join(map(str, server_cpus)), sys.executable, "colab/competitors/zvec_server.py",
+           "--collection", path, "--port", str(port), "--workers", str(workers),
+           "--query-threads", opt("zvec-query-threads", "1"), "--fusion", opt("zvec-fusion", "weighted")]
+    proc = subprocess.Popen(cmd, stdout=open(LOG, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        wait_until(lambda: urllib.request.urlopen(f"http://localhost:{port}/readyz", timeout=5).status == 200,
+                   "zvec server", 600, proc=proc, log=LOG)
+    except Exception:
+        stop(proc)
+        raise
+    tmpl = json.loads(Path("referee/requests/bm25f-tuned.json").read_text())
+    fields = opt("zvec-fields", "")
+    if fields:
+        tmpl["query"]["multi_match"]["fields"] = fields.split(",")
+    say(f"zvec: serving {tmpl['query']['multi_match']['fields']} with {opt('zvec-fusion', 'weighted')} fusion, "
+        f"{workers} workers x {opt('zvec-query-threads', '1')} query threads")
+
+    def body(q):
+        b = copy.deepcopy(tmpl)
+        b["query"]["multi_match"]["query"] = q
+        return {**b, "size": K}
+
+    return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
+
+
 def engine_target(ds, server_cpus):
     SERVE_DIR.mkdir(parents=True, exist_ok=True)
     m = copy.deepcopy(ds.mapping)
@@ -537,7 +582,7 @@ def main():
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
            "columns": COLUMNS, "mps": MPS, "fronts": FRONTS, "gpu_processes": GPUS, "log": LOG, "engines": {}}
     for name in ENGINES:
-        target = engine_target if name == "engine" else opensearch_target
+        target = {"engine": engine_target, "opensearch": opensearch_target, "zvec": zvec_target}[name]
         try:
             proc, url, make_body, build_s = target(ds, server_cpus)
         except Exception as e:                                   # recorded; the other engine still runs
