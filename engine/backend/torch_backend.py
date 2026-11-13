@@ -169,11 +169,11 @@ class TorchBackend:
         return torch.bincount(keys, minlength=n).to(torch.int32)
 
     def segment_count_where(self, keys, mask, n):
-        """``segment_count(keys[mask], n)`` without the boolean index (a host sync, S6-17): an integer scatter-add of
-        the mask, exact in any order."""
-        out = torch.zeros(n, dtype=torch.int32, device=self.device)
-        out.index_put_((keys,), mask.to(torch.int32), accumulate=True)
-        return out
+        """``segment_count(keys[mask], n)`` without the boolean index (a host sync, S6-17): a histogram of ``keys``
+        weighted by the mask. The weighted sums are small whole numbers, exact in float32 whatever the order, so the
+        counts are exact. (An integer index_put(accumulate=True) is sort-based on cuda: 22 ms of a depth-2,000
+        batch's device time on an A100 at 9729340.)"""
+        return torch.bincount(keys, weights=mask.to(torch.float32), minlength=n).to(torch.int32)
 
     def accumulator(self, n):
         return torch.zeros(n, dtype=torch.float32 if self.accumulate == "float32" else torch.float64,
