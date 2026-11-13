@@ -38,6 +38,14 @@ class InvalidRequest(UnsupportedQuery):
     pass
 
 
+def server_version():
+    """OpenSearch's version number, for the results file; None if it does not answer."""
+    try:
+        return _call("GET", "/").get("version", {}).get("number")
+    except Exception:
+        return None
+
+
 def available_devices():
     return ["cpu"]
 
@@ -72,6 +80,9 @@ def index_settings(mapping):
     if os.environ.get("S3_SEARCH_OS_ANALYZER"):
         mapping = _with_analyzer(mapping, os.environ["S3_SEARCH_OS_ANALYZER"])
     bm = mapping.get("_meta", {}).get("engine", {}).get("bm25", {})
+    if isinstance(bm.get("b"), dict):
+        # One BM25 similarity per index here; a per-field b map would be sent to OpenSearch as an object.
+        raise UnsupportedQuery("_meta.engine.bm25.b", "a per-field b map is not mapped to OpenSearch similarities")
     return {"settings": {
         "number_of_shards": 1, "number_of_replicas": 0, "index.knn": True,
         "index.translog.flush_threshold_size": "64mb",  # a small translog: the shared disk is tight
