@@ -371,6 +371,7 @@ def stop_mps():
 
 
 ZVEC_VERSION = "0.8.1"
+COMPETITOR: dict = {}                                       # what each competitor ran: version, wheel or image digest
 
 
 def zvec_target(ds, server_cpus):
@@ -378,7 +379,16 @@ def zvec_target(ds, server_cpus):
     Configuration for the steward: --zvec-fields (default the engine's tuned fields and weights), --zvec-fusion
     (weighted or rrf), --zvec-workers (processes; default one per server CPU) and --zvec-query-threads (zvec's own query
     threads per process; default 1, so workers x threads = the server CPUs). Development only until approved."""
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", f"zvec=={ZVEC_VERSION}"], check=True)
+    wheel_dir = "/content/zvec-wheel"                        # C1: install from a downloaded wheel and record its sha256
+    subprocess.run([sys.executable, "-m", "pip", "download", "-q", "--no-deps", "-d", wheel_dir,
+                    f"zvec=={ZVEC_VERSION}"], check=True)
+    import glob
+    import hashlib
+    wheel = sorted(glob.glob(f"{wheel_dir}/zvec-{ZVEC_VERSION}-*.whl"))[0]
+    COMPETITOR["zvec"] = {"version": ZVEC_VERSION, "wheel": os.path.basename(wheel),
+                          "wheel_sha256": hashlib.sha256(open(wheel, "rb").read()).hexdigest()}
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", wheel], check=True)
+    say(f"zvec: installed {COMPETITOR['zvec']}")
     from colab.competitors.zvec_build import build
     path = "/content/zvec/esci"
     t0 = time.time()
@@ -620,7 +630,10 @@ def main():
             check = compare_unloaded(url, bodies, runs)
             say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
                 f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 unloaded)")
-            out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check}
+            out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check,
+                                    "competitor": COMPETITOR.get(name), "config": {k: opt(k, None) for k in (
+                                        "zvec-fields", "zvec-fusion", "zvec-workers", "zvec-query-threads")}
+                                    if name == "zvec" else None}
         finally:
             stop(proc)
             time.sleep(5)

@@ -88,6 +88,12 @@ class ZvecApp:
         except (ValueError, KeyError, TypeError) as exc:
             return self._json(400, {"error": {"type": "invalid_request", "path": "", "reason": str(exc)}})
         z = self.zvec
+        if not text.strip():
+            # zvec's one refusal of a well-formed request: Fts raises ValueError("Fts requires a non-empty
+            # query_string or match_string") for an empty or blank text. The engine answers that request with 0
+            # hits, so this does too. Nothing else is caught: any other zvec error is a 500 and counts as one.
+            return Response(200, encode({"hits": {"total": 0, "columns": {"_id": [], "_score": np.zeros(0, np.float32),
+                                                                         "sort": []}}}))
         routes = [z.Query(field_name=f, fts=z.Fts(match_string=text)) for f, _ in fields]
         if len(routes) == 1:
             docs = self.col.query(queries=routes[0], topk=size, output_fields=[])
