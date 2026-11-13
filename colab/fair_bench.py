@@ -77,9 +77,21 @@ def http_json(method, url, body=None, timeout=600):
         return json.loads(r.read() or b"{}")
 
 
-def wait_until(check, what, seconds=900):
+def free_port() -> int:
+    """A port no one listens on (Colab's own runtime holds 8080, for example)."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_until(check, what, seconds=900, proc=None, log=None):
+    """Poll ``check`` until it holds; fail at once if ``proc`` (the server) has exited, with its log's tail."""
     t0 = time.time()
     while time.time() - t0 < seconds:
+        if proc is not None and proc.poll() is not None:
+            tail = Path(log).read_text(errors="replace")[-3000:] if log and Path(log).exists() else ""
+            raise RuntimeError(f"{what} exited with code {proc.returncode} before it was ready:\n{tail}")
         try:
             if check():
                 return
@@ -171,7 +183,7 @@ def load(url, bodies, rate, duration, client_cpus):
 
 # ---- the engines -------------------------------------------------------------------------------------------------
 
-def start_opensearch(server_cpus):
+def start_opensearch(server_cpus, port):
     if not (OS_HOME / "bin" / "opensearch").exists():
         tgz = Path(f"/content/opensearch-{OS_VERSION}.tar.gz")
         if not tgz.exists():
@@ -187,10 +199,15 @@ def start_opensearch(server_cpus):
     cmd = ["taskset", "-c", ",".join(map(str, server_cpus)), "runuser", "-u", "osuser", "--", "env",
            f"OPENSEARCH_JAVA_OPTS=-Xms{heap} -Xmx{heap}", f"LD_LIBRARY_PATH={knn_lib}",
            str(OS_HOME / "bin" / "opensearch"), "-Ediscovery.type=single-node", "-Eplugins.security.disabled=true",
-           "-Ehttp.port=9200", f"-Enode.processors={len(server_cpus)}"]
+           f"-Ehttp.port={port}", f"-Enode.processors={len(server_cpus)}"]
     proc = subprocess.Popen(cmd, stdout=open("/content/opensearch.log", "w"), stderr=subprocess.STDOUT,
                             start_new_session=True)
-    wait_until(lambda: http_json("GET", "http://localhost:9200")["version"]["number"], "opensearch", 300)
+    try:
+        wait_until(lambda: http_json("GET", f"http://localhost:{port}")["version"]["number"], "opensearch", 300,
+                   proc=proc, log="/content/opensearch.log")
+    except Exception:
+        stop(proc)
+        raise
     say(f"opensearch: up, heap {heap}, {len(server_cpus)} processors")
     return proc
 
@@ -207,13 +224,16 @@ def stop(proc):
 
 def opensearch_target(ds, server_cpus):
     os.environ["S3_SEARCH_OS_ANALYZER"] = "english"         # the prototype indexed OpenSearch with `english`
+    port = free_port()
+    base = f"http://localhost:{port}"
+    os.environ["S3_SEARCH_OPENSEARCH_URL"] = base          # the referee's adapter reads it when imported
     from referee import opensearch as osref
-    proc = start_opensearch(server_cpus)
+    proc = start_opensearch(server_cpus, port)
     t0 = time.time()
     say("opensearch: indexing 1.2M products (the referee's adapter: same mapping, english analyzer)")
     ix = osref.build_index(ds.catalogue, ds.mapping)
     build_s = time.time() - t0
-    http_json("POST", f"http://localhost:9200/{ix.name}/_forcemerge?max_num_segments=1", timeout=3600)
+    http_json("POST", f"{base}/{ix.name}/_forcemerge?max_num_segments=1", timeout=3600)
     say(f"opensearch: index {ix.name} ready in {build_s:.0f} s (force-merged to one segment)")
     tmpl = json.loads(Path("referee/requests/opensearch-cross-fields-tuned.json").read_text())
 
@@ -222,7 +242,7 @@ def opensearch_target(ds, server_cpus):
         b["query"]["multi_match"]["query"] = q
         return {**b, "size": K, "_source": False, "track_total_hits": False}
 
-    return proc, f"http://localhost:9200/{ix.name}/_search", body, build_s
+    return proc, f"{base}/{ix.name}/_search", body, build_s
 
 
 def engine_target(ds, server_cpus):
@@ -242,12 +262,17 @@ def engine_target(ds, server_cpus):
     build_s = time.time() - t0
     env = {**os.environ, "S3_SERVING_CACHE": "0", "S3_SERVING_MAX_BATCH": opt("max-batch", "64"),
            "S3_SERVING_MAX_WAIT_MS": opt("max-wait-ms", "2"), "S3_SEARCH_DEVICE": "cuda"}
+    port = free_port()
     cmd = ["taskset", "-c", ",".join(map(str, server_cpus)), sys.executable, "-m", "serving", "--data-dir",
-           str(SERVE_DIR), "--device", "cuda", "--preload", "esci", "--port", "8080"]
+           str(SERVE_DIR), "--device", "cuda", "--preload", "esci", "--port", str(port)]
     proc = subprocess.Popen(cmd, env=env, stdout=open("/content/serving.log", "w"), stderr=subprocess.STDOUT,
                             start_new_session=True)
-    wait_until(lambda: urllib.request.urlopen("http://localhost:8080/readyz", timeout=5).status == 200,
-               "serving", 1800)
+    try:
+        wait_until(lambda: urllib.request.urlopen(f"http://localhost:{port}/readyz", timeout=5).status == 200,
+                   "serving", 1800, proc=proc, log="/content/serving.log")
+    except Exception:
+        stop(proc)
+        raise
     say(f"engine: serving on cuda (index built in {build_s:.0f} s; query cache off, max_batch "
         f"{env['S3_SERVING_MAX_BATCH']}, max_wait {env['S3_SERVING_MAX_WAIT_MS']} ms)")
     tmpl = json.loads(Path("referee/requests/bm25f-tuned.json").read_text())
@@ -257,7 +282,7 @@ def engine_target(ds, server_cpus):
         b["query"]["multi_match"]["query"] = q
         return {**b, "size": K}
 
-    return proc, "http://localhost:8080/indexes/esci/_search", body, build_s
+    return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
 
 
 class Sampler:
@@ -338,7 +363,13 @@ def main():
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "engines": {}}
     for name in ENGINES:
         target = engine_target if name == "engine" else opensearch_target
-        proc, url, make_body, build_s = target(ds, server_cpus)
+        try:
+            proc, url, make_body, build_s = target(ds, server_cpus)
+        except Exception as e:                                   # recorded; the other engine still runs
+            say(f"{name}: FAILED to start: {e}")
+            out["engines"][name] = {"error": str(e)[-3000:]}
+            json.dump(out, open("/content/fair-bench.json", "w"), indent=1)
+            continue
         try:
             bodies = [json.dumps(make_body(t)).encode() for t in texts]
             for b in bodies[:200]:                               # warm-up, one at a time

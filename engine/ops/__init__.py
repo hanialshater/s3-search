@@ -6,9 +6,9 @@ from .lexical import bm25f, bm25f_groups, bm25f_multi, sum_lr
 from .dense import dense_exact, dense_scores
 from .filters import range_mask, term_mask
 from .facets import facet_terms, top_buckets
-from .page import page
+from .page import page, page_arrays
 from .fusion import rrf
 from .features import FEATURE_BASE, feature_names, gather_features
 
-__all__ = ["bm25f", "bm25f_groups", "bm25f_multi", "dense_exact", "dense_scores", "term_mask", "range_mask", "facet_terms", "top_buckets", "page",
+__all__ = ["bm25f", "bm25f_groups", "bm25f_multi", "dense_exact", "dense_scores", "term_mask", "range_mask", "facet_terms", "top_buckets", "page", "page_arrays",
            "rrf", "FEATURE_BASE", "feature_names", "gather_features"]

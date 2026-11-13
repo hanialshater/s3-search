@@ -21,16 +21,39 @@ def after_mask(b, keys, after, tiekey=None):
     return out | (eq & (doc > int(after[-1])))
 
 
-def page(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None, collapse=None):
+def page(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None, collapse=None, count=None):
     """``keys``: list of ``(array[N], descending)``; the first may be the float32 score. ``extra``: arrays[N] to read
     at the page's docs (e.g. the score). Returns host ``(doc_ids list[int], key_values list[list], extra_values
-    list[list])``."""
-    # collapse: int64[N] group codes (S7-3): only the first doc of each group in sort order is kept, and
-    # from/size count groups.
+    list[list])``; with ``count`` (a bool[N] mask), also its number of true entries, in the same transfer."""
+    r = page_arrays(b, keys, mask, from_, size, after, extra, tiekey, collapse, count)
+    return (r[0].tolist(), r[1].tolist(), r[2].tolist()) + tuple(r[3:])
+
+
+def page_arrays(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None, collapse=None,
+                count=None):
+    """``page`` as host arrays (S6-7): ``(doc_ids int64[h], key_values float64[h, len(keys)], extra_values
+    float64[h, len(extra)])``, plus ``count``'s number of true entries when it is given (S6-6: the hits total rides
+    on the page's one transfer)."""
+    nk, ne = len(keys), len(extra)
+    head = [b.asarray(b.count_nonzero(count), "float64").reshape(1)] if count is not None else []
+
+    def finish(host2d):
+        """Split the host rows; a total, if asked for, was the first value of the transfer."""
+        return (host2d[:, 0].astype("int64"), host2d[:, 1:1 + nk], host2d[:, 1 + nk:])
+
+    def empty():
+        """No hits: one transfer for the total when it is asked for, an empty page either way."""
+        if head:
+            tot = b.to_numpy(head[0])
+            blank = tot[:0].reshape(0, 1).repeat(1 + nk + ne, axis=1)
+        else:
+            blank = b.to_numpy(b.zeros((0, 1 + nk + ne), "float64"))
+        return finish(blank) + ((int(tot[0]),) if head else ())
+
     valid = mask if after is None else mask & after_mask(b, keys, after, tiekey)
     need = from_ + size
     if need == 0:
-        return [], [], []
+        return empty()
     if collapse is None and len(keys) == 1 and keys[0][1] and str(keys[0][0].dtype).endswith("float32"):
         idx, _ = b.topk(keys[0][0].reshape(1, -1), need, valid.reshape(1, -1))
         sel = b.astype(idx[0][from_:need], "int64")
@@ -48,12 +71,15 @@ def page(b, keys, mask, from_: int, size: int, after=None, extra=(), tiekey=None
             cand = cand[firsts[b.argsort(firsts)]]   # back in sort order
         sel = cand[from_:need]
     if sel.shape[0] == 0:
-        return [], [], []
+        return empty()
     safe = b.where(sel >= 0, sel, 0)
     cols = [b.astype(sel, "float64")] + [b.astype(k[safe], "float64") for k, _ in keys] + \
         [b.astype(e[safe], "float64") for e in extra]
-    host = b.to_numpy(b.stack(cols, 1))             # the one transfer
+    flat = b.stack(cols, 1).reshape(-1)
+    host = b.to_numpy(b.concatenate(head + [flat], 0) if head else flat)   # the one transfer
+    tot = None
+    if head:
+        tot, host = int(host[0]), host[1:]
+    host = host.reshape(-1, 1 + nk + ne)
     host = host[host[:, 0] >= 0]
-    nk = len(keys)
-    ids = host[:, 0].astype("int64").tolist()
-    return ids, host[:, 1:1 + nk].tolist(), host[:, 1 + nk:].tolist()
+    return finish(host) + ((tot,) if head else ())

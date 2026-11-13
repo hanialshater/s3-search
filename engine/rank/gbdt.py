@@ -133,17 +133,25 @@ class GBDT:
         ge = (x.reshape(n, x.shape[1], 1) >= d["edges"].reshape(1, *d["edges"].shape)) & \
             d["real"].reshape(1, *d["real"].shape)                                    # real edges <= x
         xb = b.where(nan, 0, b.sum(b.astype(ge, "int64"), axis=2) + 1)
+        # Every tree walks at once (S6-5): node is int64[n, T], an index into the flattened [T * M] node arrays, so
+        # a depth level is a few gathers whatever the number of trees (one tree at a time was T x depth small
+        # kernels: 100.7 ms at batch 1 on an A100).
+        T, M = d["feature"].shape
+        feat, thr = d["feature"].reshape(-1), d["bin"].reshape(-1)
+        left, right = d["left"].reshape(-1), d["right"].reshape(-1)
+        base = (b.arange(T) * M).reshape(1, T)
+        rows = b.arange(n).reshape(n, 1)
+        node = b.zeros((n, T), "int64")
+        for _ in range(self.max_depth + 1):
+            at = base + node
+            f = feat[at]
+            inner = f >= 0
+            go_left = xb[rows, b.where(inner, f, 0)] <= thr[at]
+            node = b.where(inner, b.where(go_left, left[at], right[at]), node)
+        leaf = d["value"].reshape(-1)[base + node]                                  # float64[n, T]
         out = b.full(n, self.base, "float64")
-        rows = b.arange(n)
-        for t in range(len(self.trees)):
-            node = b.zeros(n, "int64")
-            feat, thr, left, right = d["feature"][t], d["bin"][t], d["left"][t], d["right"][t]
-            for _ in range(self.max_depth + 1):
-                f = feat[node]
-                inner = f >= 0
-                go_left = xb[rows, b.where(inner, f, 0)] <= thr[node]
-                node = b.where(inner, b.where(go_left, left[node], right[node]), node)
-            out = out + d["value"][t][node]
+        for t in range(len(self.trees)):              # added one tree at a time, in predict's order: the same bits
+            out = out + leaf[:, t]
         return b.astype(out, "float32")
 
     def contributions(self, X):

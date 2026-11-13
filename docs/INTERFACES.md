@@ -600,6 +600,32 @@ Scoring, exactly:
   also has `reason`, a sentence naming why (e.g. `"not a cuda index (device cpu)"`). Several clauses on one field
   give a list of these objects, in request order (a depth-first walk of the query, then `post_filter`).
 
+**Columnar hits (S6-7, additive; 2026-11-13, architect).** At depth 2,000 the engine's server spent its one Python
+core building and encoding a dict per hit (the matched load test of 2026-11-13: 50 QPS sustained, the GPU at 7%). A
+caller that encodes responses itself (serving) may ask for the hits as columns instead:
+
+```python
+Index.search(request, hits="columns") -> dict
+Index.search_batch(requests, hits="columns") -> list[dict]     # hits="dicts" (the default) is unchanged
+engine.api.expand_hits(response) -> dict                        # columns -> the dict form, exactly
+```
+
+- The response is the dict form's in every key except `hits.hits`, which is replaced by `hits.columns`:
+  `{"total": n, "columns": {"_id": list[str], "_score": numpy float32[h], "sort": [column, ...]}}` for the `h` hits
+  of the page, in hit order.
+- `sort` has one column per position of a hit's `sort` list (the tier under `rescore`, each sort key, then
+  `first_offset`). A column is `{"values": ..., "missing": numpy bool[h] | None}`. `values` is a numpy array
+  (`int64` for the tier, `_doc`, `first_offset` and integer fields; `float64` for `_score`, float fields and
+  `_geo_distance`; `bool` for boolean fields), or a `list[str]` for a keyword field. `missing` marks the hits whose
+  value is `None` in the dict form (their `values` entry is unspecified); it is `None` when no hit is missing.
+- A request with `collapse`, `highlight` or `explain` (per-hit extras) is answered in the dict form even when
+  columns are asked for: a response has exactly one of `hits.hits` and `hits.columns`, and the caller checks which.
+- `expand_hits(resp)` gives exactly what `hits="dicts"` gives for the same request on the same state (`_score` is
+  `float(values[i])` of the float32; the referee's contract requests are the test). A response already in the dict
+  form is returned unchanged.
+- Serving owns the bytes (JSON or otherwise) it builds from the columns; the HTTP response it sends is unchanged
+  (section 7). Columns are host arrays (numpy), never device tensors.
+
 ## 6. The plan (DSL → operators) · owner architect
 
 Two passes (S3):
@@ -939,3 +965,8 @@ status:
   large catalogue in a single-threaded process without CUDA started, in forked worker processes (`S3_BUILD_WORKERS`, default the CPU
   affinity; 1 turns it off); missing checks, keyword columns, presence bitmaps and the slot and id maps are
   vectorised. The segment is unchanged byte for byte (its checksum is equal on toy and ESCI-sample). No format change.
+- 2026-11-13, architect (S6-7, the matched load test): section 5 gains **columnar hits**, `hits="columns"` on
+  `Index.search` and `Index.search_batch` and `engine.api.expand_hits`, so serving can encode deep pages without a
+  Python dict per hit. Additive and opt-in: the default response is unchanged, and so is serving's HTTP response.
+  Also recorded today: one set of BM25F parameters per index (section 4), the last-write rule for a repeated id in one
+  `patch` call, and that nested text fields keep the default BM25F parameters (section 2).

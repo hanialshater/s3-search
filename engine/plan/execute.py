@@ -606,6 +606,42 @@ class Executor:
         out.append(int(doc))
         return out
 
+    def _sort_columns(self, plan, rows, first_offset, has_tier):
+        """``_sort_values`` for a whole page at once (S6-7, INTERFACES §5 "Columnar hits"): one column per position of
+        a hit's ``sort`` list, ``{"values", "missing"}``, so that expanding them gives exactly ``_sort_values``."""
+        st = self.st
+        out = []
+        j = 0
+        if has_tier:
+            out.append({"values": rows[:, 0].astype(np.int64), "missing": None})
+            j = 1
+        for k in plan.sort:
+            v = rows[:, j]
+            j += 1
+            miss = None
+            if k.field == "_score":
+                vals = v.astype(np.float64)
+            elif k.field == "_doc":
+                vals = v.astype(np.int64)
+            else:
+                inf = np.isinf(v)
+                miss = inf if inf.any() else None
+                safe = np.where(inf, 0.0, v)
+                if k.geo is not None:
+                    vals = safe.astype(np.float64)
+                elif k.field in st.keywords:
+                    kv = st.keywords[k.field].values
+                    vals = [kv[c] for c in safe.astype(np.int64).tolist()]
+                elif st.num_dtype[k.field] == "bool":
+                    vals = safe.astype(bool)
+                elif st.num_dtype[k.field].startswith("int"):
+                    vals = safe.astype(np.int64)
+                else:
+                    vals = safe.astype(np.float64)
+            out.append({"values": vals, "missing": miss})
+        out.append({"values": first_offset.astype(np.int64), "missing": None})
+        return out
+
     # ---- the ranker
     def _rescore(self, plan, score, match, ctx, timer):
         from ..rank.features import candidate_features
@@ -635,15 +671,19 @@ class Executor:
         timer.lap("rank")
         return new, tier
 
-    # ---- one batch
-    def run(self, plans: list[Plan]) -> list[dict]:
+    # ---- one batch (S6-6): each plan's match set and scores first; then one count, the terms facets and the
+    # plain score-sorted pages for the whole batch, each in one transfer; the rest per plan, as before.
+    BATCH_ROWS = 64                                   # plans stacked per [B, N] step (bounds the device memory)
+    BATCHED = True                                    # False: every plan on the per-plan path (the reference)
+
+    def run(self, plans: list[Plan], columns: bool = False) -> list[dict]:
         b, st = self.b, self.st
         timer = Timer(b)
         shared_t0 = time.perf_counter()
         self._prefetch(plans, timer)
         shared = dict(timer.laps)
         shared_ms = (time.perf_counter() - shared_t0) * 1000.0
-        out = []
+        states = []
         for plan in plans:
             t = Timer(b)
             ctx = {"explain": {} if plan.explain else None}
@@ -655,22 +695,57 @@ class Executor:
             hits_mask = match
             if plan.post_filter is not None:             # aggregations see the query's matches, hits these
                 hits_mask = match & self.eval(plan.post_filter, {"explain": None})[1]
-            total = int(b.count_nonzero(hits_mask))
             tier = None
             if plan.rescore is not None:
                 score, tier = self._rescore(plan, score, match, ctx, t)
+            states.append({"plan": plan, "t": t, "ctx": ctx, "score": score, "match": match, "hits_mask": hits_mask,
+                           "tier": tier, "knn": _knn_methods(b, plan, self.knn_outcome)})
+        totals, pages = self._batched_totals_and_pages(states)
+        aggs = self._batched_terms(states)
+        out = []
+        for i, sx in enumerate(states):
+            plan, t, score, tier = sx["plan"], sx["t"], sx["score"], sx["tier"]
+            total = totals.get(i)
             resp = {}
             if plan.aggs:
-                resp["aggregations"] = {a.name: self._agg(a, match) for a in plan.aggs}
-                t.lap("facet")
-            keys = self._keys(plan, score, tier)
-            after = self._after_to_keys(plan, plan.search_after, tier is not None) if plan.search_after else None
+                t0 = time.perf_counter()
+                done = aggs.get(i, {})
+                resp["aggregations"] = {a.name: done[a.name] if a.name in done else self._agg(a, sx["match"])
+                                        for a in plan.aggs}
+                t.laps["facet"] += sx.pop("facet_ms", 0.0) + (time.perf_counter() - t0) * 1000.0
+            t.t = time.perf_counter()
             group = None
             if plan.collapse is not None:
                 group, group_keys = self._facet_codes(plan.collapse)
-            extra_cols = [score, st.first_offset_dev] + ([group] if group is not None else [])
-            ids, rows, extra = ops.page(b, keys, hits_mask, plan.from_, plan.size, after, extra=extra_cols,
-                                        tiekey=st.first_offset_dev, collapse=group)
+            want_columns = columns and group is None and plan.highlight is None and not plan.explain
+            if i in pages:                               # the batched page: same arrays as ops.page_arrays
+                ids_a, rows_a, extra_a = pages[i]
+                t.laps["page"] += sx.pop("page_ms", 0.0)
+            elif want_columns:
+                keys = self._keys(plan, score, tier)
+                after = self._after_to_keys(plan, plan.search_after, tier is not None) if plan.search_after else None
+                ids_a, rows_a, extra_a, total = ops.page_arrays(b, keys, sx["hits_mask"], plan.from_, plan.size,
+                                                                after, extra=[score, st.first_offset_dev],
+                                                                tiekey=st.first_offset_dev, count=sx["hits_mask"])
+            else:
+                keys = self._keys(plan, score, tier)
+                after = self._after_to_keys(plan, plan.search_after, tier is not None) if plan.search_after else None
+                extra_cols = [score, st.first_offset_dev] + ([group] if group is not None else [])
+                ids, rows, extra, total = ops.page(b, keys, sx["hits_mask"], plan.from_, plan.size, after,
+                                                   extra=extra_cols, tiekey=st.first_offset_dev, collapse=group,
+                                                   count=sx["hits_mask"])
+                ids_a = None
+            if want_columns:
+                cols = {"_id": st.ids[ids_a].tolist(), "_score": extra_a[:, 0].astype(np.float32),
+                        "sort": self._sort_columns(plan, rows_a, extra_a[:, 1], tier is not None)}
+                t.lap("page")
+                resp = {"hits": {"total": total, "columns": cols}, **resp}
+                if sx["knn"]:
+                    resp["knn"] = sx["knn"]
+                out.append(self._took(resp, shared, shared_ms, t))
+                continue
+            if ids_a is not None:                        # a batched page, in the dict form
+                ids, rows, extra = ids_a.tolist(), rows_a.tolist(), extra_a.tolist()
             score_h = [e[0] for e in extra]
             hits = [{"_id": str(st.ids[d]), "_score": float(e[0]),
                      "sort": self._sort_values(plan, r, int(e[1]), tier is not None)}
@@ -681,9 +756,8 @@ class Executor:
                     h["fields"] = {plan.collapse: [None if c == 0 else group_keys[c]]}
             t.lap("page")
             resp = {"hits": {"total": total, "hits": hits}, **resp}
-            knn = _knn_methods(b, plan, self.knn_outcome)
-            if knn:
-                resp["knn"] = knn
+            if sx["knn"]:
+                resp["knn"] = sx["knn"]
             if plan.highlight is not None:
                 from ..highlight import highlight_hits
                 for h, hl in zip(hits, highlight_hits(st, plan, ids)):
@@ -691,11 +765,83 @@ class Executor:
                         h["highlight"] = hl
             if plan.explain:
                 from ..explain import explain_hits
-                resp["explain"] = explain_hits(self, plan, ctx, ids, score_h)
-            took = {k: round(v, 3) for k, v in shared.items()}
-            for k, v in t.laps.items():
-                took[k] = round(took.get(k, 0.0) + v, 3)
-            took["total"] = round(shared_ms + t.total(), 3)
-            resp["took_ms"] = took
-            out.append(resp)
+                resp["explain"] = explain_hits(self, plan, sx["ctx"], ids, score_h)
+            out.append(self._took(resp, shared, shared_ms, t))
         return out
+
+    @staticmethod
+    def _took(resp, shared, shared_ms, t):
+        took = {k: round(v, 3) for k, v in shared.items()}
+        for k, v in t.laps.items():
+            took[k] = round(took.get(k, 0.0) + v, 3)
+        took["total"] = round(shared_ms + t.total(), 3)
+        resp["took_ms"] = took
+        return resp
+
+    def _chunks(self, idx):
+        for k in range(0, len(idx), self.BATCH_ROWS):
+            yield idx[k:k + self.BATCH_ROWS]
+
+    def _batched_terms(self, states):
+        """``{plan index: {agg name: result}}`` for the plain terms aggregations (no sub-aggregations), grouped by
+        field and size: one bincount and one top-buckets transfer per group and chunk, the same buckets as ``_agg``."""
+        b = self.b
+        groups = defaultdict(list)
+        for i, sx in enumerate(states):
+            for a in sx["plan"].aggs:
+                if self.BATCHED and a.kind == "terms" and not a.sub:
+                    groups[(a.field, a.size)].append((i, a))
+        out = defaultdict(dict)
+        for (field, size), items in groups.items():
+            t0 = time.perf_counter()
+            codes, keys_of = self._facet_codes(field)
+            for ch in self._chunks(items):
+                mask = b.stack([states[i]["match"] for i, _ in ch], 0)
+                counts = ops.facet_terms(b, codes, mask, len(keys_of))
+                for (i, a), (top, with_value) in zip(ch, ops.top_buckets(b, counts, size)):
+                    out[i][a.name] = {"doc_count_error_upper_bound": 0,
+                                      "sum_other_doc_count": with_value - sum(c for _, c in top),
+                                      "buckets": [{"key": keys_of[c], "doc_count": n} for c, n in top]}
+            ms = (time.perf_counter() - t0) * 1000.0 / len(items)
+            for i, _ in items:
+                states[i]["facet_ms"] = states[i].get("facet_ms", 0.0) + ms
+        return out
+
+    def _batched_totals_and_pages(self, states):
+        """``({plan index: hits.total}, {plan index: (doc ids, key values, extra values)})`` for the plans sorted by
+        score alone (descending; no tier, collapse or search_after): per chunk of them, one count over the stacked hit
+        masks and one top-k over the stacked scores, brought to the host in one transfer (the other plans' totals ride
+        on their own page's transfer). A row's first ``from + size`` of a larger top-k are its own top-k (the order is score descending, then doc id), so each
+        page equals ``ops.page_arrays``'s."""
+        b, st = self.b, self.st
+
+        def is_plain(sx):
+            p = sx["plan"]
+            return (sx["tier"] is None and p.collapse is None and not p.search_after and len(p.sort) == 1
+                    and p.sort[0].field == "_score" and p.sort[0].descending and p.from_ + p.size > 0
+                    and str(sx["score"].dtype).endswith("float32"))
+
+        totals, pages = {}, {}
+        for ch in self._chunks([i for i, sx in enumerate(states) if self.BATCHED and is_plain(sx)]):
+            t0 = time.perf_counter()
+            G = len(ch)
+            V = b.stack([states[i]["hits_mask"] for i in ch], 0)
+            S = b.stack([states[i]["score"] for i in ch], 0)
+            idx, _ = b.topk(S, max(states[i]["plan"].from_ + states[i]["plan"].size for i in ch), V)
+            need = idx.shape[1]                           # min(the largest from + size, N)
+            idx = b.astype(idx, "int64")
+            safe = b.where(idx >= 0, idx, 0)
+            rows = b.arange(G).reshape(G, 1)
+            buf = b.stack([b.astype(idx, "float64"), b.astype(S[rows, safe], "float64"),
+                           b.astype(st.first_offset_dev[safe], "float64")], 2)         # [G, need, 3]
+            host = b.to_numpy(b.concatenate([b.astype(b.count_nonzero(V, axis=1), "float64"), buf.reshape(-1)], 0))
+            pg = host[G:].reshape(G, need, 3)                # one transfer for the chunk: totals, then pages
+            ms = (time.perf_counter() - t0) * 1000.0 / G
+            for r, i in enumerate(ch):
+                p = states[i]["plan"]
+                totals[i] = int(host[r])
+                h = pg[r, p.from_:p.from_ + p.size]
+                h = h[h[:, 0] >= 0]
+                pages[i] = (h[:, 0].astype("int64"), h[:, 1:2], h[:, 1:3])
+                states[i]["page_ms"] = ms
+        return totals, pages
