@@ -142,7 +142,7 @@ for an engine change.
 
 | Id | Item | Owner | Status | Claimed |
 |---|---|---|---|---|
-| CI-1 | `colab/gpu_ci.py` (referee fast and the engine tests on a Colab GPU) and `engine/tests/test_write_paths_devices.py` (every write path on each device against cpu). Built out of process by the coordinator (ba28176); reviewed by the architect | architect | in review | architect, 2026-11-13 |
+| CI-1 | `colab/gpu_ci.py` (referee fast and the engine tests on a Colab GPU) and `engine/tests/test_write_paths_devices.py` (every write path on each device against cpu). Built out of process by the coordinator (ba28176); reviewed by the architect; a serving-tests suite and short shas (b75d708, from the platform-engineer) | architect | in review | architect, 2026-11-13 |
 | CI-2 | A CPU Colab runner for the referee and the engine tests at `requirements.txt`'s versions, for machines whose local Python cannot run them | architect | open | |
 
 ## S10 · A PyTerrier-style pipeline DSL (architect)
