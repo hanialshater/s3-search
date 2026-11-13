@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S3 Search demo</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>S3 Search</h1>
+  <form id="search-form" role="search">
+    <div class="search-wrap">
+      <label class="sr" for="q">Search the catalogue</label>
+      <input id="q" type="search" placeholder="Search products" autocomplete="off" autofocus
+             role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggest">
+      <ul id="suggest" role="listbox" aria-label="Suggestions" hidden></ul>
+    </div>
+    <button type="submit">Search</button>
+  </form>
+  <label class="toggle"><input id="explain" type="checkbox"> Explain scores</label>
+</header>
+
+<div class="layout">
+  <aside id="filters" aria-label="Filters">
+    <div id="dynamic-filters"></div>
+    <button id="clear" type="button">Clear filters</button>
+  </aside>
+
+  <main>
+    <div class="bar-row">
+      <p id="summary" role="status" aria-live="polite"></p>
+      <label id="sort-box" hidden>Sort <select id="sort"></select></label>
+      <label id="collapse-box" hidden><input id="collapse" type="checkbox"> One result per brand</label>
+    </div>
+    <p id="error" role="alert" hidden></p>
+    <ol id="results"></ol>
+    <nav id="pager" aria-label="Pages">
+      <button id="prev" type="button" disabled>Previous</button>
+      <span id="page-label"></span>
+      <button id="next" type="button" disabled>Next</button>
+    </nav>
+    <p id="timing" class="mut"></p>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

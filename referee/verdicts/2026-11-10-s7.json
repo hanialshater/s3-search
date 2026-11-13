@@ -1,0 +1,225 @@
+{
+ "judge": "evaluation-steward",
+ "date": "2026-11-10",
+ "label": "CPU, development only (2 cores, device cpu)",
+ "predictions_source": "the lab's company/milestones.json, S7, as written",
+ "disclosure_adapter_stemmer": {
+  "when": "after an engine result on s7-v1 was seen",
+  "what_was_seen_first": "the first engine run against the first recording: exact 137/146, avg/stats 15/16, phrase 40/40, highlight 20/20, info 23/32. The failing requests were match queries whose words of one or two letters (xs, us) the two sides analysed differently, and three exists requests.",
+  "timeline_utc": {
+   "suite and rules committed": "0b69e2e 2026-11-10 01:53:30",
+   "first recording committed": "d262631 2026-11-10 01:54:18",
+   "first engine run": "after d262631",
+   "adapter fixed and both suites re-recorded": "e5f3c87 2026-11-10 01:59:39"
+  },
+  "why_it_is_the_adapters_correctness_not_tuning": "INTERFACES section 2 has named the analyzer's stemmer as Snowball's Porter since its first version, before S7 existed: 'stopwords, Porter stemmer via `snowballstemmer`' (docs/INTERFACES.md line 117 at 4a17dc7, 2026-11-09 23:25:45 UTC). The referee's own analyzer followed it from the start (referee/porter.py, 9e2a700, 2026-11-09: 'It follows Snowball's porter definition'). The adapter's porter_stem (Lucene's PorterStemmer, which leaves one- and two-letter words alone) departed from that spec on the OpenSearch side; Lucene's snowball filter with language Porter is the specified algorithm. Nothing on the engine side or in the suite or its rules changed. The toy v2 recording, re-made with the fix, changed in 2 unsupported-family answers only, judged on the engine alone, so S3's verdicts are unaffected.",
+  "still_counted": "the exists failures (an engine defect) were the same in both runs and are counted against prediction 1"
+ },
+ "verdicts": {
+  "S7 prediction 1": {
+   "verdict": "wrong",
+   "text": "On S7's new conformance families, replayed against OpenSearch 2.19 on ESCI-sample, the exact features (exists, ids, prefix, post_filter, collapse, and the min/max/sum/value_count/cardinality/range/histogram aggregations) return identical hits, counts and values in at least 98% of requests; avg and stats agree within 1e-6 relative",
+   "command": "S3_SEARCH_SAMPLE=data/esci-sample taskset -c 0,1 python -m referee.conformance_s7",
+   "suite": "s7-v1, 254 requests (referee/conformance_s7.py, 0b69e2e); recording referee/conformance/opensearch-2.19-esci-sample-s7-v1.jsonl.gz (e5f3c87)",
+   "data_deviation": "ESCI-sample plus the judges' synthetic price and stock (seed 20261112), identical on both sides: ESCI has no numeric fields",
+   "exact": {
+    "passed": 143,
+    "n": 146,
+    "rate": 0.9795
+   },
+   "avg_stats": {
+    "passed": 16,
+    "n": 16,
+    "within_1e-6_relative": true,
+    "verdict_of_this_clause": "held"
+   },
+   "by_family": {
+    "exists": "9/12",
+    "ids": "12/12",
+    "prefix": "20/20",
+    "post_filter": "20/20",
+    "collapse": "20/20",
+    "agg_min_max": "12/12",
+    "agg_sum": "8/8",
+    "agg_value_count": "8/8",
+    "agg_cardinality": "10/10",
+    "agg_range": "12/12",
+    "agg_histogram": "12/12"
+   },
+   "failures": [
+    {
+     "id": 4,
+     "family": "exists",
+     "request": "exists product_description, price in [161.35, 215.42)",
+     "engine_total": 2628,
+     "opensearch_total": 2632
+    },
+    {
+     "id": 6,
+     "family": "exists",
+     "request": "exists product_color, price in [36.28, 90.09)",
+     "engine_total": 3608,
+     "opensearch_total": 3617
+    },
+    {
+     "id": 7,
+     "family": "exists",
+     "request": "exists product_description, price in [209.03, 261.57)",
+     "engine_total": 2558,
+     "opensearch_total": 2559
+    }
+   ],
+   "why_wrong": "143/146 = 97.9%, one request under 98%. The three failures are an engine defect: exists skipped values that analyse to no token (4, 9 and 1 such values), which OpenSearch counts as existing.",
+   "post_fix_information_not_a_verdict": "after the architect's fix 8d6344f (exists follows the stored value), the same suite gives exact 146/146; the verdict above stands, judged before the fix"
+  },
+  "S7 prediction 2": {
+   "verdict": "held",
+   "text": "match_phrase (slop 0 and 2) returns the same hit set as OpenSearch in at least 95% of its requests, and every highlight fragment the engine returns contains at least one analysed query term",
+   "phrase": {
+    "slop0": "20/20",
+    "slop2": "20/20",
+    "rate": 1.0
+   },
+   "highlight": {
+    "requests": "20/20",
+    "fragments_checked": 2419,
+    "fragments_without_a_query_term": 0
+   }
+  },
+  "S7 prediction 3": {
+   "verdict": "wrong",
+   "text": "Adding S7 changes nothing that was already supported: on ESCI-sample fit, the bench's nDCG@10 (0.4644) and Exact recall@100 (0.7551) are unchanged to 4 decimals, the 200 v1 conformance requests still pass against the reference, CPU p99 at batch 1 rises by at most 20%, and referee fast stays under 60 s on 2 cores",
+   "command": "taskset -c 0,1 python -m referee.judge_s7 --pre-s7=<24dbf46's engine/> --rounds=3",
+   "clauses": {
+    "nDCG@10 0.4644 to 4 decimals": {
+     "measured": 0.4644,
+     "held": true
+    },
+    "Exact recall@100 0.7551 to 4 decimals": {
+     "measured": 0.7551,
+     "held": true
+    },
+    "the 200 v1 conformance requests still pass against the reference": {
+     "measured": "184/200 (the 16 unsupported-family requests fail: the engine now answers match_phrase, fuzzy and avg, which the reference refuses)",
+     "held": false
+    },
+    "CPU p99 at batch 1 rises by at most 20%": {
+     "pre_s7_engine": "24dbf46 (the first parent of the S7-1 merge 7fb0a84)",
+     "p99_ms_pre": [
+      5.631,
+      5.745,
+      5.365
+     ],
+     "p99_ms_post": [
+      5.229,
+      5.061,
+      5.815
+     ],
+     "median_pre": 5.631,
+     "median_post": 5.229,
+     "rise": -0.071,
+     "held": true,
+     "load": "start 0.46, run mean 0.99 (limit 2.75): quiet"
+    },
+    "referee fast under 60 s on 2 cores": {
+     "measured_s": 7.7,
+     "held": true
+    }
+   },
+   "why_wrong": "the v1 clause, as the prediction's recorded knownFlaw (coordinator, before judging) expected: v1's unsupported family is S7's own scope"
+  },
+  "S7 prediction 4": {
+   "verdict": "held",
+   "text": "The operator, with two replicas running against a real kube-apiserver, reconciles each SearchIndex change from exactly one replica (the Lease holder) within 1 s of the change, and the other takes over within 20 s when the holder stops; RPC serving returns the same responses as HTTP for the 200 v1 conformance requests",
+   "command": "python -m referee.judge_s7_p4 (runs deploy/test-envtest.sh on test_leader.py and test_watches.py; RPC parity of its own)",
+   "operator": {
+    "envtest": "19 passed (exit 0), real kube-apiserver and etcd",
+    "change_to_reconciled": "9 changes, max 86 ms; reconciles: leader 18, standby 0",
+    "takeover_after_sigkill": "15.1 s (lease held by the standby; its first change reconciled 50 ms later; Lease transitions 1)",
+    "handover_after_sigterm": "1.2 s",
+    "watches": "11 changes p50 83 ms, max 140 ms",
+    "load": "start 0.49, run mean 0.90: quiet"
+   },
+   "rpc_parity": {
+    "requests": 200,
+    "suite_sha256": "f9a3d704dac4 (v1)",
+    "differ": 0
+   }
+  },
+  "S7 prediction 5": {
+   "verdict": "held",
+   "text": "The demo page on ESCI-sample, in headless Chromium, answers autocomplete keystrokes at a p95 under 150 ms and searches with highlights and multi-select facets at a page-1 p95 under 300 ms, with 0 errors over 100 queries",
+   "command": "S3_SEARCH_SAMPLE=data/esci-sample taskset -c 0,1 python -m referee.judge s7p5 (referee/judge_s7p5.js; committed 0b1936f before the run, written before reading the tools-engineer's numbers)",
+   "setup": "S7-8 at 882c7be; ESCI-sample as served (no numeric fields); a real python -m serving replica behind python -m tools.demo; Playwright 1.63 bundled Chromium, headless; 100 sampled fit queries",
+   "clocks": {
+    "autocomplete": "each of a query's first 12 characters typed one at a time; timed in Node from the key until the suggestion list rendered for that prefix (the page's 40 ms debounce included); the next key waits for the render",
+    "page_1": "timed in Node from the action (Enter on the full query, a facet click) until the page rendered the answer",
+    "page_clocks_recorded_alongside": "window.__suggest.keystroke (input event to rendered list) and window.__demo.latencies (fetch round trip)"
+   },
+   "autocomplete_ms": {
+    "judge": {
+     "n": 1165,
+     "p50": 66.33012699999745,
+     "p95": 84.99140199999965,
+     "max": 170.45491200000106
+    },
+    "page_clock": {
+     "n": 1165,
+     "p50": 55.700000000186265,
+     "p95": 66.6000000005588
+    }
+   },
+   "page1_ms": {
+    "judge": {
+     "n": 300,
+     "p50": 62.44240699999864,
+     "p95": 89.12361599999986,
+     "max": 111.48991499999829
+    },
+    "page_clock": {
+     "n": 401,
+     "p50": 19.700000000186265,
+     "p95": 32.59999999962747
+    },
+    "note": "page 1 = 100 searches and 200 multi-select facet clicks; the page clock also counts its Clear clicks"
+   },
+   "page_turn_ms_judge_not_counted": {
+    "n": 47,
+    "p50": 74.06463999999687,
+    "p95": 98.44861200000014
+   },
+   "errors": {
+    "actions_with_an_error": 0,
+    "page_errors": 0,
+    "console_errors": 0
+   },
+   "features": {
+    "searches_requesting_highlights": "100/100",
+    "searches_showing_marked_words": "100/100",
+    "multi_select_with_post_filter": "100/100",
+    "facet_fields": [
+     "product_brand.keyword",
+     "product_color.keyword"
+    ]
+   },
+   "load": {
+    "start": 0.48,
+    "run_mean": 1.47,
+    "limit": 2.75
+   }
+  },
+  "S7 prediction 6 (added mid-run)": {
+   "verdict": "held",
+   "text": "The 184 v1 conformance requests outside its 'unsupported' family still pass against the reference after S7, and every construct S7 does not add (for example query_string, wildcard, regexp, nested, highlight on keyword fields, collapse inner_hits) is still refused with a named error",
+   "v1_outside_unsupported": "184/184",
+   "outside_s7_refused_with_a_named_path": "18/18 (referee/scope.py, item None; collapse inner_hits added 4996918)"
+  }
+ },
+ "info_families_not_counted": {
+  "fuzzy": "6/8",
+  "match_fuzziness": "4/8",
+  "match_bool_prefix": "6/8",
+  "function_score": "8/8",
+  "note": "Lucene's max_expansions (50) on fuzzy and match_bool_prefix selects expansions differently from the engine"
+ }
+}

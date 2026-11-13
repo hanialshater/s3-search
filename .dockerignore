@@ -1,0 +1,13 @@
+.git
+.claude
+data
+results
+datasets
+baseline
+demo
+tools
+referee
+**/__pycache__
+**/.pytest_cache
+**/tests
+*.parquet

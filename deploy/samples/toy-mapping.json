@@ -1,0 +1,59 @@
+{
+  "_meta": {
+    "engine": {
+      "id_field": "product_id",
+      "hot": [
+        "price",
+        "stock"
+      ],
+      "bm25": {
+        "k1": 1.2,
+        "b": 0.75
+      }
+    }
+  },
+  "dynamic": "strict",
+  "properties": {
+    "product_title": {
+      "type": "text",
+      "analyzer": "s3_english"
+    },
+    "product_brand": {
+      "type": "text",
+      "analyzer": "s3_english",
+      "fields": {
+        "keyword": {
+          "type": "keyword",
+          "ignore_above": 256
+        }
+      }
+    },
+    "product_color": {
+      "type": "text",
+      "analyzer": "s3_english",
+      "fields": {
+        "keyword": {
+          "type": "keyword",
+          "ignore_above": 256
+        }
+      }
+    },
+    "product_bullet_point": {
+      "type": "text",
+      "analyzer": "s3_english"
+    },
+    "product_description": {
+      "type": "text",
+      "analyzer": "s3_english"
+    },
+    "category": {
+      "type": "keyword"
+    },
+    "price": {
+      "type": "float"
+    },
+    "stock": {
+      "type": "integer"
+    }
+  }
+}

@@ -1,0 +1,3 @@
+{"query": {"multi_match": {"query": "{{query}}",
+  "fields": ["product_title^1.0", "product_brand^0.126", "product_color^0.14", "product_bullet_point^0.06",
+             "product_description^0.036"]}}}

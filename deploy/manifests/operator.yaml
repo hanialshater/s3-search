@@ -1,0 +1,66 @@
+# The operator itself: namespace, RBAC and a two-replica Deployment (leader election on a Lease). Apply the CRD first (deploy/crd/searchindex.yaml).
+# Nothing here is a cloud resource; it runs wherever the cluster is (kind in CI).
+apiVersion: v1
+kind: Namespace
+metadata: {name: s3-search-system}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: s3-operator, namespace: s3-search-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: s3-operator}
+rules:
+  - apiGroups: [search.s3.dev]
+    resources: [searchindexes]
+    verbs: [get, list, watch]
+  - apiGroups: [search.s3.dev]
+    resources: [searchindexes/status]
+    verbs: [get, patch, update]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, patch, update]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+  - apiGroups: [""]
+    resources: [services, persistentvolumeclaims]
+    verbs: [get, list, create, patch, update]
+  - apiGroups: [""]
+    resources: [configmaps, pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: s3-operator}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: s3-operator}
+subjects:
+  - {kind: ServiceAccount, name: s3-operator, namespace: s3-search-system}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: s3-operator, namespace: s3-search-system, labels: {app: s3-operator}}
+spec:
+  replicas: 2            # one leads (the Lease s3-operator), the other takes over within ~lease duration
+  selector: {matchLabels: {app: s3-operator}}
+  template:
+    metadata: {labels: {app: s3-operator}}
+    spec:
+      serviceAccountName: s3-operator
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: operator
+          image: s3-search:cpu
+          imagePullPolicy: IfNotPresent
+          command: [python, -m, deploy.s3operator]
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: S3_OPERATOR_IMAGE_CPU, value: "s3-search:cpu"}
+            - {name: S3_OPERATOR_IMAGE_CUDA, value: "s3-search:cuda"}
+          resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 256Mi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}

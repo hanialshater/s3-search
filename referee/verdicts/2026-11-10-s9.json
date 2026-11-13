@@ -1,0 +1,141 @@
+{
+ "judge": "evaluation-steward",
+ "date": "2026-11-10",
+ "label": "CPU, development only (2 cores)",
+ "commit_judged": "5e47ba1 (the branch head with d8ad2ea, the optional GPU encoder and trees, merged)",
+ "note": "p4, p5 and p6's comparison clauses were first run on the commit before d8ad2ea (all the same results); on the coordinator's word they were run again on 5e47ba1, and these are those runs",
+ "suite": "s9-v1 (referee/conformance_s9.py, committed 060f493 before the recording a7b5c85)",
+ "verdicts": {
+  "S9 prediction 4": {
+   "text": "geo_distance, geo_bounding_box and _geo_distance sort, replayed against OpenSearch 2.19 on ESCI-sample with synthetic geo_point locations, return identical hits and counts in at least 98% of requests (sort distances within 1e-6 relative), on cpu and torch-cpu",
+   "verdict": "held",
+   "command": "taskset -c 0,1 python -m referee.conformance_s9 --device=cpu; and with /tmp/claude-0/venv-torch/bin/python --device=torch-cpu",
+   "cpu": {
+    "passed": 100,
+    "n": 100,
+    "rate": 1.0
+   },
+   "torch-cpu": {
+    "passed": 100,
+    "n": 100,
+    "rate": 1.0
+   },
+   "by_family": {
+    "geo_distance": {
+     "cpu": "40/40",
+     "torch-cpu": "40/40"
+    },
+    "geo_bounding_box": {
+     "cpu": "30/30",
+     "torch-cpu": "30/30"
+    },
+    "geo_sort": {
+     "cpu": "30/30",
+     "torch-cpu": "30/30"
+    }
+   },
+   "distances": "every _geo_distance sort value within 1e-6 relative (the rule; no failure)"
+  },
+  "S9 prediction 5": {
+   "text": "nested queries (with score_mode) and nested aggregations, replayed against OpenSearch 2.19 on ESCI-sample with synthetic nested offers, return identical hits, counts and values in at least 98% of requests",
+   "verdict": "held",
+   "cpu": {
+    "passed": 90,
+    "n": 90,
+    "rate": 1.0
+   },
+   "torch-cpu": {
+    "passed": 90,
+    "n": 90,
+    "rate": 1.0
+   },
+   "by_family": {
+    "nested_query": {
+     "cpu": "40/40",
+     "torch-cpu": "40/40"
+    },
+    "nested_in_bool": {
+     "cpu": "20/20",
+     "torch-cpu": "20/20"
+    },
+    "nested_aggs": {
+     "cpu": "30/30",
+     "torch-cpu": "30/30"
+    }
+   }
+  },
+  "S9 prediction 6": {
+   "text": "Nothing already supported changes: bench nDCG@10 0.4644 and Exact recall@100 0.7551 to 4 decimals, conformance v2 exact 160/160, S7's suite exact 146/146, S8's quiesced equality, and referee fast under 60 s on 2 cores",
+   "verdict": "held",
+   "clauses": {
+    "bench nDCG@10 0.4644 and Exact recall@100 0.7551 to 4 decimals": {
+     "measured": [
+      0.4643594185392334,
+      0.7550547837544519
+     ],
+     "held": true
+    },
+    "conformance v2 exact 160/160": {
+     "measured": "160/160",
+     "held": true
+    },
+    "S7's suite exact 146/146": {
+     "measured": "146/146",
+     "held": true
+    },
+    "S8's quiesced equality": {
+     "measured": {
+      "version": 46002,
+      "same_version": true,
+      "fit_queries": 2000,
+      "differ": 0
+     },
+     "held": true,
+     "run": "referee.stream, 30 s at 200 changes/s, behind the quiet gate",
+     "load": {
+      "start": {
+       "load1_at_start": 0.48779296875,
+       "waited_s": 290.02639675,
+       "max_load1_to_start": 0.5
+      },
+      "run": {
+       "load1_mean": 0.8751929012345679,
+       "load1_max": 1.25244140625,
+       "samples": 81,
+       "limit": 2.75,
+       "overloaded": false
+      }
+     }
+    },
+    "referee fast under 60 s on 2 cores": {
+     "measured_s": 9.0,
+     "held": true
+    }
+   }
+  },
+  "S9 prediction 1, CPU half": {
+   "text": "Without cuVS (the CPU container), a knn request asking for an approximate method returns exactly the exact-knn answer, and says in the response which method ran; with cuVS in Colab on ESCI-US vectors, CAGRA recall@10 against exact knn is at least 0.95 at its default search parameters, filtered CAGRA (about 10% of documents passing) at least 0.90, and IVF-PQ at least 0.90",
+   "verdict": "held (the CPU half); the GPU half (recall bars) waits for the Colab run",
+   "commit_judged": "c758c35 (S9-1 at 6d1f7f4 merged)",
+   "command": "taskset -c 0,1 python -m referee.judge_s9p1_cpu --device=cpu; and with the torch venv --device=torch-cpu",
+   "cpu": {
+    "toy_contract_check_problems": 0,
+    "requests": 1600,
+    "differ_from_exact": 0,
+    "method_not_named": 0
+   },
+   "torch-cpu": {
+    "toy_contract_check_problems": 0,
+    "requests": 1600,
+    "differ_from_exact": 0,
+    "method_not_named": 0
+   },
+   "what_was_checked": "knn on toy (cagra and ivf_pq, with and without method_parameters, filters, k 1/10/37, the list form, bad parameters refused) and 1,600 neural requests on ESCI-sample (200 fit queries, k 10 and 100, unfiltered and filtered): every answer equals exact knn (ids in order, scores 1e-6) and the response says knn.embedding = {requested: <method>, ran: exact}"
+  },
+  "S9 predictions 1 (GPU half), 2 and 3": {
+   "verdict": "not judged yet",
+   "why": "judged by referee/gpu_judges.py in the founder's Colab run (the notebook's S9 cell, the only score of record)",
+   "disclosure": "2026-11-11, before any GPU result existed (no results-s9.json had been run or seen): the judges were changed. Their first version set no embeddings `fit`, so every build fitted the encoder in numpy and prediction 2 (the GPU fit) could not have been tested; the architect found it. Now p1 and p2's cuda index use fit \"auto\", p2's cpu comparison uses fit \"numpy\", and p2 is 'not judged' on cuda unless the encoder reports it was fitted on the GPU (fitted_with gpu or cuml). The judges' thresholds and definitions did not change. Also 474f9f5: the GPU's name is read after the parts so p1's ESCI-US build is the first CUDA work, and each part records its build_mode (information only)."
+  }
+ }
+}
