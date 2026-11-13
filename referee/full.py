@@ -2,7 +2,11 @@
 (`referee/colab_referee.ipynb`); it writes results.json.
 
     python -m referee full [--dataset=esci-us] [--device=cuda] [--engine=engine|opensearch] [--request=template.json]
-                           [--k=1000] [--price-per-hour=...] [--out=results.json]
+                           [--bm25=params.json] [--k=1000] [--price-per-hour=...] [--out=results.json]
+
+The run records what it was asked to run: the request template and the --bm25 file (each with its sha256), the BM25
+parameters the mapping carried, OpenSearch's version and analyzer, whether the checkout was clean, and its caveats.
+The engine's score of record needs the contract run on the device (no --skip-contract) and a clean checkout.
 
 1. The contract on this device: `referee/contract/` on toy (the notebook also runs `referee fast` first).
 2. Quality on the **test** split: every test query, whole catalogue; nDCG@10 and Exact recall@k. This is the only
@@ -31,7 +35,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from referee import bench, freshness, loader
+from referee import bench, freshness, loader, reference
 
 HERE = Path(__file__).resolve().parent
 
@@ -50,6 +54,16 @@ def contract(device: str) -> int:
     env = {**os.environ, "S3_SEARCH_DEVICE": device}
     return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(HERE / "contract")],
                           env=env, cwd=str(HERE.parent)).returncode
+
+
+def tree_clean():
+    """True when the checkout's tracked files equal its commit (untracked files, such as results, are ignored)."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=str(HERE.parent), capture_output=True)
+    except OSError:
+        return None
+    return {0: True, 1: False}.get(r.returncode)
 
 
 def build_mode() -> str:
@@ -71,7 +85,9 @@ def main(argv=None) -> int:
     ap.add_argument("--engine", default="engine", choices=("engine", "opensearch", "reference"))
     ap.add_argument("--device", default=None, help="default: cuda if available, else cpu")
     ap.add_argument("--request", help="JSON request template with the string {{query}} (the engine's tuned request)")
-    ap.add_argument("--bm25", help="JSON file of BM25F parameters for the engine's mapping (_meta.engine.bm25: k1, and b as a number or a per-field map), tuned on the fit split; recorded in the results")
+    ap.add_argument("--bm25", help="JSON file of BM25F parameters for the engine's mapping (_meta.engine.bm25: k1, and b "
+                                   "as a number or a per-field map with b_default), tuned on the fit split only; "
+                                   "validated, recorded in the results with the file's sha256. engine or reference only")
     ap.add_argument("--k", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--latency-queries", type=int, default=1000)
@@ -90,6 +106,26 @@ def main(argv=None) -> int:
               "use --out=results-dev.json", file=sys.stderr)
         return 2
     dataset = "esci-sample" if a.catalogue == "sample" else a.dataset
+    bm25 = None
+    if a.bm25:
+        # Steward's review of ba28176 (2026-11-13): the file only replaces _meta.engine.bm25 in the mapping the engine
+        # builds from. It cannot reach the queries, the judgments, the metric or the held-out subset, which are fixed
+        # by the dataset. It is validated (no unknown key: a typo would otherwise run the defaults while the results
+        # recorded the typo'd values as applied; then the values, against the dataset's text fields, once loaded) and
+        # recorded with its path and sha256.
+        if a.engine == "opensearch":
+            print("referee full: --bm25 sets the engine's BM25F; the OpenSearch adapter has one similarity per index "
+                  "and does not take per-field b, so it does not apply to --engine=opensearch", file=sys.stderr)
+            return 2
+        import hashlib
+        raw = Path(a.bm25).read_bytes()
+        params = json.loads(raw)
+        if not isinstance(params, dict) or set(params) - set(reference.BM25_KEYS):
+            bad = sorted(set(params) - set(reference.BM25_KEYS)) if isinstance(params, dict) else type(params).__name__
+            print(f"referee full: --bm25={a.bm25}: an object with only {list(reference.BM25_KEYS)}, not {bad}",
+                  file=sys.stderr)
+            return 2
+        bm25 = {"params": params, "file": {"path": a.bm25, "sha256": hashlib.sha256(raw).hexdigest()}}
     t0 = time.perf_counter()
 
     def say(msg):
@@ -124,24 +160,38 @@ def main(argv=None) -> int:
         keep = set(int(q) for q in queries["query_id"])
         judg = {q: j for q, j in judg.items() if q in keep}
     say(f"data: {len(ds.catalogue):,} products, {len(queries):,} test queries")
-    if a.bm25:
-        if a.engine != "engine":
-            print("referee full: --bm25 sets the engine's mapping; it does not apply to --engine=" + a.engine, file=sys.stderr)
-            return 2
+    if bm25 is not None:
         import copy
         import dataclasses
-        params = json.loads(Path(a.bm25).read_text())
+        text_fields = [f for f, sp in ds.mapping.get("properties", {}).items() if sp.get("type") == "text"]
+        try:
+            reference.bm25_params(bm25["params"], text_fields)
+        except reference.InvalidMapping as e:
+            print(f"referee full: --bm25={a.bm25}: {e}", file=sys.stderr)
+            return 2
         mapping = copy.deepcopy(ds.mapping)
-        mapping.setdefault("_meta", {}).setdefault("engine", {})["bm25"] = params
+        mapping.setdefault("_meta", {}).setdefault("engine", {})["bm25"] = bm25["params"]
         ds = dataclasses.replace(ds, mapping=mapping)
-        out["bm25"] = params
-        say(f"bm25: {json.dumps(params)}")
+        out["bm25"] = bm25["params"]
+        out["bm25_file"] = bm25["file"]
+        say(f"bm25: {json.dumps(bm25['params'])}")
+    # The BM25 parameters the run's mapping carries, with or without --bm25, so two results files always say them.
+    out["bm25_effective"] = ds.mapping.get("_meta", {}).get("engine", {}).get("bm25", {})
     subsets = {}
     ho = held_out_ids()
     if ho is not None:
         subsets["held_out"] = ho & set(int(q) for q in queries["query_id"])
     template = json.loads(Path(a.request).read_text()) if a.request else \
         (bench.OPENSEARCH_TEMPLATE if a.engine == "opensearch" else None)
+    if a.request:
+        import hashlib
+        out["request_file"] = {"path": a.request, "sha256": hashlib.sha256(Path(a.request).read_bytes()).hexdigest()}
+    if a.engine == "opensearch":
+        from referee import opensearch
+        out["opensearch"] = {"analyzer": os.environ.get("S3_SEARCH_OS_ANALYZER") or "s3_english",
+                             "version": opensearch.server_version()}
+        say(f"opensearch: {out['opensearch']}")
+    out["tree_clean"] = tree_clean()
     if a.engine == "engine":
         out["build_mode"] = build_mode()
         say(f"build: {out['build_mode']}")
@@ -151,12 +201,24 @@ def main(argv=None) -> int:
     out.update(res)
     out["kind"] = "full"
     out["held_out"] = None if ho is None else {"n_queries": len(subsets["held_out"])}
-    out["score_of_record"] = (not dev) and device == "cuda" and dataset == "esci-us"
+    # Steward, 2026-11-13: the engine's score of record needs the contract run on its device. The runs of dd319a7
+    # with --skip-contract (bm25f-hand, bm25f-tuned) were marked score_of_record with the contract never run.
+    skipped = a.engine == "engine" and out["contract_exit_code"] is None
+    out["score_of_record"] = ((not dev) and device == "cuda" and dataset == "esci-us" and not skipped
+                              and out["tree_clean"] is not False)
+    caveats = []
+    if ho is None:
+        caveats.append("no held-out draw scored (S3_SEARCH_HELD_OUT unset or missing; ask L-7)")
+    if skipped:
+        caveats.append("the contract was skipped (--skip-contract): never a score of record")
+    if out["tree_clean"] is False:
+        caveats.append("tracked files differ from the commit: never a score of record")
+    out["caveats"] = caveats
     if dev:
         out["label"] = "DEVELOPMENT MODE: not a score of record"
         out["development_mode"] = {"queries": a.queries, "catalogue": a.catalogue}
     elif out["score_of_record"] is False:
-        out["label"] = "development only"
+        out["label"] = "development only" + (": the contract was skipped" if skipped else "")
 
     if a.engine in ("engine", "reference"):
         say("freshness: 10,000 hot-field changes on toy")
