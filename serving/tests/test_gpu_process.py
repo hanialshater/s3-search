@@ -245,15 +245,17 @@ def _native_bin():
     return os.environ.get("S3_NATIVE_FRONT_BIN") or (str(here) if here.exists() else None)
 
 
-@pytest.mark.parametrize("binproto", ["1", "2"])
+@pytest.mark.parametrize("binproto", ["1", "2", None])
 def test_native_front_answers_as_one_process(built, single, binproto):
-    """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process, on S3B1 and on S3B2 (kind 3:
-    the front escaping the ids and writing the floats; each reply sent alone) (skipped unless built)."""
+    """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process, on S3B1 (opt-out), on S3B2
+    (kind 3: the front escaping the ids and writing the floats; each reply sent alone) and with the variable unset (the
+    default, S3B2) (skipped unless built)."""
     if not _native_bin():
         pytest.skip("serving/native_front is not built")
     port = _free_port()
     p = _start(built, port, ["--fronts", "2", "--gpu-processes", "1"],
-               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin(), "S3_SERVING_BINPROTO": binproto})
+               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin(),
+                **({"S3_SERVING_BINPROTO": binproto} if binproto else {})})
     try:
         _same(single, _answers(port))
         url = f"http://127.0.0.1:{port}/indexes/toy/_search"

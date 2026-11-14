@@ -40,11 +40,12 @@ struct Front {
 
 async fn connect(path: &str) -> std::io::Result<Arc<Gpu>> {
     let mut s = UnixStream::connect(path).await?;
-    // S3_SERVING_BINPROTO=2 (opt-in, S6-22s): open S3B2, so the GPU process sends kind 3 replies and each reply alone
-    let magic: &[u8; 4] = if std::env::var("S3_SERVING_BINPROTO").map(|v| v.trim() == "2").unwrap_or(false) {
-        b"S3B2"
-    } else {
+    // S3B2 is the default (the steward's ruling on plat-m28, lab 1c51721): the GPU process sends kind 3 replies, each
+    // as soon as it is encoded. S3_SERVING_BINPROTO=1 opts out to S3B1 (kind 1, the batch's replies in one write).
+    let magic: &[u8; 4] = if std::env::var("S3_SERVING_BINPROTO").map(|v| v.trim() == "1").unwrap_or(false) {
         b"S3B1"
+    } else {
+        b"S3B2"
     };
     s.write_all(magic).await?;
     let (mut rd, mut wr) = s.into_split();
