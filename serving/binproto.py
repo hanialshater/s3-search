@@ -203,3 +203,200 @@ def decode_reply(payload: bytes):
             sort.append({"values": np.frombuffer(payload, "<i8", h, o).astype(np.int64), "missing": None}); o += 8 * h
     hits = encode_hits({"_id": ids, "_score": sc, "sort": sort})
     return id_, 200, (meta["pre"] + hits + meta["post"]).encode(), meta
+
+
+# ---- S3B3: one frame per batch (kind 4), agreed with the architect through the coordinator, 2026-11-14 -------------
+#
+# A connection that opens with ``S3B3`` may get kind 4 frames, one per batch per connection, besides kinds 2 and 3.
+# Payload (all integers and floats little-endian; ``pad8`` is zero bytes up to the next multiple of 8 of the payload
+# offset, so every numeric array starts aligned):
+#
+#     u8 kind=4  u64 0  u32 n_replies  u16 w  u32 h_total  ids[h_total * w] (S<w>: UTF-8, NUL-padded)
+#     pad8  scores f32[h_total]
+#     u8 n_cols, per column:  u8 type (1 float64, 2 int64)  u8 flags (bit 0: a missing bitmap follows)
+#                             pad8  values[h_total] (8 bytes each)  [bitmap: ceil(h_total / 8) bytes, bit i of byte i//8
+#                             (LSB first) set when hit i's value is missing]
+#     n_replies records:  u64 id  u8 rkind
+#         rkind 3:  u32 offset  u32 h  u8 n_sort  n_sort * u8 code (0: the score widened; 1 + c: column c)
+#                   u32 meta_len  meta JSON (pre, post, version, queue_ms, batch, ... as kind 3)
+#         rkind 2:  u32 meta_len  meta JSON  u16 status  u32 len  body (a whole response, as kind 2)
+#
+# Rule (the architect's amendment 3): a reply whose ids include one with a NUL before its end, or that is not UTF-8,
+# goes as rkind 2 (encoded in Python). The front renders an rkind 3 record exactly as kind 3: ids escaped as
+# encode_basestring_ascii, floats as json.dumps, a missing value as null. took_ms stays in the meta's pre.
+MAGIC3 = b"S3B3"                     # opt-in: kind 4 batch frames (S6-22s)
+
+
+def _ids_ok(ids) -> bool:
+    """Every id UTF-8 with no NUL before its end (its trailing NUL padding aside)."""
+    for x in ids.tolist():                                  # numpy drops the trailing NULs
+        if b"\x00" in x:
+            return False
+        try:
+            x.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    return True
+
+
+def _batch_columns(resp):
+    """``(ids, s32, cols)`` for a reply rkind 3 can carry, cols as ``[(kind, values, missing or None)]`` with kind 0
+    (the score widened), 1 (float64) or 2 (int64); else None."""
+    from .encode import _is_columnar
+    if not _is_columnar(resp):
+        return None
+    c = resp["hits"]["columns"]
+    ids = c["_id"]
+    if not (isinstance(ids, np.ndarray) and ids.dtype.kind == "S") or len(ids) == 0 or not _ids_ok(ids):
+        return None
+    h = len(ids)
+    s32 = np.asarray(c["_score"], np.float32)
+    if len(s32) != h:
+        return None
+    s64 = s32.astype(np.float64)
+    cols = []
+    for col in c.get("sort") or []:
+        v, miss = col.get("values"), col.get("missing")
+        if not isinstance(v, np.ndarray) or len(v) != h:
+            return None
+        m = None if miss is None else np.asarray(miss, dtype=bool)
+        if m is not None and len(m) != h:
+            return None
+        if m is not None and not m.any():
+            m = None
+        if v.dtype == np.float64 and m is None and np.array_equal(v, s64):
+            cols.append((0, None, None))
+        elif v.dtype == np.float64:
+            cols.append((1, v, m))
+        elif v.dtype.kind in "iu":
+            cols.append((2, v.astype(np.int64), m))
+        else:
+            return None
+    return ids, s32, cols
+
+
+def batch4(msgs) -> bytes:
+    """The reference writer of a kind 4 frame for one batch's reply messages to one front (what ``hostpath.reply_frame``
+    writes one by one), in Python; s3_hostpath's Rust reply() writes the same bytes from the engine's page."""
+    from .encode import encode, _shell
+    import struct as _s
+    recs, rows = [], []                                     # rows: (ids, s32, cols) of each rkind 3 record
+    for msg in msgs:
+        if msg[0] == "search" and msg[2] == "ok":
+            _, id_, _, resp, version, queue_ms, *rest = msg
+            meta = {"version": f"{version[0]}:{version[1]}", "queue_ms": round(float(queue_ms), 3),
+                    "batch": rest[0] if rest else 1}
+            if len(rest) > 1 and rest[1] is not None:
+                meta["batch_ms"] = round(float(rest[1]), 3)
+            got = _batch_columns(resp)
+            text = json.dumps(_shell(resp, _PLACEHOLDER), separators=(",", ":")) if got is not None else ""
+            marker = '"hits":' + json.dumps(_PLACEHOLDER)
+            if got is not None and text.count(marker) == 1:
+                pre, post = text.split(marker)
+                recs.append(("hits", id_, {**meta, "pre": pre + '"hits":', "post": post}, len(rows)))
+                rows.append(got)
+            else:
+                recs.append(("whole", id_, meta, 200, encode(resp)))
+        elif msg[0] == "search":
+            recs.append(("whole", msg[1], {}, msg[3], json.dumps(msg[4], separators=(",", ":")).encode()))
+        else:
+            _, id_, status, body, ctype, headers = msg
+            recs.append(("whole", id_, {"type": ctype}, status, body))
+    w = max([r[0].dtype.itemsize for r in rows] + [1])
+    h_total = sum(len(r[0]) for r in rows)
+    out = bytearray(_HDR.pack(4, 0) + _s.pack("<IHI", len(recs), w, h_total))
+    for ids, _, _ in rows:
+        out += ids.astype(f"S{w}").tobytes()
+
+    def pad8():
+        out.extend(b"\x00" * (-len(out) % 8))
+    pad8()
+    for _, s32, _ in rows:
+        out += s32.astype("<f4").tobytes()
+    # shared columns: one per (sort position, kind) used by any reply
+    keys = []
+    for _, _, cols in rows:
+        for k, (kind, _, _) in enumerate(cols):
+            if kind and (k, kind) not in keys:
+                keys.append((k, kind))
+    if len(keys) > 254:
+        raise ValueError("too many shared columns")
+    out.append(len(keys))
+    offs = np.cumsum([0] + [len(r[0]) for r in rows])
+    codes = []                                              # per row: its sort codes
+    for r, (_, _, cols) in enumerate(rows):
+        codes.append([0 if kind == 0 else 1 + keys.index((k, kind)) for k, (kind, _, _) in enumerate(cols)])
+    for c, (k, kind) in enumerate(keys):
+        vals = np.zeros(h_total, "<f8" if kind == 1 else "<i8")
+        miss = np.zeros(h_total, bool)
+        for r, (_, _, cols) in enumerate(rows):
+            if k < len(cols) and cols[k][0] == kind:
+                vals[offs[r]:offs[r + 1]] = cols[k][1]
+                if cols[k][2] is not None:
+                    miss[offs[r]:offs[r + 1]] = cols[k][2]
+        flags = 1 if miss.any() else 0
+        out += bytes([kind, flags])
+        pad8()
+        out += vals.tobytes()
+        if flags:
+            out += np.packbits(miss, bitorder="little").tobytes()
+    for rec in recs:
+        if rec[0] == "hits":
+            _, id_, meta, r = rec
+            mb = json.dumps(meta, separators=(",", ":")).encode()
+            out += (_s.pack("<QB", id_, 3) + _s.pack("<IIB", int(offs[r]), int(offs[r + 1] - offs[r]), len(codes[r]))
+                    + bytes(codes[r]) + _U32.pack(len(mb)) + mb)
+        else:
+            _, id_, meta, status, body = rec
+            mb = json.dumps(meta, separators=(",", ":")).encode()
+            out += _s.pack("<QB", id_, 2) + _U32.pack(len(mb)) + mb + _s.pack("<HI", status, len(body)) + body
+    return frame(bytes(out))
+
+
+def split_batch4(payload: bytes):
+    """For tests and the Python reference: a kind 4 payload -> ``[(id, status, body, meta)]``, each rkind 3 record
+    encoded with ``serving.encode.encode_hits`` from its slices of the shared columns (what the native front must match)."""
+    from .encode import encode_hits
+    import struct as _s
+    o = _HDR.size
+    n, w, ht = _s.unpack_from("<IHI", payload, o); o += 10
+    ids_all = np.frombuffer(payload, dtype=f"S{w}", count=ht, offset=o) if ht else np.array([], "S1"); o += ht * w
+    o += -o % 8
+    sc_all = np.frombuffer(payload, "<f4", ht, o); o += 4 * ht
+    nc = payload[o]; o += 1
+    cols = []
+    for _ in range(nc):
+        kind, flags = payload[o], payload[o + 1]; o += 2
+        o += -o % 8
+        vals = np.frombuffer(payload, "<f8" if kind == 1 else "<i8", ht, o); o += 8 * ht
+        miss = None
+        if flags & 1:
+            nb = (ht + 7) // 8
+            miss = np.unpackbits(np.frombuffer(payload, np.uint8, nb, o), bitorder="little")[:ht].astype(bool); o += nb
+        cols.append((kind, vals, miss))
+    out = []
+    for _ in range(n):
+        id_, rk = _s.unpack_from("<QB", payload, o); o += 9
+        if rk == 3:
+            off, h, ns = _s.unpack_from("<IIB", payload, o); o += 9
+            cs = list(payload[o:o + ns]); o += ns
+            (ml,) = _U32.unpack_from(payload, o); o += 4
+            meta = json.loads(payload[o:o + ml]); o += ml
+            sc = sc_all[off:off + h]
+            sort = []
+            for code in cs:
+                if code == 0:
+                    sort.append({"values": sc.astype(np.float64), "missing": None})
+                else:
+                    kind, vals, miss = cols[code - 1]
+                    v = vals[off:off + h].astype(np.float64 if kind == 1 else np.int64)
+                    m = None if miss is None else miss[off:off + h]
+                    sort.append({"values": v, "missing": m if m is not None and m.any() else None})
+            hits = encode_hits({"_id": ids_all[off:off + h], "_score": sc, "sort": sort})
+            out.append((id_, 200, (meta["pre"] + hits + meta["post"]).encode(), meta))
+        else:
+            (ml,) = _U32.unpack_from(payload, o); o += 4
+            meta = json.loads(payload[o:o + ml]); o += ml
+            st, bl = _s.unpack_from("<HI", payload, o); o += 6
+            out.append((id_, st, payload[o:o + bl], meta)); o += bl
+    return out

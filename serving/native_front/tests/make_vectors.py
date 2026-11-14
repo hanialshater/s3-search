@@ -90,6 +90,55 @@ def golden(rng):
     return rows
 
 
+def golden4(rng):
+    """Kind 4 frames (S3B3): random batches of replies (columnar with any ids and floats, field sorts with missing
+    values, an id with an interior NUL, whole, error, call), each line ``hex(payload) id:status:hex(body) ...``."""
+    from serving import binproto
+    from serving.encode import encode
+    strs = strings(random.Random(17))[1:200]
+    fl = floats(random.Random(18))
+    rows = []
+    for k in range(40):
+        msgs, want = [], []
+        for j in range(rng.randint(1, 12)):
+            rid = k * 100 + j
+            kind = rng.random()
+            if kind < 0.75:
+                h = rng.randint(1, 30)
+                ids = [rng.choice(strs) or "x" for _ in range(h)]
+                if rng.random() < 0.05:
+                    ids[0] = "a\x00b"
+                w = max(len(s.encode("utf-8")) for s in ids)
+                idarr = np.array([s.encode("utf-8") for s in ids], f"S{w}")
+                with np.errstate(over="ignore"):
+                    sc = np.array([rng.choice(fl) for _ in range(h)], np.float64).astype(np.float32)
+                sort = []
+                for c in rng.sample(["score", "f8", "i8", "f8m", "i8m"], rng.randint(0, 3)):
+                    miss = None
+                    if c.endswith("m"):
+                        miss = [rng.random() < 0.3 for _ in range(h)]
+                    if c == "score":
+                        sort.append({"values": sc.astype(np.float64), "missing": None})
+                    elif c.startswith("f8"):
+                        sort.append({"values": np.array([rng.choice(fl) for _ in range(h)], np.float64), "missing": miss})
+                    else:
+                        sort.append({"values": np.array([rng.randint(-2**62, 2**62) for _ in range(h)], np.int64), "missing": miss})
+                resp = {"took_ms": {"parse": 0.1}, "hits": {"total": h + j, "columns": {"_id": idarr, "_score": sc, "sort": sort}}}
+                msgs.append(("search", rid, "ok", resp, ("seg", 1), 0.5, 3, 1.25))
+                want.append((rid, 200, encode(resp)))
+            elif kind < 0.9:
+                body = {"error": {"type": "invalid_request", "path": "", "reason": "x"}}
+                msgs.append(("search", rid, "error", 400, body))
+                want.append((rid, 400, json.dumps(body, separators=(",", ":")).encode()))
+            else:
+                msgs.append(("call", rid, 200, b'{"status":"ok"}', "application/json", {}))
+                want.append((rid, 200, b'{"status":"ok"}'))
+        f = binproto.batch4(msgs)
+        assert f[4] == 4
+        rows.append(f[4:].hex() + "".join(f" {i}:{st}:{b.hex()}" for i, st, b in want))
+    return rows
+
+
 def main():
     rng = random.Random(22)
     with open(HERE / "pyrepr_vectors.txt", "w") as f:
@@ -99,6 +148,7 @@ def main():
         for s in strings(rng):
             f.write(f"{s.encode('utf-8').hex()} {esc(s).encode().hex()}\n")
     (HERE / "golden3.txt").write_text("\n".join(golden(random.Random(9))) + "\n")
+    (HERE / "golden4.txt").write_text("\n".join(golden4(random.Random(10))) + "\n")
     print("written")
 
 

@@ -160,7 +160,8 @@ def _raw_post(url, body):
         return e.code, e.read()
 
 
-@pytest.mark.parametrize("hostpath,magic", [("0", b"S3B1"), ("stub", b"S3B1"), ("stub-prepared", b"S3B1"), ("0", b"S3B2")])
+@pytest.mark.parametrize("hostpath,magic", [("0", b"S3B1"), ("stub", b"S3B1"), ("stub-prepared", b"S3B1"), ("0", b"S3B2"),
+                                           ("0", b"S3B3")])
 def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic):
     """S6-22s: on a connection opened with S3B1, a GPU process answers in serving/binproto.py's frames, and the
     bodies decoded the way a native front must encode them equal one process's (but for took_ms); the same with the
@@ -182,13 +183,21 @@ def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic):
         s.connect(os.path.join(state, "gpu-0.sock"))
         s.sendall(magic)                                    # S3B2: kind 3 replies, each sent alone
 
+        backlog = []                                        # S3B3: a kind 4 frame may hold several replies
+
+        def next_reply():
+            if not backlog:
+                n = struct.unpack("<I", _recv(s, 4))[0]
+                payload = _recv(s, n)
+                backlog.extend(binproto.split_batch4(payload) if payload[0] == 4 else [binproto.decode_reply(payload)])
+            return backlog.pop(0)
+
         def ask(i, req):
             body = req if isinstance(req, bytes) else json.dumps(req).encode()
             name = b"toy"
             s.sendall(binproto.frame(struct.pack("<BQ", 1, i) + struct.pack("<H", len(name)) + name
                                      + struct.pack("<I", len(body)) + body))
-            n = struct.unpack("<I", _recv(s, 4))[0]
-            return binproto.decode_reply(_recv(s, n))
+            return next_reply()
 
         kinds = set()
         for i, req in enumerate(REQS):
@@ -217,8 +226,7 @@ def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic):
                                      + struct.pack("<I", len(body)) + body))
         got = {}
         for _ in mixed:
-            n = struct.unpack("<I", _recv(s, 4))[0]
-            id_, st, body, _ = binproto.decode_reply(_recv(s, n))
+            id_, st, body, _ = next_reply()
             got[id_ - 3000] = (st, json.loads(body))
         for k, req in enumerate(mixed):
             want_st, want_body = (single[k] if k < len(REQS) else want_bad[k - len(REQS)])
@@ -245,7 +253,7 @@ def _native_bin():
     return os.environ.get("S3_NATIVE_FRONT_BIN") or (str(here) if here.exists() else None)
 
 
-@pytest.mark.parametrize("binproto", ["1", "2"])
+@pytest.mark.parametrize("binproto", ["1", "2", "3"])
 def test_native_front_answers_as_one_process(built, single, binproto):
     """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process, on S3B1 and on S3B2 (kind 3:
     the front escaping the ids and writing the floats; each reply sent alone) (skipped unless built)."""
