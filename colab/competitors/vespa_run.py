@@ -114,6 +114,14 @@ def deploy(app_dir: Path = APP) -> dict:
 def feed(catalogue, threads: int = 32) -> dict:
     """Every product through /document/v1 with ``threads`` concurrent POSTs (the build is reported, not compared)."""
     ids = catalogue["product_id"].astype(str).tolist()
+    try:                                                        # already fed (a restart keeps proton's data): skip
+        st, body = _http("POST", f"http://localhost:{PORT}/search/",
+                         {"yql": "select * from product where true", "hits": 0, "timeout": "20s"}, timeout=60)
+        have = json.loads(body)["root"]["fields"]["totalCount"]
+        if have == len(ids):
+            return {"fed": 0, "already": have, "failed": 0, "feed_s": 0.0}
+    except Exception:  # noqa: BLE001
+        pass
     cols = {f: catalogue[f].fillna("").astype(str).tolist() for f in FIELDS}
     ok, failed, lock = [0], [], threading.Lock()
 
