@@ -780,14 +780,22 @@ def main():
                     break
                 time.sleep(5)
             say(f"{name}: replaying sampled requests unloaded")
-            check = compare_unloaded(url, bodies, runs)
-            say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
-                f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 unloaded)")
-            if opt("ab-dump", None):                              # S6-22s: the front A/B, byte for byte
+            try:                                                  # a dead server after the ladder must not lose it
+                check = compare_unloaded(url, bodies, runs)
+                say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
+                    f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 "
+                    f"unloaded)")
+            except Exception as e:  # noqa: BLE001
+                check = {"error": f"{type(e).__name__}: {e}"}
+                say(f"{name}: unloaded comparison FAILED: {check['error']}")
+            if opt("ab-dump", None) and "error" not in check:     # S6-22s: the front A/B, byte for byte
                 check["ab_dump"] = ab_dump(url, bodies, opt("ab-dump", None), int(opt("ab-n", "1000")))
             if name == "vespa":                                   # V5: proton and mmap after the ladder, and the log itself
                 from colab.competitors import vespa_run as _V
-                COMPETITOR["vespa"]["after"] = _V.check_proton()
+                try:
+                    COMPETITOR["vespa"]["after"] = _V.check_proton()
+                except Exception as e:  # noqa: BLE001
+                    COMPETITOR["vespa"]["after"] = {"error": f"{type(e).__name__}: {e}"}
                 COMPETITOR["vespa"]["log_fetched"] = _V.fetch_log(LOG.replace(".log", "") + "-vespa.log")
             out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check,
                                     "competitor": COMPETITOR.get(name), "config": {k: opt(k, None) for k in (
