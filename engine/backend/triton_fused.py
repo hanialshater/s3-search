@@ -141,6 +141,21 @@ if triton is not None:
             tl.atomic_add(fc_ptr + fo + code, tl.full([TILE], 1, tl.int32), mask=match)
 
 
+def pack(parts, dtype, align):
+    """``parts`` one after another in one array, each starting at a multiple of ``align`` elements (16 bytes), and
+    their start offsets. Triton specialises a pointer argument on 16-byte alignment, so views at unaligned offsets
+    would compile the kernel again for each new alignment (a ~0.5 s stall a time: the L4 hostpath profile)."""
+    at, n = [], 0
+    for x in parts:
+        n += (-n) % align
+        at.append(n)
+        n += len(x)
+    out = np.zeros(n, dtype)
+    for a, x in zip(at, parts):
+        out[a:a + len(x)] = x
+    return out, at
+
+
 def _rows(part, terms):
     """Per query its term rows in order, as the kernel's flat arrays; ``None`` if a query has no rows."""
     ptr = part.host_term_ptr
@@ -185,17 +200,16 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     # S6-24: every small per-call array in two host-to-device copies (one int64, one float32), not one per array
     ints = [row_start or [0], row_len or [0], q_lo, q_hi, [int(m) for m in msm], offs or [0], sizes or [1],
             row_term or [0]]
-    lens = [len(x) for x in ints]
-    host_i = np.fromiter((v for x in ints for v in x), np.int64, sum(lens))
+    host_i, at = pack(ints, np.int64, 2)
     w32 = np.asarray(w, np.float32)
     bb32 = np.asarray(bb, np.float32)
-    host_f = np.concatenate([w32, bb32, np.float32(1.0) - bb32,          # (1 - b) in float32, as the torch path
-                             np.asarray([float(x) for x in boost], np.float32)])
+    floats = [w32, bb32, np.float32(1.0) - bb32,                          # (1 - b) in float32, as the torch path
+              np.asarray([float(x) for x in boost], np.float32)]
+    host_f, fat = pack(floats, np.float32, 4)
     dev_i = torch.from_numpy(host_i).to(dev)
     dev_f = torch.from_numpy(host_f).to(dev)
-    at = np.cumsum([0] + lens)
-    vi = [dev_i[at[k]:at[k + 1]] for k in range(len(ints))]
-    vf = [dev_f[:F], dev_f[F:2 * F], dev_f[2 * F:3 * F], dev_f[3 * F:]]
+    vi = [dev_i[a:a + len(x)] for a, x in zip(at, ints)]
+    vf = [dev_f[a:a + len(x)] for a, x in zip(fat, floats)]
     return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
 
 
@@ -242,13 +256,13 @@ def run_prepared(b, part, k1, idf, chunk, host_i, host_f, dev_i, dev_f, live, fa
     offs = [int(x) for x in hi[5]] if chunk["facets"] else []
     if mode(b) == "kernel":
         vi = [dev_i[a:a + n] for a, n in zip(at, ln)]
-        vf = [dev_f[fa:fa + F], dev_f[fa + F:fa + 2 * F], dev_f[fa + 2 * F:fa + 3 * F], dev_f[fa + 3 * F:fa + 3 * F + Q]]
+        vf = [dev_f[a:a + n] for a, n in zip(fa, (F, F, F, Q))]
         return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
     rt = hi[7]
     terms = [[int(t) for t in rt[qlo[g]:qhi[g]]] for g in range(Q)]
-    w = host_f[fa:fa + F]
-    bb = host_f[fa + F:fa + 2 * F]
-    boost = host_f[fa + 3 * F:fa + 3 * F + Q]
+    w = host_f[fa[0]:fa[0] + F]
+    bb = host_f[fa[1]:fa[1] + F]
+    boost = host_f[fa[3]:fa[3] + Q]
     return reference(b, part, terms, w, bb, k1, idf, [int(m) for m in hi[4]], [float(x) for x in boost], live,
                      facet_codes, sizes)
 

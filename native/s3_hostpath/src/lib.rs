@@ -423,7 +423,8 @@ impl HostIndex {
     /// - `fallback`: the positions Python must serve; `eligible`: the served ones, in chunk order;
     /// - `ints` and `floats`: little-endian int64 and float32 byte blocks;
     /// - `chunks`: one per kernel call, each with `positions`, `int_at`, `int_len` (row_start, row_len, q_lo, q_hi,
-    ///   msm, facet offsets, facet sizes, row_term), `float_at` (w, b, 1 - b per text field, then a boost per query),
+    ///   msm, facet offsets, facet sizes, row_term), `float_at` (the offsets of w, b and 1 - b per text field, and a
+    ///   boost per query; every segment 16-byte aligned),
     ///   `idf_field` and `facets` (field names), plus per
     ///   position `from`, `size` and `aggs` (name, field, size).
     fn prepare<'py>(&self, py: Python<'py>, payloads: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyDict>> {
@@ -492,17 +493,23 @@ impl HostIndex {
                 let mut int_at = Vec::new();
                 let mut int_len = Vec::new();
                 for part in parts.iter() {
+                    while ints.len() % 2 != 0 {
+                        ints.push(0); // each segment 16-byte aligned (triton_fused.pack)
+                    }
                     int_at.push(ints.len());
                     int_len.push(part.len());
                     ints.extend_from_slice(part);
                 }
-                let float_at = floats.len();
                 let w = &planned[ch[0]].w;
-                floats.extend_from_slice(w);                                   // w
-                floats.extend_from_slice(&self.field_b);                       // b
-                floats.extend(self.field_b.iter().map(|b| 1.0f32 - *b));       // 1 - b, in float32 as the torch path
-                for &k in ch {
-                    floats.push(planned[k].boost as f32);
+                let omb: Vec<f32> = self.field_b.iter().map(|b| 1.0f32 - *b).collect(); // 1 - b, in float32
+                let boosts: Vec<f32> = ch.iter().map(|&k| planned[k].boost as f32).collect();
+                let mut float_at = Vec::new();
+                for seg in [w.as_slice(), self.field_b.as_slice(), omb.as_slice(), boosts.as_slice()] {
+                    while floats.len() % 4 != 0 {
+                        floats.push(0.0); // 16-byte aligned
+                    }
+                    float_at.push(floats.len());
+                    floats.extend_from_slice(seg);
                 }
                 let d = PyDict::new_bound(py);
                 d.set_item("group", g)?;

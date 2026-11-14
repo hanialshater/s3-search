@@ -117,14 +117,18 @@ def prepare_reference(st, payloads, words=None):
             offs = [int(x) for x in np.cumsum([0] + [Q * s for s in sizes])[:-1]] if facets else []
             parts = [rs or [0], rl or [0], qlo, qhi, msm, offs or [0], sizes or [1], rt or [0]]
             int_at, int_len = [], []
-            for x in parts:
+            for x in parts:                                # each segment 16-byte aligned (triton_fused.pack)
+                ints += [0] * ((-len(ints)) % 2)
                 int_at.append(len(ints))
                 int_len.append(len(x))
                 ints += x
-            float_at = len(floats)
             w = info[ch[0]][1]
-            floats += list(w) + list(bb) + list(np.float32(1.0) - bb) + [np.float32(info[pos][0].root.boost)
-                                                                         for pos in ch]
+            float_at = []
+            for x in (list(w), list(bb), list(np.float32(1.0) - bb),
+                      [np.float32(info[pos][0].root.boost) for pos in ch]):
+                floats += [np.float32(0)] * ((-len(floats)) % 4)
+                float_at.append(len(floats))
+                floats += x
             chunks.append({"group": g, "positions": ch, "int_at": int_at, "int_len": int_len, "float_at": float_at,
                            "idf_field": keys[g][1], "facets": facets,
                            "from": [info[pos][0].from_ for pos in ch], "size": [info[pos][0].size for pos in ch],
