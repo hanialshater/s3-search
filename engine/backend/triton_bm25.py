@@ -11,12 +11,14 @@ tile's accumulators, a float64 sum and an int32 count, with a barrier between te
 no two lanes write one key at once; across terms the barrier keeps the order. Each key's sum is therefore
 0 + a1 + a2 + ..., added in the same order as the sort-based kernel adds them, in float64: the same bits. No atomics.
 
-Used only on cuda, for a single segment whose postings are sorted by doc within each term, when ``triton`` imports and
-``S3_TRITON_BM25`` is "1". The torch path stays the default until the kernel is measured faster on the A100.
+Used only on cuda, for a single segment whose postings are sorted by doc within each term, when ``S3_TRITON_BM25`` is
+"1" and ``triton_gate.supported`` (Triton imports, at the tested version, on a GPU class that passed). The torch path stays the default until the kernel is measured faster on the A100.
 """
 from __future__ import annotations
 
 import os
+
+from . import triton_gate
 
 try:                                                        # optional: Colab's torch ships it; CPU CI does not need it
     import triton
@@ -30,7 +32,7 @@ BLOCK = 256
 
 
 def wanted(b) -> bool:
-    return triton is not None and getattr(b, "name", "") == "cuda" and os.environ.get("S3_TRITON_BM25", "0") == "1"
+    return os.environ.get("S3_TRITON_BM25", "0") == "1" and triton_gate.supported(b)
 
 
 if triton is not None:
