@@ -261,14 +261,14 @@ _TOOK = None
 
 def ab_dump(url, bodies, path, n) -> dict:
     """--ab-dump=FILE (S6-22s): the first n request bodies, one at a time and unloaded, each response's raw bytes
-    with only the took_ms value blanked, as length-prefixed records; colab/front_ab.py compares two such files byte
+    with only the took_ms value (a number, or the object of sub-timings) blanked, as length-prefixed records; colab/front_ab.py compares two such files byte
     for byte (the stdlib front's and the native front's)."""
     global _TOOK
     import hashlib
     import re
     import struct
     if _TOOK is None:
-        _TOOK = re.compile(rb'("took_ms":\s*)-?[0-9][0-9.eE+-]*')
+        _TOOK = re.compile(rb'("took_ms":\s*)(?:\{[^{}]*\}|-?[0-9][0-9.eE+-]*)')   # a number, or (plat-m18) an object
     digest, blanked = hashlib.sha256(), 0
     with open(path, "wb") as f:
         for b in bodies[:n]:
