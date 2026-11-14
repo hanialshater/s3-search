@@ -83,6 +83,16 @@ DEEP = any(a == "--deep=1" for a in sys.argv[1:])
 # --triton=1 (S6-18): with --deep=1, measure the depth-2,000 request again with the Triton BM25F sum (S3_TRITON_BM25=1),
 # in the same process, and profile it.
 TRITON = any(a == "--triton=1" for a in sys.argv[1:])
+# --precision=1 (S6-21, the founder's precision experiment): only the depth-2,000 request, with the Triton BM25F sum and
+# top-k on, for each BM25F precision (S3_BM25_ADDEND, S3_BM25_SUM) in the same process on one index: today's float32
+# weights summed in float64 (the reference), float16 weights summed in float32 (variant a) and in float64 (a, the sum
+# kept), and float32 weights summed in float32 (variant b, the float32 accumulation option). Each: throughput, one
+# torch.profiler batch, and against the reference over every text: the share of queries whose top 10 changes (as an
+# ordered list, and as a set) and the recall of the reference's top 2,000. The index is lexical only (no encoder, no
+# ranker), so the run is short. Use with --plan-cache=0.
+PRECISION = any(a == "--precision=1" for a in sys.argv[1:])
+PRECISIONS = [("reference_f32w_f64sum", "float32", "float64"), ("a_f16w_f32sum", "float16", "float32"),
+              ("a_f16w_f64sum", "float16", "float64"), ("b_f32w_f32sum", "float32", "float32")]
 
 
 def measure(index, make, texts, label, kw=None):
@@ -120,6 +130,54 @@ def measure(index, make, texts, label, kw=None):
         say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms, "
             f"host CPU {cpu * 1e3 / len(reqs):.3f} ms per request ({cpu / total:.2f} cores)")
     return out
+
+
+def precision_runs(index, texts):
+    """--precision=1: each BM25F precision on the depth-2,000 request, the Triton kernels on (see PRECISIONS)."""
+    import numpy as np
+    from engine.api import expand_hits
+    kw = {"hits": "columns", "ids": "bytes"}
+    os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "1", "1"
+
+    def ids_of(label):
+        out = []
+        for i in range(0, len(texts), 64):
+            for r in index.search_batch([deep_request(t) for t in texts[i:i + 64]], **kw):
+                h = expand_hits(r)["hits"]
+                out.append(([x["_id"] for x in h["hits"]], h["total"]))
+        return out
+
+    res, ranked = {}, {}
+    for label, addend, acc in PRECISIONS:
+        os.environ["S3_BM25_ADDEND"], os.environ["S3_BM25_SUM"] = addend, acc
+        say(f"precision {label}: S3_BM25_ADDEND={addend} S3_BM25_SUM={acc}")
+        res[label] = {"S3_BM25_ADDEND": addend, "S3_BM25_SUM": acc,
+                      "measure": measure(index, deep_request, texts, f"deep/{label}", kw)}
+        try:
+            res[label]["torch_profile"] = torch_profile(index, deep_request, texts, f"deep/{label}", kw=kw)
+        except Exception as e:  # noqa: BLE001  (extra: never lose the run's numbers to it)
+            res[label]["torch_profile"] = {"error": repr(e)[:500]}
+        ranked[label] = ids_of(label)
+    ref = ranked[PRECISIONS[0][0]]
+    for label, _, _ in PRECISIONS[1:]:
+        got = ranked[label]
+        top10 = sum(a[:10] != b[:10] for (a, _), (b, _) in zip(got, ref)) / len(ref)
+        top10_set = sum(set(a[:10]) != set(b[:10]) for (a, _), (b, _) in zip(got, ref)) / len(ref)
+        rec = [len(set(a) & set(b)) / len(b) for (a, _), (b, _) in zip(got, ref) if b]
+        totals = sum(ta != tb for (_, ta), (_, tb) in zip(got, ref))
+        same = sum(a == b for (a, _), (b, _) in zip(got, ref))
+        res[label]["against_reference"] = {
+            "queries": len(ref), "top10_order_changed_share": top10, "top10_set_changed_share": top10_set,
+            "recall_at_2000_mean": float(np.mean(rec)) if rec else None,
+            "recall_at_2000_min": float(np.min(rec)) if rec else None,
+            "identical_2000_lists": same, "totals_differ": totals}
+        say(f"precision {label} against the reference: top 10 changed (order) {top10:.2%}, (set) {top10_set:.2%}; "
+            f"recall@2000 mean {res[label]['against_reference']['recall_at_2000_mean']:.6f}, min "
+            f"{res[label]['against_reference']['recall_at_2000_min']:.4f}; identical lists {same} of {len(ref)}")
+    os.environ.pop("S3_BM25_ADDEND", None)
+    os.environ.pop("S3_BM25_SUM", None)
+    os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "0", "0"
+    return res
 
 
 def torch_profile(index, make, texts, label, bs=64, kw=None):
@@ -185,6 +243,21 @@ def main():
               "color": {"terms": {"field": "product_color.keyword", "size": 20}}}
     m = copy.deepcopy(ds.mapping)
     m["_meta"]["engine"]["bm25"] = json.loads(open("referee/requests/bm25f-tuned.bm25.json").read())
+    if PRECISION:                                    # lexical only: no encoder, no ranker, only the deep request
+        say(f"build (precision run): {len(ds.catalogue):,} products on cuda, lexical only")
+        t0 = time.perf_counter()
+        index = api.build_index(ds.catalogue, m, device="cuda")
+        build_s = time.perf_counter() - t0
+        texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
+        result = {"kind": "pipeline-profile-precision", "label": "development only, never a score", "ref": REF,
+                  "commit": commit, "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
+                  "n_products": int(len(ds.catalogue)), "n_queries": len(texts), "build_s": build_s,
+                  "precision": precision_runs(index, texts)}
+        stop.set()
+        json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
+        say("DONE")
+        print(json.dumps(result, indent=1), flush=True)
+        return 0
     m["_meta"]["engine"]["embeddings"] = {"embedding": {"model": "tfidf-svd-128",
                                                        "inputs": ["product_title", "product_brand", "product_color"]}}
     m["properties"]["embedding"] = {"type": "knn_vector", "dimension": 128,

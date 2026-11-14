@@ -121,14 +121,14 @@ class NumpyBackend:
         entry = np.arange(total, dtype=np.int64) + np.repeat(starts - offsets, n)
         return np.repeat(np.asarray(owners, dtype=np.int64), n), entry
 
-    def segment_sum(self, keys, values, n):
+    def segment_sum(self, keys, values, n, accumulate=None):
         # float64: bincount accumulates in float64, in entry order. float32: np.add.at in entry order. Both are
         # deterministic, and a key's addends keep their order whatever else is in the batch.
-        if self.accumulate == "float32":
+        if (accumulate or self.accumulate) == "float32":
             out = np.zeros(n, np.float32)
             np.add.at(out, keys, np.asarray(values, np.float32))
             return out
-        return np.bincount(keys, weights=values, minlength=n).astype(np.float32)
+        return np.bincount(keys, weights=np.asarray(values, np.float64), minlength=n).astype(np.float32)
 
     def accumulator(self, n):
         return np.zeros(n, np.float32 if self.accumulate == "float32" else np.float64)

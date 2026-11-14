@@ -147,12 +147,12 @@ class TorchBackend:
             torch.repeat_interleave(starts - offsets, n, output_size=total)
         return torch.repeat_interleave(owners, n, output_size=total), entry
 
-    def segment_sum(self, keys, values, n):
+    def segment_sum(self, keys, values, n, accumulate=None):
         # float64 accumulation through index_put_(accumulate=True), whose CUDA kernel is sort-based and
         # deterministic; on CPU it is sequential.
         # float32 (the option for T4/L4-class GPUs, where FP64 is slow): the same deterministic kernel in float32;
         # a key's addends keep their order whatever else is in the batch, so BM25F stays batch-invariant.
-        dt = torch.float32 if self.accumulate == "float32" else torch.float64
+        dt = torch.float32 if (accumulate or self.accumulate) == "float32" else torch.float64
         out = torch.zeros(n, dtype=dt, device=self.device)
         out.index_put_((keys,), values.to(dt), accumulate=True)
         return out.to(torch.float32)
@@ -168,14 +168,17 @@ class TorchBackend:
     def segment_count(self, keys, n):
         return torch.bincount(keys, minlength=n).to(torch.int32)
 
-    def segment_sum_rows(self, docs, values, hits, row_lens, row_owners, n_queries, N):
+    def segment_sum_rows(self, docs, values, hits, row_lens, row_owners, n_queries, N, accumulate=None):
         """S6-18: ``(segment_sum(q * N + docs, values), segment_count_where(...))`` for a chunk whose entries are its term
         rows one after another (each sorted by doc), summed by the Triton kernel in the rows' order: the same float64
         additions in the same order as the sort-based kernel, so the same bits. ``None`` when it does not apply
-        (no Triton, not cuda, ``S3_TRITON_BM25`` not "1", float32 accumulation), and the caller takes the torch path."""
+        (no Triton, not cuda, ``S3_TRITON_BM25`` not "1"), and the caller takes the torch path. ``values`` may be float16,
+        float32 or float64 and is read as it is; ``accumulate`` (S6-21): the sum's dtype, float64 or float32, else the
+        backend's. Each dtype pair gives the torch path's bits: the same adds in the same order."""
         from . import triton_bm25 as TB
-        if self.accumulate != "float64" or not TB.wanted(self):
+        if not TB.wanted(self):
             return None
+        acc_dt = torch.float32 if (accumulate or self.accumulate) == "float32" else torch.float64
         row_start, at = [], 0
         for n in row_lens:
             row_start.append(at)
@@ -187,8 +190,8 @@ class TorchBackend:
                 q_lo.append(r)
                 q_hi.append(r)
             q_hi[-1] = r + 1
-        acc, cnt = TB.segment_sum_and_count(self, docs, values.to(torch.float64), hits, row_start, list(row_lens),
-                                            q_lo, q_hi, q_index, n_queries, N)
+        acc, cnt = TB.segment_sum_and_count(self, docs, values, hits, row_start, list(row_lens),
+                                            q_lo, q_hi, q_index, n_queries, N, acc_dtype=acc_dt)
         return acc.to(torch.float32), cnt
 
     def segment_count_where(self, keys, mask, n):

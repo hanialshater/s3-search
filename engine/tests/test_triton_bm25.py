@@ -59,6 +59,37 @@ def test_triton_sum_equals_the_torch_path(limit, monkeypatch, _any_gpu_class):
     assert _any_gpu_class, "the Triton kernel never ran"
 
 
+@pytest.mark.parametrize("addend,acc", [("float32", "float32"), ("float16", "float64"), ("float16", "float32")])
+def test_triton_sum_equals_the_torch_path_for_each_precision(addend, acc, monkeypatch, _any_gpu_class):
+    """S6-21: float16 weights and a float32 sum give the torch path's bits through the kernel too."""
+    import torch
+    from engine import api
+    from engine.analysis import analyze
+    monkeypatch.setenv("S3_BM25_ADDEND", addend)
+    monkeypatch.setenv("S3_BM25_SUM", acc)
+    ds = loader.load_dataset("toy")
+    ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
+    st = ix._st
+    part, b = st.parts[0], st.b
+    texts = list(dict.fromkeys(list(ds.fit["query"]) + list(ds.test_queries["query"])))
+    terms = [sorted({part.vocab[t] for t in analyze(x) if t in part.vocab}) for x in texts][:64] + [[]]
+    F = len(st.text_fields)
+    w = np.linspace(0.7, 2.3, F).astype(np.float32)
+    bb = np.full(F, 0.75, np.float32)
+
+    def run(on, ts):
+        monkeypatch.setenv("S3_TRITON_BM25", "1" if on else "0")
+        s, n = L.bm25f(b, part, ts, w, bb, 1.2, part.idf)
+        return s.view(torch.int32).cpu().numpy(), n.cpu().numpy()
+
+    s0, n0 = run(False, terms)
+    s1, n1 = run(True, terms)
+    assert np.array_equal(s0, s1) and np.array_equal(n0, n1)
+    sa, na = run(True, [terms[3]])
+    assert np.array_equal(sa[0], s1[3]) and np.array_equal(na[0], n1[3])
+    assert _any_gpu_class, "the Triton kernel never ran"
+
+
 def test_off_by_default_and_never_on_cpu():
     assert not TB.wanted(get_backend("cuda"))                  # S3_TRITON_BM25 unset
     assert not TB.wanted(get_backend("cpu"))

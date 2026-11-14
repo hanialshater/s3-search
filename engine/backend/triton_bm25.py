@@ -77,27 +77,28 @@ if triton is not None:
                 h = tl.load(hits_ptr + e, mask=ok, other=0)
                 off = base + d
                 cur = tl.load(acc_ptr + off, mask=ok, other=0.0)
-                tl.store(acc_ptr + off, cur + x, mask=ok)
+                tl.store(acc_ptr + off, cur + x.to(cur.dtype), mask=ok)   # x is exact in the wider dtype
                 c = tl.load(cnt_ptr + off, mask=ok, other=0)
                 tl.store(cnt_ptr + off, c + h, mask=ok)
             tl.debug_barrier()                              # this term's adds land before the next term's
 
 
-def segment_sum_and_count(b, docs, vals64, hits, row_start, row_len, q_row_lo, q_row_hi, q_index, n_queries: int,
-                          N: int):
-    """``(sum float64[Q*N], count int32[Q*N])`` of a chunk's entries, the sum bit for bit ``segment_sum``'s float64
-    accumulation of ``vals64`` at keys ``q * N + doc``, and the count ``segment_count`` of the entries with ``hits``.
+def segment_sum_and_count(b, docs, vals, hits, row_start, row_len, q_row_lo, q_row_hi, q_index, n_queries: int,
+                          N: int, acc_dtype=None):
+    """``(sum acc_dtype[Q*N], count int32[Q*N])`` of a chunk's entries, the sum bit for bit ``segment_sum``'s
+    accumulation of ``vals`` (float16, float32 or float64, read as it is) at keys ``q * N + doc`` in ``acc_dtype``
+    (float64 by default; float32 for S6-21's experiment), and the count ``segment_count`` of the entries with ``hits``.
     ``row_start``, ``row_len``: each term row's entries in the chunk (host lists); ``q_row_lo``/``q_row_hi``: each query's
     rows; ``q_index``: each query's row in the output."""
     import torch
     dev = docs.device
-    acc = torch.zeros(n_queries * N, dtype=torch.float64, device=dev)
+    acc = torch.zeros(n_queries * N, dtype=acc_dtype or torch.float64, device=dev)
     cnt = torch.zeros(n_queries * N, dtype=torch.int32, device=dev)
     G = len(q_index)
     if G == 0 or N == 0:
         return acc, cnt
     t = lambda xs: torch.tensor(xs, dtype=torch.int64, device=dev)  # noqa: E731
     grid = (G, triton.cdiv(N, TILE))
-    _segsum_kernel[grid](docs.contiguous(), vals64.contiguous(), hits.to(torch.int32).contiguous(), t(row_start),
+    _segsum_kernel[grid](docs.contiguous(), vals.contiguous(), hits.to(torch.int32).contiguous(), t(row_start),
                          t(row_len), t(q_row_lo), t(q_row_hi), t(q_index), acc, cnt, N, TILE=TILE, BLOCK=BLOCK)
     return acc, cnt

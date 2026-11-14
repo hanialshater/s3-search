@@ -1,6 +1,8 @@
 """BM25F, exhaustive over the postings of the query terms (the prototype's ``Index.score_into``)."""
 from __future__ import annotations
 
+from ..backend import bm25_precision
+
 MAX_POSTINGS_PER_CHUNK = 30_000_000
 
 
@@ -47,8 +49,11 @@ def bm25f_groups(b, st, groups, modes, w, bb, k1: float, idf, group_idf=None):
     mode_of = b.asarray([{"sum": 0, "synonym": 1, "const": 2}[m] for m in modes], "int64")[q_of]
     s_sum = (mode_of == 0) & hit
     if "sum" in modes:
+        addend, acc_dt = bm25_precision(b)               # S6-21
         imp = idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf)
-        scores = scores + b.segment_sum(keys[s_sum], imp[s_sum], G * N)
+        if addend != "float32":
+            imp = b.astype(imp, addend)
+        scores = scores + b.segment_sum(keys[s_sum], imp[s_sum], G * N, accumulate=acc_dt)
     s_syn = (mode_of == 1) & hit
     if "synonym" in modes:
         P = b.segment_sum(keys[s_syn], ptf[s_syn], G * N)
@@ -114,6 +119,7 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
         groups.append(chunk)
     w = b.asarray(w, "float32")
     bb = b.asarray(bb, "float32")
+    addend, acc_dt = bm25_precision(b)                   # S6-21: float32 weights summed in float64, by default
     for g in groups:
         total = sum(lens[i] for i in g)                  # known on the host: no device read (S6-17)
         q_of, entry = b.csr_expand(st.term_ptr, [rows[i] for i in g], [owners[i] for i in g], total=total)
@@ -127,16 +133,18 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
         norm = b.where(norm > 1e-6, norm, 1e-6)
         ptf = sum_lr(w * tf / norm, 1)
         imp = idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf)
+        if addend != "float32":
+            imp = b.astype(imp, addend)
         rows_sum = getattr(b, "segment_sum_rows", None)  # S6-18: the Triton segmented sum, when the backend has it
         if rows_sum is not None and getattr(st, "identity", False):
-            res = rows_sum(docs, imp, ptf > 0, [lens[i] for i in g], [owners[i] for i in g], Q, N)
+            res = rows_sum(docs, imp, ptf > 0, [lens[i] for i in g], [owners[i] for i in g], Q, N, accumulate=acc_dt)
             if res is not None:
                 s_g, n_g = res
                 scores = scores + s_g
                 nmatch = nmatch + n_g
                 continue
         keys = q_of * N + docs
-        scores = scores + b.segment_sum(keys, imp, Q * N)
+        scores = scores + b.segment_sum(keys, imp, Q * N, accumulate=acc_dt)
         hit = ptf > 0
         nmatch = nmatch + b.segment_count_where(keys, hit, Q * N)   # no boolean index: no host sync (S6-17)
     return scores.reshape(Q, N), nmatch.reshape(Q, N)
@@ -173,6 +181,9 @@ def bm25f_multi(b, parts, terms_per_part, w, bb, k1: float, idfs, N: int):
     keys = b.concatenate(keys_all) if len(keys_all) > 1 else keys_all[0]
     imp = b.concatenate(imp_all) if len(imp_all) > 1 else imp_all[0]
     hit = b.concatenate(hit_all) if len(hit_all) > 1 else hit_all[0]
-    scores = b.segment_sum(keys, imp, Q * N)
+    addend, acc_dt = bm25_precision(b)                   # S6-21
+    if addend != "float32":
+        imp = b.astype(imp, addend)
+    scores = b.segment_sum(keys, imp, Q * N, accumulate=acc_dt)
     nmatch = b.segment_count(keys[hit], Q * N)
     return scores.reshape(Q, N), nmatch.reshape(Q, N)

@@ -77,9 +77,9 @@ class Backend(Protocol):
         ``total`` (S6-17), when the caller knows E on the host, saves the device read that finds it.
         """
 
-    def segment_sum(self, keys: Array, values: Array, n: int) -> Array:
+    def segment_sum(self, keys: Array, values: Array, n: int, accumulate: str | None = None) -> Array:
         """``out[k] = sum(values[keys == k])`` for k in ``range(n)``; float32; deterministic order of summation
-        (by entry index) on every device."""
+        (by entry index) on every device. ``accumulate``: the sum's dtype, else the backend's (S6-21)."""
 
     def segment_max(self, keys: Array, values: Array, n: int, init: float = float("-inf")) -> Array:
         """``out[k] = max(values[keys == k])`` (float64; ``init`` where none), for nested score modes (S9-5)."""
@@ -170,6 +170,26 @@ def resolve_device(device: str | None = None) -> str:
 
 _CACHE: dict = {}
 ENV_ACCUM = "S3_SEARCH_ACCUM"
+ENV_BM25_ADDEND = "S3_BM25_ADDEND"
+ENV_BM25_SUM = "S3_BM25_SUM"
+
+
+def bm25_precision(b) -> tuple[str, str]:
+    """S6-21, a precision experiment (development only; the default is today's): ``(addend, accumulate)`` for BM25F.
+
+    ``S3_BM25_ADDEND``: the dtype each posting's term weight (idf * saturated pseudo-tf, computed in float32) is rounded
+    to before the sum: ``"float32"`` (default, unrounded) or ``"float16"`` (about 3 significant digits per weight).
+    ``S3_BM25_SUM``: the dtype the weights are summed in: ``"float64"`` or ``"float32"``; unset, the backend's own
+    ``accumulate`` (``S3_SEARCH_ACCUM``, float64 by default). A float16 sum is not offered: it keeps about 3 digits of
+    the total, and at depth 2,000 that reorders near-ties. Read on every call, so one process can measure each variant
+    on one index. Every combination stays deterministic and batch-invariant: the order of the adds does not change."""
+    addend = os.environ.get(ENV_BM25_ADDEND, "") or "float32"
+    acc = os.environ.get(ENV_BM25_SUM, "") or b.accumulate
+    if addend not in ("float32", "float16"):
+        raise ValueError(f"{ENV_BM25_ADDEND}: float32 | float16, not {addend!r}")
+    if acc not in ("float64", "float32"):
+        raise ValueError(f"{ENV_BM25_SUM}: float64 | float32, not {acc!r}")
+    return addend, acc
 
 
 def get_backend(device: str | None = None, accumulate: str | None = None) -> Backend:
