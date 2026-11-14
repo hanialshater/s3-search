@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|granian]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|granian|native] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -41,6 +41,7 @@ import multiprocessing as mp
 import os
 import subprocess
 import sys
+import shutil
 import tarfile
 import time
 import urllib.request
@@ -253,6 +254,32 @@ def _post(url, body, route=None):
         h["X-S3-Route-Gpu"] = str(route)
     with urllib.request.urlopen(urllib.request.Request(url, data=body, method="POST", headers=h), timeout=60) as r:
         return r.read(), r.headers.get("X-S3-Gpu-Process"), r.headers.get("X-S3-Index-Version")
+
+
+_TOOK = None
+
+
+def ab_dump(url, bodies, path, n) -> dict:
+    """--ab-dump=FILE (S6-22s): the first n request bodies, one at a time and unloaded, each response's raw bytes
+    with only the took_ms value blanked, as length-prefixed records; colab/front_ab.py compares two such files byte
+    for byte (the stdlib front's and the native front's)."""
+    global _TOOK
+    import hashlib
+    import re
+    import struct
+    if _TOOK is None:
+        _TOOK = re.compile(rb'("took_ms":\s*)-?[0-9][0-9.eE+-]*')
+    digest, blanked = hashlib.sha256(), 0
+    with open(path, "wb") as f:
+        for b in bodies[:n]:
+            raw, _, _ = _post(url, b)
+            raw, k = _TOOK.subn(rb"\g<1>0", raw, count=1)
+            blanked += k
+            f.write(struct.pack("<I", len(raw)) + raw)
+            digest.update(struct.pack("<I", len(raw)) + raw)
+    out = {"path": path, "n": min(n, len(bodies)), "took_ms_blanked": blanked, "sha256": digest.hexdigest()}
+    say(f"ab dump: {out}")
+    return out
 
 
 def _diff(a: bytes, b: bytes) -> dict:
@@ -497,6 +524,25 @@ def zvec_target(ds, server_cpus):
 GRANIAN_VERSION = "2.8.8"                                   # BSD-3-Clause; only when --front-server=granian
 
 
+def build_native_front() -> dict:
+    """--front-server=native (S6-22s): build serving/native_front on the VM (Rust stable by rustup when cargo is
+    missing) and record the toolchain and the binary's sha256. The fronts' threads: --server-env=
+    S3_SERVING_FRONT_THREADS_NATIVE=N (default --fronts)."""
+    import hashlib
+    cargo = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+    if not os.path.exists(cargo):
+        subprocess.run("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable",
+                       shell=True, check=True)
+    t0 = time.time()
+    subprocess.run([cargo, "build", "--release", "--locked"], cwd="serving/native_front", check=True)
+    binary = os.path.abspath("serving/native_front/target/release/s3-native-front")
+    info = {"cargo": subprocess.run([cargo, "--version"], capture_output=True, text=True).stdout.strip(),
+            "build_s": round(time.time() - t0, 1), "binary": binary,
+            "binary_sha256": hashlib.sha256(open(binary, "rb").read()).hexdigest()}
+    say(f"engine: native front built {info}")
+    return info
+
+
 def engine_target(ds, server_cpus):
     """--engine-bm25: the index's BM25 parameters, a JSON object or a file (default the tuned bm25f-tuned.bm25.json);
     --engine-request: the request template file (default the tuned BM25F request; title-only.json for the parity
@@ -504,7 +550,8 @@ def engine_target(ds, server_cpus):
     global SERVE_DIR
     if opt("front-server", "stdlib") == "granian":
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", f"granian=={GRANIAN_VERSION}"], check=True)
-    spec = opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
+    native = build_native_front() if opt("front-server", "stdlib") == "native" else None
+    spec =opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
     bm25 = json.loads(spec) if spec.strip().startswith("{") else json.loads(Path(spec).read_text())
     if spec != "referee/requests/bm25f-tuned.bm25.json":
         import hashlib
@@ -531,11 +578,14 @@ def engine_target(ds, server_cpus):
            "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0"),
            "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0"),
            "S3_SERVING_FRONT_SERVER": opt("front-server", "stdlib"),
+           **({"S3_NATIVE_FRONT_BIN": native["binary"]} if native else {}),
            **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
     COMPETITOR.setdefault("engine", {})["server_env"] = {      # provenance: what the server ran with (the steward's ask)
         k: v for k, v in env.items() if k.startswith(("S3_SERVING_", "S3_SEARCH_", "S3_TRITON", "S3_PLAN_CACHE",
                                                       "S3_CUDA_"))}
     COMPETITOR["engine"]["server_env_arg"] = opt("server-env", "")
+    if native:
+        COMPETITOR["engine"]["native_front"] = native
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
@@ -732,6 +782,8 @@ def main():
             check = compare_unloaded(url, bodies, runs)
             say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
                 f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 unloaded)")
+            if opt("ab-dump", None):                              # S6-22s: the front A/B, byte for byte
+                check["ab_dump"] = ab_dump(url, bodies, opt("ab-dump", None), int(opt("ab-n", "1000")))
             if name == "vespa":                                   # V5: proton and mmap after the ladder, and the log itself
                 from colab.competitors import vespa_run as _V
                 COMPETITOR["vespa"]["after"] = _V.check_proton()
