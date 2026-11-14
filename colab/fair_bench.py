@@ -589,6 +589,7 @@ class Sampler:
     def __init__(self, pid):
         import threading
         self.pid, self.gpu, self.mem, self.cpu = pid, [], [], []
+        self.extra = None                                       # Vespa: its daemons, found by command line
         self.per_cpu, self.per_mem, self.role = {}, {}, {}      # per process: cores and device MiB samples
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
@@ -606,7 +607,11 @@ class Sampler:
                 pass
             try:
                 total = 0.0
-                for p in [root] + root.children(recursive=True):
+                procs_now = [root] + root.children(recursive=True)
+                if RESPONSE["kind"] == "vespa":
+                    from colab.competitors import vespa_run as _V
+                    procs_now += [psutil.Process(q) for q in _V.vespa_pids() if q not in {x.pid for x in procs_now}]
+                for p in procs_now:
                     if p.pid not in procs:
                         procs[p.pid] = p
                         p.cpu_percent(None)                     # the first call only starts the counter
@@ -723,6 +728,10 @@ def main():
             check = compare_unloaded(url, bodies, runs)
             say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
                 f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 unloaded)")
+            if name == "vespa":                                   # V5: proton and mmap after the ladder, and the log itself
+                from colab.competitors import vespa_run as _V
+                COMPETITOR["vespa"]["after"] = _V.check_proton()
+                COMPETITOR["vespa"]["log_fetched"] = _V.fetch_log(LOG.replace(".log", "") + "-vespa.log")
             out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check,
                                     "competitor": COMPETITOR.get(name), "config": {k: opt(k, None) for k in (
                                         "zvec-fields", "zvec-fusion", "zvec-workers", "zvec-query-threads")}
