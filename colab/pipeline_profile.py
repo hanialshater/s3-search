@@ -235,13 +235,30 @@ def main():
                               for x, y in zip(on, off))
             result["deep_triton_responses_differ"] = {"of": 256, "differ": differ}
             say(f"deep/triton: {differ} of 256 responses differ from the torch sum's")
-            os.environ["S3_TRITON_BM25"] = "0"
+            # and with the Triton top-k too (S3_TRITON_TOPK=1)
+            os.environ["S3_TRITON_BM25"] = "1"
+            os.environ["S3_TRITON_TOPK"] = "1"
+            result["deep_triton_topk"] = measure(index, deep_request, texts, "deep/triton+topk",
+                                                 {"hits": "columns", "ids": "bytes"})
+            differ = 0
+            for i in range(0, 256, 64):
+                reqs = [deep_request(t) for t in texts[i:i + 64]]
+                os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "1", "1"
+                on = [expand_hits(r) for r in index.search_batch(reqs, hits="columns", ids="bytes")]
+                os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "0", "0"
+                off = [expand_hits(r) for r in index.search_batch(reqs, hits="columns", ids="bytes")]
+                differ += sum({k: v for k, v in x.items() if k != "took_ms"} != {k: v for k, v in y.items() if k != "took_ms"}
+                              for x, y in zip(on, off))
+            result["deep_triton_topk_responses_differ"] = {"of": 256, "differ": differ}
+            say(f"deep/triton+topk: {differ} of 256 responses differ from the torch path's")
+            os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "0", "0"
     if TORCH_PROFILE:
         result["torch_profile"] = {}
         kinds = [("lexical", lexical_request), ("pipeline", pipeline_request)] + ([("deep", deep_request)] if DEEP else []) \
-            + ([("deep_triton", deep_request)] if DEEP and TRITON else [])
+            + ([("deep_triton", deep_request), ("deep_triton_topk", deep_request)] if DEEP and TRITON else [])
         for label, make in kinds:
-            os.environ["S3_TRITON_BM25"] = "1" if label == "deep_triton" else "0"
+            os.environ["S3_TRITON_BM25"] = "1" if label.startswith("deep_triton") else "0"
+            os.environ["S3_TRITON_TOPK"] = "1" if label == "deep_triton_topk" else "0"
             try:
                 result["torch_profile"][label] = torch_profile(
                     index, make, texts, label, kw={"hits": "columns", "ids": "bytes"} if label.startswith("deep") else None)
