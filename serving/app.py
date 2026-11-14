@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import re
+import socket
 import threading
 import time
 import uuid
@@ -284,9 +285,8 @@ def make_server(app: App, host: str | None = None, port: int | None = None, sock
             # delayed ACK (about 40 ms on Linux). plat-m13 showed a p95 near 45 to 50 ms at low rates on this stack,
             # for the engine and for zvec behind the same server alike. TCP_NODELAY sends each write at once.
             try:
-                import socket as _socket
-                self.connection.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
-            except OSError:
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:                                     # not TCP (a Unix socket): nothing to do
                 pass
 
         def _do(self) -> None:
