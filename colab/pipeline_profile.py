@@ -141,10 +141,15 @@ def fused_runs(index, texts):
     variants = [("0", None), ("1", None)]
     if any(a == "--threshold=1" for a in sys.argv[1:]):     # S6-29: the fused path with each top-k threshold
         variants = [("0", None), ("1", "torch"), ("1", "radix")]
+    impacts = any(a == "--impacts=1" for a in sys.argv[1:])    # S6-33: the fused path without and with impacts
+    if impacts:
+        variants = [("0", None), ("1", "imp0"), ("1", "imp1")]
     for kind, (make, kw) in kinds.items():
         for on, thr in variants:
             os.environ["S3_TRITON_FUSED_LEXICAL"] = on
-            if thr:
+            if thr in ("imp0", "imp1"):
+                os.environ["S3_TRITON_FUSED_IMPACTS"] = thr[-1]
+            elif thr:
                 os.environ["S3_TRITON_TOPK_THRESHOLD"] = thr
             label = f"{kind}_{'fused' if on == '1' else 'today'}" + (f"_{thr}" if thr else "")
             res[label] = {"measure": measure(index, make, texts, label, kw)}
@@ -239,8 +244,10 @@ def main():
         index = api.build_index(ds.catalogue, m, device="cuda")
         build_s = time.perf_counter() - t0
         texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
+        part0 = index._st.parts[0]
+        say(f"index: {part0.N:,} docs, {int(part0.doc_ids.shape[0]):,} postings, {int(part0.tf.shape[1])} text fields")
         from engine.backend import triton_gate
-        result = {"kind": "pipeline-profile-fused", "label": "development only, never a score", "ref": REF,
+        result = {"kind": "pipeline-profile-fused", "postings": int(part0.doc_ids.shape[0]), "label": "development only, never a score", "ref": REF,
                   "commit": commit, "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
                   "triton_effective": triton_gate.effective(index._st.b), "n_products": int(len(ds.catalogue)),
                   "n_queries": len(texts), "build_s": build_s, "fused": fused_runs(index, texts)}
