@@ -282,3 +282,26 @@ def test_timing_headers_include_the_batch_time(built, front):
         assert q >= 0 and b > 0 and s >= b, h
     finally:
         assert _stop(p) == 0
+
+
+def test_native_front_readyz_asks_every_gpu_process_and_honours_the_route(built, single):
+    """S6-22s, plat-m21: the native front's /readyz counts every GPU process (as the Python front), and a search with
+    X-S3-Route-Gpu goes to that process (skipped unless built)."""
+    if not _native_bin():
+        pytest.skip("serving/native_front is not built")
+    port = _free_port()
+    p = _start(built, port, ["--fronts", "2", "--gpu-processes", "2"],
+               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin()})
+    try:
+        st, body, _ = _http("GET", f"http://127.0.0.1:{port}/readyz")
+        rz = json.loads(body)
+        assert st == 200 and rz["ready"] is True and rz["gpu_processes"] == 2 and rz["gpu_ready"] == 2, rz
+        assert list(rz) == ["ready", "draining", "indexes", "fronts", "gpu_processes", "gpu_ready", "worker"]
+        url = f"http://127.0.0.1:{port}/indexes/toy/_search"
+        for j in (0, 1):
+            req = urllib.request.Request(url, data=json.dumps(REQS[0]).encode(), method="POST",
+                                         headers={"Content-Type": "application/json", "X-S3-Route-Gpu": str(j)})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                assert r.status == 200 and r.headers["X-S3-Gpu-Process"] == str(j)
+    finally:
+        assert _stop(p) == 0
