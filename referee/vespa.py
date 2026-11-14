@@ -7,7 +7,8 @@ scores Vespa with the same loader, test split and metrics as the engine, OpenSea
 It talks to a running Vespa whose application is the platform-engineer's `colab/competitors/vespa_app` (schema
 `product`, the `ids` document summary, rank profiles `title` and `bm25w`) and which already holds the catalogue.
 `build_index` does not feed; it checks that the corpus is the catalogue: the document count must equal the catalogue's,
-and a fixed sample of documents must hold the catalogue's text.
+and a fixed sample of documents must hold the catalogue's text (after `vespa_text`: the control characters Vespa refuses
+become spaces, for Vespa only, as the feed does; the engine's analyzer splits on them too, so the tokens are the same).
 
 Requests map as follows:
 
@@ -36,6 +37,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 FIELDS = ("product_title", "product_brand", "product_color", "product_bullet_point", "product_description")
 _FIELD = re.compile(r"^([^\^]+)(?:\^([0-9.eE+-]+))?$")
+_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def vespa_text(text: str) -> str:
+    """The text Vespa holds for a catalogue string: the control characters it refuses become spaces (the same rule
+    as colab/competitors/vespa_run.clean; the steward's fairness ruling on the feed, 2026-11-14)."""
+    return _ILLEGAL.sub(" ", text)
 
 
 class UnsupportedQuery(ValueError):
@@ -168,7 +176,7 @@ def build_index(catalogue, mapping: dict, device: str = "cpu", sample: int = 50)
     titles = catalogue["product_title"].fillna("").astype(str).tolist()
     for i in rng.sample(range(len(ids)), min(sample, len(ids))):
         doc = _http("GET", f"/document/v1/esci/product/docid/{urllib.request.quote(ids[i], safe='')}", timeout=30)
-        if doc.get("fields", {}).get("product_title", "") != titles[i]:
+        if doc.get("fields", {}).get("product_title", "") != vespa_text(titles[i]):
             raise RuntimeError(f"Vespa's document {ids[i]} does not hold the catalogue's title")
     return idx
 
