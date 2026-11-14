@@ -197,8 +197,16 @@ def _comparable(d: dict) -> dict:
 
 
 def full_coverage(raw: bytes) -> bool:
-    """V1: a Vespa response counts only with full coverage ("full": true in the root's coverage block)."""
-    return RESPONSE["kind"] != "vespa" or b'"full":true' in raw[:800]
+    """V1 (the steward's condition): a Vespa response counts only if its root coverage block, parsed, says coverage
+    100, full true and no degradation (``degraded`` absent, or every flag in it false)."""
+    if RESPONSE["kind"] != "vespa":
+        return True
+    try:
+        cov = json.loads(raw)["root"]["coverage"]
+    except (ValueError, KeyError, TypeError):
+        return False
+    deg = cov.get("degraded") or {}
+    return cov.get("coverage") == 100 and cov.get("full") is True and not any(bool(v) for v in deg.values())
 
 
 def result_digest(raw: bytes) -> tuple[int, str]:
