@@ -197,10 +197,11 @@ def binproto_search_body(raw):
 
 
 class _Item:
-    __slots__ = ("conn", "id", "name", "request", "t", "raw")
+    __slots__ = ("conn", "id", "name", "request", "t", "raw", "prep")
 
     def __init__(self, conn, id_, name, request, raw=None):
         self.conn, self.id, self.name, self.request, self.raw = conn, id_, name, request, raw
+        self.prep = None                                        # (Prepared, position) when s3_hostpath planned it
         self.t = time.perf_counter()
 
 
@@ -402,9 +403,12 @@ class GpuServer:
                 index = None
             prep = hp.prepare([it.raw for it in its], index, None) if index is not None else None
             errs = {i: (st, body) for i, st, body in (prep.errors if prep else [])}
+            eligible = set(prep.layout.get("eligible", ())) if prep is not None and prep.layout is not None else set()
             for i, it in enumerate(its):
                 if i in errs:
                     refused[id(it)] = (it, errs[i])
+                elif i in eligible and i not in prep.fallback:      # planned by the module: search_prepared in _run
+                    it.prep = (prep, i)
                 elif prep is not None and i not in prep.fallback and prep.requests[i] is not None:
                     it.request = prep.requests[i]
                 else:
@@ -434,6 +438,14 @@ class GpuServer:
         m = self.app.metrics
         m.inc("s3_batches_total", index=name)
         m.observe("s3_batch_size", len(items), index=name)
+        planned = [it for it in items if it.prep is not None]
+        if planned:                                             # s3_hostpath: the eligible positions at once
+            by_prep: dict[int, list[_Item]] = {}
+            for it in planned:
+                by_prep.setdefault(id(it.prep[0]), []).append(it)
+            rest = [it for it in items if it.prep is None]     # before _run_prepared clears prep on a fallback
+            back = [x for group in by_prep.values() for x in self._run_prepared(index, version, mi, group, len(items))]
+            items = rest + back
         bad = [i for i, it in enumerate(items) if not isinstance(it.request, dict)]
         for i in bad:
             self._fail([items[i]], TypeError("a search request is a JSON object"))
@@ -452,6 +464,45 @@ class GpuServer:
             return self._one_by_one(index, version, mi, items, waits, exc)
         for it, resp, w in zip(items, out, waits):
             self._answer(it, resp, version, w, mi, len(items))
+
+    def _run_prepared(self, index, version, mi, planned: list[_Item], size: int) -> list[_Item]:
+        """``index.search_prepared`` (or hostpath.search_prepared_stub) for the planned items, answered here and matched
+        back by position; returns the items to run through search_batch instead (their bodies parsed in Python) when
+        the call fails, counted as a host-path fallback."""
+        from . import hostpath
+        prep = planned[0].prep[0]
+        order = list(prep.layout["eligible"])
+        kw = {}
+        from .scheduler import takes_param
+        fn = getattr(index, "search_prepared", None)
+        if fn is not None:
+            if takes_param(fn, "hits"):
+                kw["hits"] = "columns"
+            if takes_param(fn, "ids"):
+                kw["ids"] = "bytes"
+        else:
+            kw = {k: v for k, v in (("hits", "columns"), ("ids", "bytes")) if takes_param(index.search_batch, k)}
+        t0 = time.perf_counter()
+        try:
+            out = fn(prep, **kw) if fn is not None else hostpath.search_prepared_stub(index, prep, **kw)
+            if len(out) != len(order):
+                raise RuntimeError(f"search_prepared returned {len(out)} responses for {len(order)} positions")
+        except Exception:  # noqa: BLE001 - never lose a batch to the module
+            log.exception("search_prepared failed; the batch falls back to search_batch")
+            hp = _hostpath()
+            if hp is not None:
+                hp.fallbacks += 1
+            for it in planned:
+                it.prep = None
+                it.request = hostpath.parse_body(binproto_search_body(it.raw))
+            return planned
+        self.busy_s += time.perf_counter() - t0
+        self.n_batches += 1
+        self.n_requests += len(planned)
+        by_pos = dict(zip(order, out))
+        for it in planned:
+            self._answer(it, by_pos[it.prep[1]], version, (t0 - it.t) * 1000.0, mi, size)
+        return []
 
     def _one_by_one(self, index, version, mi, items, waits, exc) -> None:
         failures = 0
@@ -473,7 +524,7 @@ class GpuServer:
             status, body = classify_entry(resp["error"])
             mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="error")
             return self._reply(it, ("search", it.id, "error", status, body))
-        src = it.request.get("_source")
+        src = it.request.get("_source") if isinstance(it.request, dict) else None   # planned: no _source
         if src not in (None, False):
             from .encode import expand_columns
             try:

@@ -160,7 +160,7 @@ def _raw_post(url, body):
         return e.code, e.read()
 
 
-@pytest.mark.parametrize("hostpath", ["0", "stub"])
+@pytest.mark.parametrize("hostpath", ["0", "stub", "stub-prepared"])
 def test_binary_protocol_gives_the_same_bodies(built, single, hostpath):
     """S6-22s: on a connection opened with S3B1, a GPU process answers in serving/binproto.py's frames, and the
     bodies decoded the way a native front must encode them equal one process's (but for took_ms); the same with the

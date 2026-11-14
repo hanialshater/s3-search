@@ -5,6 +5,8 @@ search frames straight from their binproto payloads, and to write the batch's re
 
     S3_HOSTPATH unset or 0   the default: the reader thread parses each frame (binproto.parse_request), as before
     S3_HOSTPATH=stub         PyStub below: the same contract in Python, so the plumbing is tested before the Rust lands
+    S3_HOSTPATH=stub-prepared  PyStub with a layout: plain requests come back eligible (``requests[i]`` None), and the
+                             GPU process answers them through ``search_prepared`` (the index's, or search_prepared_stub)
     S3_HOSTPATH=1            ``import s3_hostpath``; it must provide ``prepare`` and ``reply`` as PyStub does
 
 The contract (agreed through the coordinator, 2026-11-14):
@@ -26,6 +28,12 @@ The contract (agreed through the coordinator, 2026-11-14):
   for the same message, took_ms masked; ``serving/tests/golden/binproto_frames.json`` holds fixed cases a module must
   reproduce. (The architect's engine side may add a page-level reply, from the page buffer and the facet buckets; the
   frames it writes are held to the same golden cases.)
+- Eligible positions (the architect's 4c, 2026-11-14): when ``Prepared.layout`` is not None, ``requests[i]`` is None
+  for each position in ``layout["eligible"]``, and the GPU process calls ``index.search_prepared(prep, hits=...,
+  ids=...)``, which returns the responses for those positions, in that order and in today's response form; the other
+  positions go through ``search_batch`` as before, and the answers are matched back by position. An index without
+  ``search_prepared`` gets ``search_prepared_stub`` (the stub's own bodies through ``search_batch``). Empty and non-JSON
+  bodies come back as ``fallback`` from the module (the Python path keeps the error text).
 - Any exception from ``prepare`` falls that batch back to Python parsing, and from ``reply`` to the Python encoder;
   both are counted (``fallbacks``). No request is lost.
 
@@ -74,9 +82,16 @@ def reply_frame(msg) -> bytes:
     return binproto.whole(id_, status, body, {"type": ctype})
 
 
+_OWN = ("explain", "highlight", "_source", "profile")          # never eligible in the stub
+
+
 class PyStub:
-    """The contract in Python: what ``s3_hostpath`` replaces."""
+    """The contract in Python: what ``s3_hostpath`` replaces. ``prepared=True`` also returns a layout, with every plain
+    request eligible, so the GPU process's search_prepared path runs before the Rust lands."""
     name = "python-stub"
+
+    def __init__(self, prepared: bool = False):
+        self.prepared = prepared
 
     def prepare(self, payloads, index=None, out=None) -> Prepared:
         requests, errors = [], []
@@ -87,7 +102,15 @@ class PyStub:
                 requests.append(None)
                 status, body = classify(exc)
                 errors.append((i, status, body))
-        return Prepared(requests, errors)
+        if not self.prepared:
+            return Prepared(requests, errors)
+        refused = {i for i, _, _ in errors}
+        eligible = [i for i, r in enumerate(requests) if i not in refused and isinstance(r, dict)
+                    and not any(r.get(k) for k in _OWN)]
+        layout = {"eligible": eligible, "stub_bodies": [requests[i] for i in eligible]}
+        for i in eligible:
+            requests[i] = None
+        return Prepared(requests, errors, layout=layout)
 
     def reply(self, msgs) -> bytes:
         return b"".join(reply_frame(m) for m in msgs)
@@ -114,6 +137,12 @@ class _Guarded:
             return self._py.reply(msgs)
 
 
+def search_prepared_stub(index, prep: Prepared, **kw) -> list:
+    """An index without ``search_prepared``: the stub layout's own request dicts through ``search_batch``."""
+    out = index.search_batch(list(prep.layout["stub_bodies"]), **kw)
+    return list(out)
+
+
 def load():
     """None (the default), or the host path S3_HOSTPATH names, guarded."""
     mode = os.environ.get("S3_HOSTPATH", "0")
@@ -121,7 +150,9 @@ def load():
         return None
     if mode == "stub":
         return _Guarded(PyStub(), "python-stub")
+    if mode == "stub-prepared":
+        return _Guarded(PyStub(prepared=True), "python-stub-prepared")
     if mode == "1":
         import s3_hostpath                                   # the architect's pyo3 module
         return _Guarded(s3_hostpath, getattr(s3_hostpath, "__name__", "s3_hostpath"))
-    raise ValueError(f"S3_HOSTPATH={mode!r}: 0, stub or 1")
+    raise ValueError(f"S3_HOSTPATH={mode!r}: 0, stub, stub-prepared or 1")

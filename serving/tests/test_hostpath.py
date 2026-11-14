@@ -118,3 +118,82 @@ def test_load(monkeypatch):
     monkeypatch.setenv("S3_HOSTPATH", "maybe")
     with pytest.raises(ValueError):
         hostpath.load()
+
+
+def test_stub_prepared_marks_plain_requests_eligible():
+    bodies = [b'{"query": {"match_all": {}}, "size": 2}', b'{"query": {"match_all": {}}, "explain": true}', b"",
+              b'{"size": 1, "_source": true}', b'{"size": 3}']
+    prep = hostpath.PyStub(prepared=True).prepare([_payload(i, b) for i, b in enumerate(bodies)])
+    assert prep.layout["eligible"] == [0, 4]
+    assert prep.requests[0] is None and prep.requests[4] is None
+    assert prep.requests[1]["explain"] is True and prep.requests[3]["_source"] is True
+    assert [i for i, _, _ in prep.errors] == [2]
+    assert prep.layout["stub_bodies"] == [{"query": {"match_all": {}}, "size": 2}, {"size": 3}]
+
+
+class _FakeIndex:
+    """search_batch answers {"n": size}; search_prepared (optional) answers the layout's bodies the same way."""
+
+    def __init__(self, prepared=True, broken=False):
+        self.calls, self.broken = [], broken
+        if prepared:
+            self.search_prepared = self._search_prepared
+
+    def search_batch(self, requests, hits=None, ids=None, errors=None):
+        self.calls.append(("batch", len(requests)))
+        return [{"n": r.get("size")} for r in requests]
+
+    def _search_prepared(self, prep, hits=None, ids=None):
+        self.calls.append(("prepared", len(prep.layout["eligible"])))
+        if self.broken:
+            raise RuntimeError("boom")
+        return [{"n": r.get("size"), "via": "prepared"} for r in prep.layout["stub_bodies"]]
+
+
+class _FakeMI:
+    name, ready = "toy", True
+
+    def __init__(self, index):
+        self.index = index
+        import types
+        self.metrics = types.SimpleNamespace(inc=lambda *a, **k: None, observe=lambda *a, **k: None)
+
+    def attach_source(self, resp, src):
+        pass
+
+
+def _server(index, monkeypatch):
+    import types
+    from serving import gpu
+    monkeypatch.setattr(gpu, "_HOSTPATH", [hostpath._Guarded(hostpath.PyStub(prepared=True), "python-stub-prepared")])
+    monkeypatch.setattr(gpu, "version_of", lambda mi: ("seg", 1))
+    mi = _FakeMI(index)
+    srv = object.__new__(gpu.GpuServer)
+    srv.app = types.SimpleNamespace(manager=types.SimpleNamespace(get=lambda name: mi),
+                                    metrics=types.SimpleNamespace(inc=lambda *a, **k: None, observe=lambda *a, **k: None))
+    srv.busy_s, srv.n_batches, srv.n_requests, srv._out = 0.0, 0, 0, None
+    sent = []
+    srv._reply = lambda it, msg: sent.append(msg)
+    return gpu, srv, sent
+
+
+@pytest.mark.parametrize("prepared,broken", [(True, False), (False, False), (True, True)])
+def test_run_answers_planned_positions_by_search_prepared_and_the_rest_by_search_batch(monkeypatch, prepared, broken):
+    index = _FakeIndex(prepared=prepared, broken=broken)
+    gpu, srv, sent = _server(index, monkeypatch)
+    bodies = [b'{"size": 1}', b'{"size": 2, "explain": true}', b"{bad", b'{"size": 4}']
+    items = [gpu._Item(None, 100 + i, "toy", None, raw=_payload(100 + i, b)) for i, b in enumerate(bodies)]
+    batch = srv._prepare_raw(items)
+    assert [it.id for it in batch] == [100, 101, 103]                # the non-JSON body answered at once
+    assert sent[0][:4] == ("search", 102, "error", 400)
+    srv._run("toy", batch)
+    got = {m[1]: m[3] for m in sent[1:]}
+    assert set(got) == {100, 101, 103} and got[101] == {"n": 2}
+    if prepared and not broken:
+        assert got[100] == {"n": 1, "via": "prepared"} and got[103] == {"n": 4, "via": "prepared"}
+        assert index.calls == [("prepared", 2), ("batch", 1)]
+    elif not prepared:                                                # an index without search_prepared: the stub
+        assert got[100] == {"n": 1} and got[103] == {"n": 4} and ("batch", 2) in index.calls
+    else:                                                             # search_prepared raised: search_batch, counted
+        assert got[100] == {"n": 1} and got[103] == {"n": 4}
+        assert index.calls == [("prepared", 2), ("batch", 3)] and gpu._HOSTPATH[0].fallbacks == 1
