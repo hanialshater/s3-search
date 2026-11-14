@@ -22,6 +22,11 @@ from collections import Counter, defaultdict
 import numpy as np
 
 PARTS = ("client_network", "front", "queue", "gpu_batch")
+# The front split, when the native front's timers were recorded (--extra-headers): f_read (the body read), f_build (the
+# frame built and queued), f_render (the hits written), f_tail (serve minus those and the round trip), g_parse (the GPU
+# process reader's parse), g_post (a reply's wait for the writer after its batch), g_io (the round trip less parse,
+# queue, batch and post: the writer's encode, the socket both ways, the reader's wait for the GIL)
+SUB = ("f_read", "f_build", "f_render", "f_tail", "g_parse", "g_post", "g_io")
 
 
 def rows(path):
@@ -33,20 +38,29 @@ def rows(path):
             lat, serve = float(r["lat_ms"]), float(r["serve_ms"])
             q = float(r["queue_ms"] or 0.0)
             b = float(r["batch_ms"]) if r["batch_ms"] else float("nan")
-            out.append({"i": int(r["i"]), "lat": lat, "lag": float(r["lag_ms"]), "gpu": r["gpu"],
-                        "batch": int(r["batch"] or 0), "client_network": lat - serve,
-                        "front": serve - q - (0.0 if np.isnan(b) else b), "queue": q, "gpu_batch": b})
+            rec = {"i": int(r["i"]), "lat": lat, "lag": float(r["lag_ms"]), "gpu": r["gpu"],
+                   "batch": int(r["batch"] or 0), "client_network": lat - serve,
+                   "front": serve - q - (0.0 if np.isnan(b) else b), "queue": q, "gpu_batch": b}
+            if r.get("front_rtt_ms"):                       # the native front's timers: the front split into parts
+                f = lambda k: float(r[k]) if r.get(k) else 0.0
+                rtt, post, parse = f("front_rtt_ms"), f("gpu_post_ms"), f("gpu_parse_ms")
+                rec.update({"f_read": f("front_read_ms"), "f_build": f("front_build_ms"), "f_render": f("front_render_ms"),
+                            "f_tail": serve - f("front_read_ms") - f("front_build_ms") - rtt - f("front_render_ms"),
+                            "g_parse": parse, "g_post": post,
+                            "g_io": rtt - parse - q - (0.0 if np.isnan(b) else b) - post})
+            out.append(rec)
     return out
 
 
 def summary(recs, rate=None):
     lat = np.array([r["lat"] for r in recs])
+    sub = [k for k in SUB if recs and k in recs[0]]
     pct = {k: {f"p{q}": float(np.nanpercentile([r[k] for r in recs], q)) for q in (50, 90, 99, 99.9)}
-           for k in ("lat",) + PARTS}
+           for k in ("lat",) + PARTS + tuple(sub)}
     cut = np.percentile(lat, 99)
     slow = [r for r in recs if r["lat"] >= cut]
     dom = Counter(max(PARTS, key=lambda k: -1 if np.isnan(r[k]) else r[k]) for r in slow)
-    share = {k: float(np.nanmean([r[k] / r["lat"] for r in slow])) for k in PARTS}
+    share = {k: float(np.nanmean([r[k] / r["lat"] for r in slow])) for k in PARTS + tuple(sub)}
     by_gpu = Counter(r["gpu"] for r in slow)
     all_gpu = Counter(r["gpu"] for r in recs)
     batch_slow = float(np.median([r["batch"] for r in slow])) if slow else None
@@ -80,11 +94,11 @@ def main():
         json.dump(s, open(sys.argv[2], "w"), indent=1)
     p = s["percentiles_ms"]
     print(f"{path}: {s['answered']} answered")
-    for k in ("lat",) + PARTS:
+    for k in p:
         print(f"  {k:15s} " + "  ".join(f"{q} {v:8.2f}" for q, v in p[k].items()))
     sl = s["slowest_1pct"]
     print(f"  slowest 1% (>= {sl['latency_cut_ms']:.1f} ms): dominant {sl['dominant']}, mean share "
-          + ", ".join(f"{k} {v:.0%}" for k, v in sl["mean_share"].items())
+          + ", ".join(f"{k} {v:.0%}" for k, v in sl["mean_share"].items() if not np.isnan(v))
           + f"; median batch {sl['median_batch']} (all {sl['median_batch_all']})")
 
 

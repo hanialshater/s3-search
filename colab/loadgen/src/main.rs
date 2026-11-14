@@ -78,6 +78,7 @@ struct Rec {
     queue: String,
     serve: String,
     batch_ms: String,
+    extra: Vec<String>,
     sampled: bool,
 }
 
@@ -100,9 +101,13 @@ fn main() {
     let samples_dir = Arc::new(arg("--samples-dir").unwrap_or_else(|| "/content/fair-samples".into()));
     let timeout = Duration::from_secs_f64(arg("--timeout").and_then(|x| x.parse().ok()).unwrap_or(10.0));
     let accept_encoding = Arc::new(arg("--accept-encoding").unwrap_or_else(|| "gzip, deflate".into()));
+    // --extra-headers a,b: more response headers recorded per request as extra CSV columns (a header read only)
+    let extra_names: Arc<Vec<String>> = Arc::new(arg("--extra-headers").unwrap_or_default().split(',')
+        .map(|x| x.trim().to_ascii_lowercase()).filter(|x| !x.is_empty()).collect());
     let n_total = (rate * duration) as u64;
     let rate_tag = rate as u64;
 
+    let extra_for_tasks = extra_names.clone();             // the async block below takes its own handle
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().unwrap();
     let recs: Vec<Rec> = rt.block_on(async move {
         let mut conn = HttpConnector::new();
@@ -125,6 +130,7 @@ fn main() {
             let url = url.clone();
             let dir = samples_dir.clone();
             let enc = accept_encoding.clone();
+            let extra_names = extra_for_tasks.clone();
             handles.push(tokio::spawn(async move {
                 // aiohttp's request headers but for the client name (the steward's condition): Host and
                 // Content-Length are set by hyper as by aiohttp; Accept is aiohttp's default and Accept-Encoding the
@@ -141,7 +147,7 @@ fn main() {
                 };
                 let mut r = Rec { i, lat_ms: None, lag_ms, status: 1, why: None, gpu: String::new(),
                                   version: String::new(), batch: String::new(), queue: String::new(),
-                                  serve: String::new(), batch_ms: String::new(), sampled: false };
+                                  serve: String::new(), batch_ms: String::new(), extra: Vec::new(), sampled: false };
                 match tokio::time::timeout(timeout, fut).await {
                     Err(_) => r.status = 0,
                     Ok(Err(e)) => {
@@ -159,6 +165,7 @@ fn main() {
                             r.queue = header(&h, "x-s3-queue-ms");
                             r.serve = header(&h, "x-s3-serve-ms");
                             r.batch_ms = header(&h, "x-s3-batch-ms");
+                            r.extra = extra_names.iter().map(|k| header(&h, k)).collect();
                             if sampled {
                                 let p = format!("{}/{}-{}.json", dir, rate_tag, i);
                                 if std::fs::write(&p, &raw).is_ok() {
@@ -182,7 +189,7 @@ fn main() {
                 Err(_) => recs.push(Rec { i: i as u64, lat_ms: None, lag_ms: f64::NAN, status: 1,
                                           why: Some("JoinError".into()), gpu: String::new(), version: String::new(),
                                           batch: String::new(), queue: String::new(), serve: String::new(),
-                                          batch_ms: String::new(), sampled: false }),
+                                          batch_ms: String::new(), extra: Vec::new(), sampled: false }),
             }
         }
         recs
@@ -192,7 +199,8 @@ fn main() {
     let (mut errors, mut timeouts) = (0u64, 0u64);
     let mut why: HashMap<String, u64> = HashMap::new();
     let mut csv = std::io::BufWriter::new(std::fs::File::create(&rec_path).expect("--records"));
-    writeln!(csv, "i,lat_ms,lag_ms,status,gpu,batch,queue_ms,serve_ms,batch_ms").unwrap();
+    let extra_cols: String = extra_names.iter().map(|k| format!(",{}", k.trim_start_matches("x-s3-").replace('-', "_"))).collect();
+    writeln!(csv, "i,lat_ms,lag_ms,status,gpu,batch,queue_ms,serve_ms,batch_ms{}", extra_cols).unwrap();
     for r in &recs {
         if !r.lag_ms.is_nan() {
             lag.push(r.lag_ms);
@@ -208,8 +216,13 @@ fn main() {
         if r.sampled {
             samples.push(serde_json::json!([r.i, null, null, r.gpu, r.version, r.batch]));
         }
-        writeln!(csv, "{},{},{:.3},{},{},{},{},{},{}", r.i, r.lat_ms.map(|x| format!("{:.3}", x)).unwrap_or_default(),
-                 r.lag_ms, r.status, r.gpu, r.batch, r.queue, r.serve, r.batch_ms).unwrap();
+        let mut extra = String::new();
+        for k in 0..extra_names.len() {
+            extra.push(',');
+            extra.push_str(r.extra.get(k).map(|x| x.as_str()).unwrap_or(""));
+        }
+        writeln!(csv, "{},{},{:.3},{},{},{},{},{},{}{}", r.i, r.lat_ms.map(|x| format!("{:.3}", x)).unwrap_or_default(),
+                 r.lag_ms, r.status, r.gpu, r.batch, r.queue, r.serve, r.batch_ms, extra).unwrap();
     }
     csv.flush().unwrap();
     let out = serde_json::json!({"lat": lat, "errors": errors, "timeouts": timeouts, "hits": [], "lag": lag,

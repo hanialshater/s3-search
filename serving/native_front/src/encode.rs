@@ -119,6 +119,169 @@ fn itoa_buf(v: i64) -> Vec<u8> {
     v.to_string().into_bytes()
 }
 
+/// `json.dumps(x)` for any float64, byte for byte (S3B2, kind 3): Python's `float.__repr__`, the shortest round-trip
+/// digits (ryu's, the same digits as CPython's dtoa shortest mode) laid out by CPython's 'r' rule: positional when the
+/// decimal point position decpt (x = 0.d1d2... x 10^decpt) has -4 < decpt <= 16, else d[.ddd]e+XX / e-XX (at least
+/// two exponent digits); and NaN, Infinity, -Infinity as json.dumps writes them.
+pub fn push_pyrepr(out: &mut Vec<u8>, x: f64, buf: &mut ryu::Buffer) {
+    // The common case first (plat-m26: render 0.66 against 0.30 ms on kind 1): in repr's positional range ryu's text is
+    // already Python's (kind 1's whole premise, held by tests/float_vectors.txt), so no layout work and no allocation.
+    let m = x.abs();
+    if x.is_finite() && x != 0.0 && m >= 1e-4 && m < 1e16 {
+        out.extend_from_slice(buf.format_finite(x).as_bytes());
+        return;
+    }
+    if x.is_nan() {
+        out.extend_from_slice(b"NaN");
+        return;
+    }
+    if x.is_infinite() {
+        out.extend_from_slice(if x > 0.0 { b"Infinity" } else { b"-Infinity" });
+        return;
+    }
+    if x == 0.0 {
+        out.extend_from_slice(if x.is_sign_negative() { b"-0.0" } else { b"0.0" });
+        return;
+    }
+    let s = buf.format_finite(x.abs());
+    let (mant, exp) = match s.find('e') {
+        Some(p) => (&s[..p], s[p + 1..].parse::<i32>().unwrap_or(0)),
+        None => (s, 0),
+    };
+    let (ip, fp) = match mant.find('.') {
+        Some(p) => (&mant[..p], &mant[p + 1..]),
+        None => (mant, ""),
+    };
+    let n = ip.len() + fp.len();
+    let mut dbuf = [0u8; 64];                                  // no allocation on the slow path (ryu's text is short)
+    let heap: Vec<u8>;
+    let digits: &[u8] = if n <= dbuf.len() {
+        dbuf[..ip.len()].copy_from_slice(ip.as_bytes());
+        dbuf[ip.len()..n].copy_from_slice(fp.as_bytes());
+        &dbuf[..n]
+    } else {
+        heap = [ip.as_bytes(), fp.as_bytes()].concat();
+        &heap
+    };
+    let z = digits.iter().take_while(|&&c| c == b'0').count();
+    let decpt = ip.len() as i32 - z as i32 + exp;
+    let mut d: &[u8] = &digits[z..];
+    while d.len() > 1 && d[d.len() - 1] == b'0' {
+        d = &d[..d.len() - 1];
+    }
+    if x < 0.0 {
+        out.push(b'-');
+    }
+    if decpt > -4 && decpt <= 16 {
+        if decpt <= 0 {
+            out.extend_from_slice(b"0.");
+            for _ in 0..(-decpt) {
+                out.push(b'0');
+            }
+            out.extend_from_slice(d);
+        } else if decpt as usize >= d.len() {
+            out.extend_from_slice(d);
+            for _ in 0..(decpt as usize - d.len()) {
+                out.push(b'0');
+            }
+            out.extend_from_slice(b".0");
+        } else {
+            out.extend_from_slice(&d[..decpt as usize]);
+            out.push(b'.');
+            out.extend_from_slice(&d[decpt as usize..]);
+        }
+    } else {
+        out.push(d[0]);
+        if d.len() > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&d[1..]);
+        }
+        let e = decpt - 1;
+        out.push(b'e');
+        out.push(if e < 0 { b'-' } else { b'+' });
+        let ea = e.unsigned_abs();
+        if ea < 10 {
+            out.push(b'0');
+        }
+        out.extend_from_slice(ea.to_string().as_bytes());
+    }
+}
+
+/// `json.encoder.encode_basestring_ascii(s)`, byte for byte: quoted; `"` `\` and \b \f \n \r \t as their short
+/// escapes; every other character outside space..~ as \uXXXX (lower-case hex; a surrogate pair above U+FFFF).
+pub fn push_json_ascii(out: &mut Vec<u8>, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let b = s.as_bytes();
+    if b.iter().all(|&c| (0x20..0x7f).contains(&c) && c != b'"' && c != b'\\') {
+        out.push(b'"');                                         // printable ASCII, nothing to escape: copy it
+        out.extend_from_slice(b);
+        out.push(b'"');
+        return;
+    }
+    out.push(b'"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            '\u{8}' => out.extend_from_slice(b"\\b"),
+            '\u{c}' => out.extend_from_slice(b"\\f"),
+            ' '..='~' => out.push(ch as u8),
+            c => {
+                let mut units = [0u16; 2];
+                for u in c.encode_utf16(&mut units).iter() {
+                    out.extend_from_slice(b"\\u");
+                    for shift in [12, 8, 4, 0] {
+                        out.push(HEX[((u >> shift) & 0xf) as usize]);
+                    }
+                }
+            }
+        }
+    }
+    out.push(b'"');
+}
+
+/// Kind 3 (S3B2): the hits list as `serving/encode.py`'s `encode_hits` writes it for any ids and floats: each id
+/// (UTF-8, its trailing NUL padding dropped) escaped by `push_json_ascii`, each float by `push_pyrepr`. None when an
+/// id is not UTF-8 (the interface says it always is).
+pub fn encode_hits3(blk: &Block, out: &mut Vec<u8>) -> Option<()> {
+    let mut fb = ryu::Buffer::new();
+    out.push(b'[');
+    let mut score_txt: Vec<u8> = Vec::with_capacity(32);
+    for i in 0..blk.h {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"{\"_id\":");
+        let id = &blk.ids[i * blk.w..(i + 1) * blk.w];
+        let end = id.iter().rposition(|&c| c != 0).map(|p| p + 1).unwrap_or(0);
+        push_json_ascii(out, std::str::from_utf8(&id[..end]).ok()?);
+        out.extend_from_slice(b",\"_score\":");
+        score_txt.clear();
+        push_pyrepr(&mut score_txt, f32_at(blk.scores, i) as f64, &mut fb);
+        out.extend_from_slice(&score_txt);
+        out.extend_from_slice(b",\"sort\":[");
+        for (k, c) in blk.sort.iter().enumerate() {
+            if k > 0 {
+                out.push(b',');
+            }
+            match c {
+                Col::SameAsScore => out.extend_from_slice(&score_txt),
+                Col::F64(v) => push_pyrepr(out, f64_at(v, i), &mut fb),
+                Col::I64(v) => {
+                    let mut ib = itoa_buf(i64_at(v, i));
+                    out.append(&mut ib);
+                }
+            }
+        }
+        out.extend_from_slice(b"]}");
+    }
+    out.push(b']');
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +303,56 @@ mod tests {
             n += 1;
         }
         assert!(n > 10_000);
+    }
+
+    fn vectors(name: &str) -> Vec<(String, String)> {
+        let path = format!("{}/tests/{}", env!("CARGO_MANIFEST_DIR"), name);
+        std::fs::read_to_string(&path).expect(name).lines().filter(|l| !l.is_empty())
+            .map(|l| { let mut it = l.splitn(2, ' '); (it.next().unwrap().to_string(), it.next().unwrap_or("").to_string()) })
+            .collect()
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// S3B2: json.dumps(x) for every float64 class (tests/pyrepr_vectors.txt, written by tests/make_vectors.py).
+    #[test]
+    fn pyrepr_matches_python_json_dumps() {
+        let mut fb = ryu::Buffer::new();
+        let v = vectors("pyrepr_vectors.txt");
+        for (bits, want) in &v {
+            let x = f64::from_bits(u64::from_str_radix(bits, 16).unwrap());
+            let mut out = Vec::new();
+            push_pyrepr(&mut out, x, &mut fb);
+            assert_eq!(std::str::from_utf8(&out).unwrap(), want, "bits {}", bits);
+        }
+        assert!(v.len() > 30_000);
+    }
+
+    /// S3B2: encode_basestring_ascii for fuzzed UTF-8 (tests/escape_vectors.txt).
+    #[test]
+    fn escape_matches_python_encode_basestring_ascii() {
+        let v = vectors("escape_vectors.txt");
+        for (src, want) in &v {
+            let s = String::from_utf8(unhex(src)).unwrap();
+            let mut out = Vec::new();
+            push_json_ascii(&mut out, &s);
+            assert_eq!(out, unhex(want), "source {}", src);
+        }
+        assert!(v.len() > 2_000);
+    }
+
+    /// S3B2: a whole kind 3 reply payload rendered is serving.encode.encode's body (tests/golden3.txt).
+    #[test]
+    fn kind3_frames_render_python_bytes() {
+        let v = vectors("golden3.txt");
+        for (payload, body) in &v {
+            let p = unhex(payload);
+            let (st, out, _) = crate::render(&p).expect("render");
+            assert_eq!(st, 200);
+            assert_eq!(out, unhex(body), "payload {}", &payload[..40]);
+        }
+        assert!(v.len() >= 60);
     }
 }
