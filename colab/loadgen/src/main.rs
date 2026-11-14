@@ -3,6 +3,7 @@
 //!
 //!     s3-loadgen --url URL --bodies FILE --rate R --duration D --t0 EPOCH --threads N --out FILE --records FILE
 //!                [--sample-every K] [--sample-bodies a,b] [--samples-dir DIR] [--timeout S] [--accept-encoding E]
+//!                [--extra-headers a,b] [--lead-in S]
 //!
 //! As the aiohttp client: request i (0 .. rate*duration) carries body i % len(bodies) and is due at t0 + i/rate (wall
 //! clock, epoch seconds); it is sent when due without waiting for any reply (open loop); its latency is from its due
@@ -105,6 +106,10 @@ fn main() {
     let extra_names: Arc<Vec<String>> = Arc::new(arg("--extra-headers").unwrap_or_default().split(',')
         .map(|x| x.trim().to_ascii_lowercase()).filter(|x| !x.is_empty()).collect());
     let n_total = (rate * duration) as u64;
+    // --lead-in S (plat-m28): S seconds at the same rate before t0, due at t0 - S + j / rate, on the same connection
+    // pool, recorded nowhere and not counted, so the measured window starts on warm connections.
+    let lead_in: f64 = arg("--lead-in").and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    let n_lead = (rate * lead_in) as u64;
     let rate_tag = rate as u64;
 
     let extra_for_tasks = extra_names.clone();             // the async block below takes its own handle
@@ -114,6 +119,28 @@ fn main() {
         conn.set_nodelay(true);                                 // as aiohttp
         let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(conn);
         let clock = Clock::new();
+        let mut lead = Vec::with_capacity(n_lead as usize);
+        for j in 0..n_lead {                                    // the lead-in: sent on schedule, answers ignored
+            let due = t0 - lead_in + j as f64 / rate;
+            let wait = due - clock.now();
+            if wait > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+            }
+            let body = bodies[(j as usize) % bodies.len()].clone();
+            let client = client.clone();
+            let url = url.clone();
+            let enc = accept_encoding.clone();
+            lead.push(tokio::spawn(async move {
+                let req = Request::post(url).header("Content-Type", "application/json").header("Accept", "*/*")
+                    .header("Accept-Encoding", enc.as_str()).header("User-Agent", "s3-loadgen/0.1")
+                    .body(Full::new(body)).unwrap();
+                let _ = tokio::time::timeout(timeout, async {
+                    if let Ok(resp) = client.request(req).await {
+                        let _ = resp.into_body().collect().await;
+                    }
+                }).await;
+            }));
+        }
         let mut handles = Vec::with_capacity(n_total as usize);
         for i in 0..n_total {
             let due = t0 + i as f64 / rate;
@@ -179,6 +206,9 @@ fn main() {
                 }
                 r
             }));
+        }
+        for h in lead {
+            let _ = h.await;
         }
         let mut recs = Vec::with_capacity(handles.len());
         for (i, h) in handles.into_iter().enumerate() {

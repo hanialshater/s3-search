@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--warm-rung=1 --warm-duration=S] [--extra-headers=X-S3-Front-Rtt-Ms,...] [--loadgen-bin=PATH --loadgen-sha256=HEX] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--warm-rung=1 --warm-duration=S] [--extra-headers=X-S3-Front-Rtt-Ms,...] [--lead-in=S (native)] [--loadgen-bin=PATH --loadgen-sha256=HEX] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -471,6 +471,8 @@ def _load_native(url, bodies, rate, duration, client_cpus, t0):
            "--timeout", repr(TIMEOUT_S), "--accept-encoding", _aiohttp_accept_encoding()]
     if opt("extra-headers", None):                          # e.g. the native front's timers (S6-22s)
         cmd += ["--extra-headers", opt("extra-headers", None)]
+    if float(opt("lead-in", "0")) > 0:                       # plat-m28: unrecorded seconds before t0, warm connections
+        cmd += ["--lead-in", opt("lead-in", "0")]
     pr = subprocess.Popen(cmd)
     deadline = time.time() + duration + TIMEOUT_S + 120
     while True:
@@ -498,7 +500,7 @@ def _load_native(url, bodies, rate, duration, client_cpus, t0):
 
 
 def load(url, bodies, rate, duration, client_cpus):
-    t0 = time.time() + 2.0
+    t0 = time.time() + 2.0 + (float(opt("lead-in", "0")) if CLIENT == "native" else 0.0)   # the lead-in runs before t0
     if CLIENT == "native":
         return _merge(_load_native(url, bodies, rate, duration, client_cpus, t0), rate, duration, client_cpus)
     procs, outs = [], []
