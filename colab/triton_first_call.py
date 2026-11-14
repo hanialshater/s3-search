@@ -19,6 +19,7 @@ os.environ["TRITON_CACHE_DIR"] = tempfile.mkdtemp(prefix="triton-cache-")
 os.environ["S3_TRITON_CAPABILITIES"] = "any"       # measure on whatever GPU this is
 for f in ("S3_TRITON_BM25", "S3_TRITON_TOPK", "S3_TRITON_FACETS"):
     os.environ[f] = "0"
+os.environ["S3_TRITON_FUSED_LEXICAL"] = "0"         # S6-26: each kernel on its own path, not the fused pass
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch  # noqa: E402
