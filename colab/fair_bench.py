@@ -416,12 +416,17 @@ def _bodies_file(bodies) -> str:
     return path
 
 
+_NATIVE_RUN = [0]
+
+
 def _load_native(url, bodies, rate, duration, client_cpus, t0):
     """One s3-loadgen process on the client CPUs (taskset), its CPU time from wait4; returns load()'s parts."""
     lg = build_loadgen()
     if RESPONSE["kind"] == "vespa":
         raise RuntimeError("the native client has no coverage check: not for Vespa (the steward's ruling)")
-    out, rec = "/content/fair-client-native.json", f"/content/fair-records-{int(rate)}.csv"
+    _NATIVE_RUN[0] += 1                                     # a file per run, not per rate (the steward's note)
+    out = f"/content/fair-client-native-{_NATIVE_RUN[0]}.json"
+    rec = f"/content/fair-records-{int(rate)}-run{_NATIVE_RUN[0]}.csv"
     cmd = ["taskset", "-c", ",".join(map(str, client_cpus)), lg["binary"], "--url", url, "--bodies",
            _bodies_file(bodies), "--rate", repr(float(rate)), "--duration", repr(float(duration)), "--t0", repr(t0),
            "--threads", str(len(client_cpus)), "--out", out, "--records", rec, "--sample-every", str(SAMPLE_EVERY),
@@ -441,6 +446,9 @@ def _load_native(url, bodies, rate, duration, client_cpus, t0):
     if pr.returncode != 0:
         raise RuntimeError(f"the native load client exited {pr.returncode}")
     d = json.load(open(out))
+    want = int(rate * duration)
+    if d["sent"] != want:                                   # the steward's counting condition: every request accounted for
+        raise RuntimeError(f"the native load client accounted for {d['sent']} requests, not {want}")
     for smp in d["samples"]:                                 # the digest in Python, the same result_digest as aiohttp
         raw = open(f"{SAMPLES}/{int(rate)}-{smp[0]}.json", "rb").read()
         smp[1], smp[2] = result_digest(raw)

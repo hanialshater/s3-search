@@ -174,9 +174,15 @@ fn main() {
             }));
         }
         let mut recs = Vec::with_capacity(handles.len());
-        for h in handles {
-            if let Ok(r) = h.await {
-                recs.push(r);
+        for (i, h) in handles.into_iter().enumerate() {
+            match h.await {
+                Ok(r) => recs.push(r),
+                // A request task that panicked is an error, never dropped (the steward, on 82c0ebd): sent stays
+                // int(rate * duration).
+                Err(_) => recs.push(Rec { i: i as u64, lat_ms: None, lag_ms: f64::NAN, status: 1,
+                                          why: Some("JoinError".into()), gpu: String::new(), version: String::new(),
+                                          batch: String::new(), queue: String::new(), serve: String::new(),
+                                          batch_ms: String::new(), sampled: false }),
             }
         }
         recs
@@ -188,7 +194,9 @@ fn main() {
     let mut csv = std::io::BufWriter::new(std::fs::File::create(&rec_path).expect("--records"));
     writeln!(csv, "i,lat_ms,lag_ms,status,gpu,batch,queue_ms,serve_ms,batch_ms").unwrap();
     for r in &recs {
-        lag.push(r.lag_ms);
+        if !r.lag_ms.is_nan() {
+            lag.push(r.lag_ms);
+        }
         match r.status {
             0 => timeouts += 1,
             200 => lat.push(r.lat_ms.unwrap()),
