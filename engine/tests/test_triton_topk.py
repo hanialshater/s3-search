@@ -63,6 +63,7 @@ def test_deep_responses_unchanged(monkeypatch, _any_gpu_class):
     from engine import api
     ds = loader.load_dataset("toy")
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
+    monkeypatch.setattr(TT, "MIN_K", 1)                     # the toy has 200 docs, fewer than MIN_K: let it run
     reqs = [{**r, "size": 300} for r in checks.lexical_requests(ds)[:40]]
     monkeypatch.setenv("S3_TRITON_TOPK", "0")
     want = [api.expand_hits(r) for r in ix.search_batch(reqs, hits="columns", ids="bytes")]

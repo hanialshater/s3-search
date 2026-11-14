@@ -25,6 +25,7 @@ import torch  # noqa: E402
 import triton  # noqa: E402
 
 from engine import api  # noqa: E402
+from engine.backend import triton_bm25, triton_facets, triton_topk  # noqa: E402
 from referee import checks, loader  # noqa: E402
 
 
@@ -38,6 +39,7 @@ def timed(ix, reqs):
 
 def main():
     ds = loader.load_dataset("toy")
+    triton_topk.MIN_K = 1                           # the toy has 200 docs, fewer than MIN_K; the compile is the same
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
     aggs = {"b": {"terms": {"field": "product_brand.keyword", "size": 5}}}
     lex = checks.lexical_requests(ds)[:32]
@@ -46,13 +48,21 @@ def main():
         timed(ix, reqs)                             # torch path warm
     out = {"gpu": torch.cuda.get_device_name(), "capability": list(torch.cuda.get_device_capability()),
            "torch": torch.__version__, "triton": triton.__version__, "kernels": {}}
+    calls = {}
+    for flag, mod, fn in (("S3_TRITON_BM25", triton_bm25, "segment_sum_and_count"),
+                          ("S3_TRITON_TOPK", triton_topk, "topk"), ("S3_TRITON_FACETS", triton_facets, "bincount_rows")):
+        real = getattr(mod, fn)
+        setattr(mod, fn, lambda *a, _r=real, _f=flag, **k: (calls.__setitem__(_f, calls.get(_f, 0) + 1), _r(*a, **k))[1])
     for flag in ("S3_TRITON_BM25", "S3_TRITON_TOPK", "S3_TRITON_FACETS"):
         os.environ[flag] = "1"
         first = timed(ix, reqs)
         cached = statistics.median(timed(ix, reqs) for _ in range(3))
         os.environ[flag] = "0"
         out["kernels"][flag] = {"first_s": round(first, 3), "cached_s": round(cached, 4),
-                                "compile_s": round(first - cached, 3)}
+                                "compile_s": round(first - cached, 3), "kernel_calls": calls.get(flag, 0)}
+        if not calls.get(flag):
+            print(f"[first-call] {flag}: the kernel never ran", flush=True)
+            return 1
         print(f"[first-call] {flag}: first batch {first:.3f} s, cached {cached * 1000:.1f} ms, "
               f"compile about {first - cached:.2f} s", flush=True)
     print("[first-call] " + json.dumps(out), flush=True)

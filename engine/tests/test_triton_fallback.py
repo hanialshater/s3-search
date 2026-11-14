@@ -77,6 +77,7 @@ def test_flags_on_without_a_usable_kernel_give_the_same_responses(device, monkey
     ds = loader.load_dataset("toy")
     ix = api.build_index(ds.catalogue, ds.mapping, device=device)
     reqs = _requests(ds)
+    monkeypatch.setattr(TT, "MIN_K", 1)                   # the toy has 200 docs: the top-k would be wanted here
     strip = lambda r: {k: v for k, v in api.expand_hits(r).items() if k != "took_ms"}  # noqa: E731
     for f in FLAGS:
         monkeypatch.setenv(f, "0")
