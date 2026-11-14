@@ -397,3 +397,21 @@ def test_real_engine_smoke(make, tmp_path):
     assert st == 200, body
     st, body, _ = call(app, "POST", "/indexes/toy/_search", {"query": {"match": {"product_title": "shirt"}}})
     assert st == 200 and body["hits"]["total"] > 0 and "total" in body["took_ms"]
+
+
+def test_http_connections_have_tcp_nodelay(tmp_path):
+    """1aee977: headers and body are two writes, so without TCP_NODELAY a small response waits about 42 ms for the
+    client's delayed ACK (measured on Linux, S6-plat-47). The handler sets it on every TCP connection."""
+    import socket as _socket
+    app = create_app(ServingConfig(data_dir=str(tmp_path / "d")), fake_ports())
+    try:
+        srv = make_server(app, "127.0.0.1", 0)
+        client = _socket.create_connection(srv.server_address)
+        conn, _ = srv.socket.accept()
+        h = srv.RequestHandlerClass.__new__(srv.RequestHandlerClass)
+        h.request, h.client_address, h.server = conn, None, srv
+        h.setup()
+        assert conn.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY) != 0
+        h.finish(); conn.close(); client.close(); srv.server_close()
+    finally:
+        app.close()
