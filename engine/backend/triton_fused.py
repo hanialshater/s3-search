@@ -48,6 +48,14 @@ except Exception:  # noqa: BLE001
 
 TILE = 2048
 BLOCK = 256
+NUM_WARPS = 4
+
+
+def _shape():
+    """(TILE, BLOCK, num_warps), from S3_TRITON_FUSED_TILE, _BLOCK and _WARPS for tuning (S6-30). A tile is a doc
+    range one program owns, so its size never changes the order of any key's adds, nor the bits."""
+    return (int(os.environ.get("S3_TRITON_FUSED_TILE", TILE)), int(os.environ.get("S3_TRITON_FUSED_BLOCK", BLOCK)),
+            int(os.environ.get("S3_TRITON_FUSED_WARPS", NUM_WARPS)))
 ENV = "S3_TRITON_FUSED_LEXICAL"
 
 
@@ -196,14 +204,15 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
              else torch.zeros((1, 1), dtype=torch.int32, device=dev))
     c1 = float(np.float32(k1 + 1.0))
     c2 = float(np.float32(k1))
-    grid = (Q, triton.cdiv(N, TILE))
+    tile, block, warps = _shape()
+    grid = (Q, triton.cdiv(N, tile))
     _fused_kernel[grid](part.doc_ids.contiguous(), part.tf.contiguous(), part.rel_len.contiguous(), row_idf,
                         t64(row_start or [0]), t64(row_len or [0]), t64(q_lo), t64(q_hi),
                         torch.tensor([int(m) for m in msm], dtype=torch.int32, device=dev),
                         torch.tensor([float(x) for x in boost], dtype=torch.float32, device=dev),
                         live.contiguous().view(torch.uint8), w32, omb, bb32, codes,
                         t64(offs or [0]), t64(sizes or [1]), acc, cnt, out, total, fc, N, c1, c2,
-                        F=F, NFACET=nf, TILE=TILE, BLOCK=BLOCK, enable_fp_fusion=False)
+                        F=F, NFACET=nf, TILE=tile, BLOCK=block, num_warps=warps, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
     return out.view(Q, N), total.to(torch.int64), facets
 
