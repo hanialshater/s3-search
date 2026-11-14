@@ -46,15 +46,35 @@ def frame(payload: bytes) -> bytes:
     return _U32.pack(len(payload)) + payload
 
 
+def search_head(payload) -> tuple[int, str]:
+    """A type-1 (search) payload's ``(id, index name)``, without its JSON (``serving/hostpath.py``)."""
+    _, id_ = _HDR.unpack_from(payload, 0)
+    (n,) = struct.unpack_from("<H", payload, _HDR.size)
+    return id_, bytes(payload[_HDR.size + 2:_HDR.size + 2 + n]).decode()
+
+
+def search_body(payload) -> bytes:
+    """A type-1 payload's request JSON bytes, as the HTTP body came."""
+    o = _HDR.size
+    (n,) = struct.unpack_from("<H", payload, o); o += 2 + n
+    (m,) = _U32.unpack_from(payload, o); o += 4
+    return bytes(payload[o:o + m])
+
+
 def parse_request(payload: bytes):
-    """-> ("search", id, name, request_dict) | ("call", id, method, path, body)"""
+    """-> ("search", id, name, request_dict or BadJSON) | ("call", id, method, path, body)"""
     typ, id_ = _HDR.unpack_from(payload, 0)
     o = _HDR.size
     if typ == 1:
         (n,) = struct.unpack_from("<H", payload, o); o += 2
         name = payload[o:o + n].decode(); o += n
         (n,) = _U32.unpack_from(payload, o); o += 4
-        return ("search", id_, name, json.loads(payload[o:o + n]))
+        from .hostpath import parse_body                        # the Python front's BadJSON, not a closed connection
+        from .errors import BadJSON
+        try:
+            return ("search", id_, name, parse_body(payload[o:o + n]))
+        except BadJSON as exc:
+            return ("search", id_, name, exc)
     (n,) = struct.unpack_from("<H", payload, o); o += 2
     method = payload[o:o + n].decode(); o += n
     (n,) = struct.unpack_from("<H", payload, o); o += 2
