@@ -1045,7 +1045,7 @@ class Executor:
             rows = b.arange(G).reshape(G, 1)
             idx, _ = b.topk(S, k)
             idx = b.astype(idx, "int64")
-            safe = b.where(idx >= 0, idx, 0)
+            safe = b.clamp_min(idx, 0)                    # the same values as where(idx >= 0, idx, 0)
             bufs.append(b.stack([b.astype(idx, "float64"), b.astype(S[rows, safe], "float64"),
                                  b.astype(st.first_offset_dev[safe], "float64")], 2).reshape(-1))
             tots.append(b.astype(tot, "float64"))
@@ -1183,7 +1183,7 @@ class Executor:
                     idx = b.where(first, i1, i0[rows, j0])
                     tier_col = b.astype(first, "float64")
                 need = idx.shape[1]                       # min(the largest from + size, N)
-                safe = b.where(idx >= 0, idx, 0)
+                safe = b.clamp_min(idx, 0)                    # the same values as where(idx >= 0, idx, 0)
                 cols = [b.astype(idx, "float64")] + ([tier_col] if tiered else []) + \
                     [b.astype(S[rows, safe], "float64"), b.astype(st.first_offset_dev[safe], "float64")]
                 w = len(cols)

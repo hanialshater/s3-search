@@ -178,31 +178,38 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     Q, N = len(terms), part.N
     F = int(part.tf.shape[1])
     row_start, row_len, row_term, q_lo, q_hi = _rows(part, terms)
-    t64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=dev)  # noqa: E731
-    w32 = b.asarray(np.asarray(w, np.float32), "float32")
-    bb32 = b.asarray(np.asarray(bb, np.float32), "float32")
-    omb = (1.0 - bb32).contiguous()                           # as the torch path: (1 - b) in float32 first
-    row_idf = (idf[t64(row_term)] if row_term else torch.zeros(0, dtype=torch.float32, device=dev)).contiguous()
+    nf = len(facet_codes)
+    sizes = [int(s) for s in facet_sizes]
+    offs = [int(x) for x in np.cumsum([0] + [Q * s for s in sizes])[:-1]] if nf else []
+    R = len(row_start)
+    # S6-24: every small per-call array in two host-to-device copies (one int64, one float32), not one per array
+    ints = [row_start or [0], row_len or [0], q_lo, q_hi, [int(m) for m in msm], offs or [0], sizes or [1],
+            row_term or [0]]
+    lens = [len(x) for x in ints]
+    host_i = np.fromiter((v for x in ints for v in x), np.int64, sum(lens))
+    w32 = np.asarray(w, np.float32)
+    bb32 = np.asarray(bb, np.float32)
+    host_f = np.concatenate([w32, bb32, np.float32(1.0) - bb32,          # (1 - b) in float32, as the torch path
+                             np.asarray([float(x) for x in boost], np.float32)])
+    dev_i = torch.from_numpy(host_i).to(dev)
+    dev_f = torch.from_numpy(host_f).to(dev)
+    at = np.cumsum([0] + lens)
+    rs, rl, qlo, qhi, msm_d, off_d, nv_d, rt = (dev_i[at[k]:at[k + 1]] for k in range(len(ints)))
+    w_d, bb_d, omb_d, boost_d = dev_f[:F], dev_f[F:2 * F], dev_f[2 * F:3 * F], dev_f[3 * F:]
+    row_idf = (idf[rt] if R else torch.zeros(1, dtype=torch.float32, device=dev)).contiguous()
     acc = torch.empty(Q * N, dtype=torch.float64, device=dev)
     cnt = torch.empty(Q * N, dtype=torch.int32, device=dev)
     out = torch.empty(Q * N, dtype=torch.float32, device=dev)
     total = torch.zeros(Q, dtype=torch.int32, device=dev)
-    nf = len(facet_codes)
-    sizes = [int(s) for s in facet_sizes]
-    offs = list(np.cumsum([0] + [Q * s for s in sizes])[:-1]) if nf else []
     fc = torch.zeros(max(1, sum(Q * s for s in sizes)), dtype=torch.int32, device=dev)
     codes = (torch.stack([c.to(torch.int32) for c in facet_codes], 0).contiguous() if nf
              else torch.zeros((1, 1), dtype=torch.int32, device=dev))
     c1 = float(np.float32(k1 + 1.0))
     c2 = float(np.float32(k1))
     grid = (Q, triton.cdiv(N, TILE))
-    _fused_kernel[grid](part.doc_ids.contiguous(), part.tf.contiguous(), part.rel_len.contiguous(), row_idf,
-                        t64(row_start or [0]), t64(row_len or [0]), t64(q_lo), t64(q_hi),
-                        torch.tensor([int(m) for m in msm], dtype=torch.int32, device=dev),
-                        torch.tensor([float(x) for x in boost], dtype=torch.float32, device=dev),
-                        live.contiguous().view(torch.uint8), w32, omb, bb32, codes,
-                        t64(offs or [0]), t64(sizes or [1]), acc, cnt, out, total, fc, N, c1, c2,
-                        F=F, NFACET=nf, TILE=TILE, BLOCK=BLOCK, enable_fp_fusion=False)
+    _fused_kernel[grid](part.doc_ids, part.tf, part.rel_len, row_idf, rs, rl, qlo, qhi, msm_d, boost_d,
+                        live.view(torch.uint8), w_d, omb_d, bb_d, codes, off_d, nv_d, acc, cnt, out, total, fc, N,
+                        c1, c2, F=F, NFACET=nf, TILE=TILE, BLOCK=BLOCK, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
     return out.view(Q, N), total.to(torch.int64), facets
 

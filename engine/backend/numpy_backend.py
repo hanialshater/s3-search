@@ -57,6 +57,9 @@ class NumpyBackend:
     def stack(self, arrays, axis=0):
         return np.stack(list(arrays), axis=axis)
 
+    def clamp_min(self, a, lo):
+        return np.maximum(a, lo)
+
     def astype(self, a, dtype):
         return a.astype(DTYPES[dtype], copy=False)
 
