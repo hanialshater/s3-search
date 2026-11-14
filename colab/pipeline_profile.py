@@ -37,7 +37,8 @@ TORCH_PROFILE = any(a == "--torch-profile=1" for a in sys.argv[1:])
 PLAN_CACHE = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--plan-cache=")), None)
 if PLAN_CACHE is not None:
     os.environ["S3_PLAN_CACHE"] = str(int(PLAN_CACHE))
-BATCHES = (1, 16, 64, 128)
+BATCHES = tuple(int(x) for x in next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--batches=")),
+                                     "1,16,64,128").split(","))
 S6_QPS, S6_P99_MS = 694, 35.0
 
 t_start = time.time()
@@ -137,10 +138,15 @@ def fused_runs(index, texts):
     real = triton_fused._run_kernel
     triton_fused._run_kernel = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
     res = {}
+    variants = [("0", None), ("1", None)]
+    if any(a == "--onepass=1" for a in sys.argv[1:]):       # S6-31: the fused path with each host assembly
+        variants = [("0", None), ("1", "0"), ("1", "1")]
     for kind, (make, kw) in kinds.items():
-        for on in ("0", "1"):
+        for on, op in variants:
             os.environ["S3_TRITON_FUSED_LEXICAL"] = on
-            label = f"{kind}_{'fused' if on == '1' else 'today'}"
+            if op is not None:
+                os.environ["S3_FUSED_ONEPASS"] = op
+            label = f"{kind}_{'fused' if on == '1' else 'today'}" + ("" if op is None else f"_onepass{op}")
             res[label] = {"measure": measure(index, make, texts, label, kw)}
             try:
                 res[label]["torch_profile"] = torch_profile(index, make, texts, label, kw=kw)
