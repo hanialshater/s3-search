@@ -134,11 +134,15 @@ class Supervisor:
                  gpu_processes: int = 0):
         """``gpu_processes`` > 0: the S6-10s layout, ``n`` fronts and that many GPU processes (``serving/gpu.py``)."""
         self.fronts, self.k = (n, gpu_processes) if gpu_processes else (0, 0)
-        n = n + self.k
+        # S6-21s: S3_SERVING_FRONT_SERVER=granian runs the fronts as one granian process with ``fronts`` workers on the
+        # port (serving/front_granian.py); stdlib (the default) keeps serving's own fronts on a shared socket.
+        self.granian = bool(self.k) and os.environ.get("S3_SERVING_FRONT_SERVER", "stdlib") == "granian"
+        n = (1 if self.granian else n) + self.k
         self.n, self.argv, self.restart_pause_s = n, list(argv), restart_pause_s
-        self.http = listen(host, port)
+        self.host = host
+        self.http = None if self.granian else listen(host, port)
         self.rpc = listen(host, rpc_port) if rpc_port else None
-        self.port = self.http.getsockname()[1]
+        self.port = port if self.granian else self.http.getsockname()[1]
         self.procs: list[subprocess.Popen | None] = [None] * n
         self.started = [0.0] * n
         self.stopping = threading.Event()
@@ -152,13 +156,20 @@ class Supervisor:
         """Processes 0..k-1 are the GPU processes (started first), then the fronts; without GPU processes, workers."""
         if not self.k:
             return "worker", i
-        return ("gpu", i) if i < self.k else ("front", i - self.k)
+        if i < self.k:
+            return "gpu", i
+        return ("granian", 0) if self.granian else ("front", i - self.k)
 
     def _cmd(self, i: int) -> list[str]:
         kind, j = self._kind(i)
         if kind == "gpu":
             return [sys.executable, "-m", "serving", *self.argv, "--gpu-process", str(j), "--gpu-socket",
                     self.gpu_sockets[j]]
+        if kind == "granian":
+            return [sys.executable, "-m", "granian", "--interface", "wsgi", "--workers", str(self.fronts),
+                    "--blocking-threads", os.environ.get("S3_SERVING_FRONT_THREADS", "32"), "--host", self.host,
+                    "--port", str(self.port), "--backlog", "1024", "--no-ws", "--log-level", "warning",
+                    "serving.front_granian:app"]
         cmd = [sys.executable, "-m", "serving", *self.argv, "--worker-index", str(j),
                "--listen-fd", str(self.http.fileno())]
         if kind == "front":
@@ -168,7 +179,7 @@ class Supervisor:
         return cmd
 
     def _start(self, i: int) -> None:
-        fds = (self.http.fileno(),) + ((self.rpc.fileno(),) if self.rpc is not None else ())
+        fds = (() if self.http is None else (self.http.fileno(),)) + ((self.rpc.fileno(),) if self.rpc is not None else ())
         kind, j = self._kind(i)
         clear_ready(self.state_dir, f"gpu-{j}" if kind == "gpu" else j)
         env = {**os.environ, "S3_SERVING_WORKER_STATE": self.state_dir}
@@ -176,11 +187,11 @@ class Supervisor:
             env["S3_SERVING_WORKERS"] = str(self.n)
         else:
             env.update(S3_SERVING_WORKERS="1", S3_SERVING_FRONTS=str(self.fronts),
-                       S3_SERVING_GPU_PROCESSES=str(self.k))
+                       S3_SERVING_GPU_PROCESSES=str(self.k), S3_SERVING_GPU_SOCKETS=",".join(self.gpu_sockets))
         share = str(max(1, _cores() // self.n))                  # N workers x all-core thread pools oversubscribe
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             env.setdefault(var, share)
-        self.procs[i] = subprocess.Popen(self._cmd(i), pass_fds=() if kind == "gpu" else fds, env=env)
+        self.procs[i] = subprocess.Popen(self._cmd(i), pass_fds=() if kind in ("gpu", "granian") else fds, env=env)
         self.started[i] = time.monotonic()
         log.info("%s %d started (pid %d) on port %d", kind, j, self.procs[i].pid, self.port)
 
@@ -224,7 +235,8 @@ class Supervisor:
             if t_end is not None and time.monotonic() > t_end:
                 break
             time.sleep(0.2)
-        self.http.close()
+        if self.http is not None:
+            self.http.close()
         if self.rpc is not None:
             self.rpc.close()
         shutil.rmtree(self.state_dir, ignore_errors=True)

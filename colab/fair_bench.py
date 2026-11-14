@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|granian]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -490,11 +490,16 @@ def zvec_target(ds, server_cpus):
     return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
 
 
+GRANIAN_VERSION = "2.8.8"                                   # BSD-3-Clause; only when --front-server=granian
+
+
 def engine_target(ds, server_cpus):
     """--engine-bm25: the index's BM25 parameters, a JSON object or a file (default the tuned bm25f-tuned.bm25.json);
     --engine-request: the request template file (default the tuned BM25F request; title-only.json for the parity
     runs). A different --engine-bm25 builds its own index (its own serve dir)."""
     global SERVE_DIR
+    if opt("front-server", "stdlib") == "granian":
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", f"granian=={GRANIAN_VERSION}"], check=True)
     spec = opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
     bm25 = json.loads(spec) if spec.strip().startswith("{") else json.loads(Path(spec).read_text())
     if spec != "referee/requests/bm25f-tuned.bm25.json":
@@ -521,6 +526,7 @@ def engine_target(ds, server_cpus):
            "S3_SERVING_FRONTS": str(FRONTS), "S3_SERVING_GPU_PROCESSES": str(GPUS),
            "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0"),
            "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0"),
+           "S3_SERVING_FRONT_SERVER": opt("front-server", "stdlib"),
            **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
     COMPETITOR.setdefault("engine", {})["server_env"] = {      # provenance: what the server ran with (the steward's ask)
         k: v for k, v in env.items() if k.startswith(("S3_SERVING_", "S3_SEARCH_", "S3_TRITON", "S3_PLAN_CACHE",

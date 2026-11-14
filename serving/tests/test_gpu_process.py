@@ -145,3 +145,22 @@ def test_two_gpu_processes_are_read_only(built, single):
         assert len(versions) == 1 and next(iter(versions)).startswith("seg-")   # both hold the same index state
     finally:
         assert _stop(p) == 0
+
+
+def test_granian_fronts_answer_as_one_process(built, single):
+    """S6-21s: the same FrontApp behind granian (S3_SERVING_FRONT_SERVER=granian) sends the same bodies."""
+    pytest.importorskip("granian")
+    port = _free_port()
+    p = _start(built, port, ["--fronts", "2", "--gpu-processes", "1"], {"S3_SERVING_FRONT_SERVER": "granian"})
+    try:
+        rz = json.loads(_http("GET", f"http://127.0.0.1:{port}/readyz")[1])
+        assert rz["ready"] and rz["gpu_processes"] == 1
+        _same(single, _answers(port))
+        url = f"http://127.0.0.1:{port}/indexes/toy/_search"
+        want = _hits(_http("POST", url, REQS[0])[1])
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(16) as ex:
+            for st, body, _ in ex.map(lambda _: _http("POST", url, REQS[0]), range(100)):
+                assert st == 200 and _hits(body) == want
+    finally:
+        assert _stop(p) == 0
