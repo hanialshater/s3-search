@@ -1,0 +1,5 @@
+<!-- V1: the query timeout above the load client's 10 s; V2: up to 2,000 hits (Vespa's default cap is 400) -->
+<query-profile id="default">
+  <field name="maxHits">2000</field>
+  <field name="timeout">20s</field>
+</query-profile>

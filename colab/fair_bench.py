@@ -144,6 +144,10 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                             errors += 1
                             why[str(r.status)] = why.get(str(r.status), 0) + 1
                             return
+                        if not full_coverage(raw):
+                            errors += 1
+                            why["coverage"] = why.get("coverage", 0) + 1
+                            return
                     lat.append((time.time() - due) * 1e3)
                     if i % SAMPLE_EVERY == 0 or (i % len(bodies)) in SAMPLE_BODIES:   # sampled: hits, digest, bytes, who
                         n_hits, digest = result_digest(raw)
@@ -173,12 +177,34 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
     asyncio.run(run())
 
 
+RESPONSE = {"kind": "hits"}                                 # "hits" (engine, OpenSearch, zvec) or "vespa"
+
+
+def hits_of(d: dict) -> list:
+    if RESPONSE["kind"] == "vespa":
+        return d.get("root", {}).get("children", []) or []
+    return d["hits"]["hits"]
+
+
+def _comparable(d: dict) -> dict:
+    """A response without what differs run to run: took_ms, and Vespa's timing and coverage block."""
+    d.pop("took_ms", None)
+    d.pop("timing", None)
+    if RESPONSE["kind"] == "vespa" and isinstance(d.get("root"), dict):
+        d["root"].pop("coverage", None)
+    return d
+
+
+def full_coverage(raw: bytes) -> bool:
+    """V1: a Vespa response counts only with full coverage ("full": true in the root's coverage block)."""
+    return RESPONSE["kind"] != "vespa" or b'"full":true' in raw[:800]
+
+
 def result_digest(raw: bytes) -> tuple[int, str]:
     """A response's hit count and a digest of everything but took_ms (for the unloaded comparison)."""
     import hashlib
-    d = json.loads(raw)
-    d.pop("took_ms", None)
-    return len(d["hits"]["hits"]), hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
+    d = _comparable(json.loads(raw))
+    return len(hits_of(d)), hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
 
 SAMPLES = "/content/fair-samples"
@@ -222,11 +248,12 @@ def _post(url, body, route=None):
 
 def _diff(a: bytes, b: bytes) -> dict:
     """Where two responses first differ: totals, page lengths, the first differing hit and both sides of it."""
-    x, y = json.loads(a), json.loads(b)
-    hx, hy = x["hits"]["hits"], y["hits"]["hits"]
+    x, y = _comparable(json.loads(a)), _comparable(json.loads(b))
+    hx, hy = hits_of(x), hits_of(y)
     first = next((k for k, (p, q) in enumerate(zip(hx, hy)) if p != q), None)
     other = sorted(set(x) ^ set(y)) + [k for k in set(x) & set(y) if k not in ("hits", "took_ms") and x[k] != y[k]]
-    return {"total": [x["hits"].get("total"), y["hits"].get("total")], "len": [len(hx), len(hy)],
+    tot = (lambda z: z["root"]["fields"].get("totalCount")) if RESPONSE["kind"] == "vespa" else (lambda z: z["hits"].get("total"))
+    return {"total": [tot(x), tot(y)], "len": [len(hx), len(hy)],
             "first_differing_hit": first, "hits_differing": sum(p != q for p, q in zip(hx, hy)),
             "at_first": [hx[first], hy[first]] if first is not None else None, "other_keys_differing": other}
 
@@ -371,7 +398,32 @@ def stop_mps():
     subprocess.run(["bash", "-c", "echo quit | nvidia-cuda-mps-control"], check=False)
 
 
+def vespa_target(ds, server_cpus):
+    """Vespa 8.781.11 under chroot (colab/competitors/vespa_run.py), pinned by digest, on the server CPUs.
+    --vespa-mode=any (exact, the headline) or weakAnd (targetHits = depth, declared approximate);
+    --vespa-profile=title (BM25 k1 1.2, b 0.75 on product_title: the parity run) or bm25w (the weighted sum).
+    Development only until the steward approves."""
+    from colab.competitors import vespa_run as V
+    RESPONSE["kind"] = "vespa"
+    info = V.setup()
+    t0 = time.time()
+    proc = V.start(server_cpus, LOG)
+    info.update(V.deploy())
+    info.update(V.feed(ds.catalogue))
+    build_s = time.time() - t0
+    info.update(V.check_proton())
+    COMPETITOR["vespa"] = info
+    say(f"vespa: {info}")
+    mode, profile = opt("vespa-mode", "any"), opt("vespa-profile", "title")
+
+    def body(q):
+        return V.request(q, K, mode, profile)
+
+    return proc, f"http://localhost:{V.PORT}/search/", body, build_s
+
+
 ZVEC_VERSION = "0.8.1"
+ZVEC_SHA256 = "87909dddd7d86c82cb49d4c03f1851df94473b32fa31f5b919179ab1ca45bc50"   # the steward's record (C1)
 COMPETITOR: dict = {}                                       # what each competitor ran: version, wheel or image digest
 
 
@@ -388,6 +440,8 @@ def zvec_target(ds, server_cpus):
     wheel = sorted(glob.glob(f"{wheel_dir}/zvec-{ZVEC_VERSION}-*.whl"))[0]
     COMPETITOR["zvec"] = {"version": ZVEC_VERSION, "wheel": os.path.basename(wheel),
                           "wheel_sha256": hashlib.sha256(open(wheel, "rb").read()).hexdigest()}
+    if COMPETITOR["zvec"]["wheel_sha256"] != ZVEC_SHA256:
+        raise RuntimeError(f"zvec wheel sha256 {COMPETITOR['zvec']['wheel_sha256']} is not the approved {ZVEC_SHA256}")
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", wheel], check=True)
     say(f"zvec: installed {COMPETITOR['zvec']}")
     from colab.competitors.zvec_build import build
@@ -594,7 +648,8 @@ def main():
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
            "columns": COLUMNS, "mps": MPS, "fronts": FRONTS, "gpu_processes": GPUS, "log": LOG, "engines": {}}
     for name in ENGINES:
-        target = {"engine": engine_target, "opensearch": opensearch_target, "zvec": zvec_target}[name]
+        target = {"engine": engine_target, "opensearch": opensearch_target, "zvec": zvec_target,
+                  "vespa": vespa_target}[name]
         try:
             proc, url, make_body, build_s = target(ds, server_cpus)
         except Exception as e:                                   # recorded; the other engine still runs
@@ -635,7 +690,8 @@ def main():
             out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check,
                                     "competitor": COMPETITOR.get(name), "config": {k: opt(k, None) for k in (
                                         "zvec-fields", "zvec-fusion", "zvec-workers", "zvec-query-threads")}
-                                    if name == "zvec" else None}
+                                    if name == "zvec" else {k: opt(k, None) for k in ("vespa-mode", "vespa-profile")}
+                                    if name == "vespa" else None}
         finally:
             stop(proc)
             time.sleep(5)
