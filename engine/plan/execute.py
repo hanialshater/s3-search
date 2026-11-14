@@ -704,8 +704,9 @@ class Executor:
             t = Timer(b, sync=self.SYNC_PLAN_TIMES or len(plans) == 1)
             ctx = {"explain": {} if plan.explain else None}
             self.knn_outcome = {}
+            stacked = None
             if k in pre:                                  # S6-17: computed with the batch's other lexical roots
-                score, match, ctx["lexical"] = pre[k]
+                score, match, ctx["lexical"], stacked = pre[k]
             else:
                 score, match = self.eval(plan.root, ctx)
                 match = match & st.live
@@ -719,7 +720,8 @@ class Executor:
             if plan.rescore is not None and not batched:  # explain reads the rescore's host copy: per plan
                 score, tier = self._rescore(plan, score, match, ctx, t)
             states.append({"plan": plan, "t": t, "ctx": ctx, "score": score, "match": match, "hits_mask": hits_mask,
-                           "tier": tier, "knn": _knn_methods(b, plan, self.knn_outcome), "rescore_later": batched})
+                           "tier": tier, "knn": _knn_methods(b, plan, self.knn_outcome), "rescore_later": batched,
+                           "stacked": stacked if plan.post_filter is None and plan.rescore is None else None})
         self._batched_rescore(states)
         totals, pages = self._batched_totals_and_pages(states)
         aggs = self._batched_terms(states)
@@ -888,8 +890,9 @@ class Executor:
             raw = b.where(M, S * boost, 0.0)
             match = M & st.live.reshape(1, -1)
             score = b.where(match, raw, 0.0)
+            stack = (score, match)                        # S6-19: the page step may reuse the stacked rows
             for g, (k, n) in enumerate(zip(ch, nodes)):
-                out[k] = (score[g], match[g], (n, self.lex_cache[n][0], M[g]))
+                out[k] = (score[g], match[g], (n, self.lex_cache[n][0], M[g]), (stack, g))
         return out
 
     def _batched_rescore(self, states):
@@ -998,8 +1001,14 @@ class Executor:
             for ch in self._chunks([i for i, sx in enumerate(states) if self.BATCHED and want(sx)]):
                 t0 = time.perf_counter()
                 G = len(ch)
-                V = b.stack([states[i]["hits_mask"] for i in ch], 0)
-                S = b.stack([states[i]["score"] for i in ch], 0)
+                st0 = states[ch[0]].get("stacked")
+                if (st0 is not None and st0[0][0].shape[0] == G
+                        and all(states[i].get("stacked") is not None and states[i]["stacked"][0] is st0[0]
+                                and states[i]["stacked"][1] == g for g, i in enumerate(ch))):
+                    S, V = st0[0]                         # S6-19: phase A's rows, in this chunk's order: no restack
+                else:
+                    V = b.stack([states[i]["hits_mask"] for i in ch], 0)
+                    S = b.stack([states[i]["score"] for i in ch], 0)
                 k = max(states[i]["plan"].from_ + states[i]["plan"].size for i in ch)
                 rows = b.arange(G).reshape(G, 1)
                 if not tiered:

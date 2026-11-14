@@ -74,6 +74,9 @@ def deep_request(q):
 # --deep=1: also measure deep_request in-process, asking for the hits as serving does (hits="columns", ids="bytes"):
 # the engine's own ceiling for the founder's workload (1,000 QPS at depth 2,000), without HTTP or pickling.
 DEEP = any(a == "--deep=1" for a in sys.argv[1:])
+# --triton=1 (S6-18): with --deep=1, measure the depth-2,000 request again with the Triton BM25F sum (S3_TRITON_BM25=1),
+# in the same process, and profile it.
+TRITON = any(a == "--triton=1" for a in sys.argv[1:])
 
 
 def measure(index, make, texts, label, kw=None):
@@ -216,13 +219,32 @@ def main():
                 index, deep_request, texts, "deep/blocking" if not was else "deep/spinning",
                 {"hits": "columns", "ids": "bytes"})
             b.blocking_sync = was
+        if TRITON:
+            os.environ["S3_TRITON_BM25"] = "1"
+            result["deep_triton"] = measure(index, deep_request, texts, "deep/triton", {"hits": "columns", "ids": "bytes"})
+            # the same responses, kernel on and off: 4 batches of 64, field by field (took_ms aside)
+            from engine.api import expand_hits
+            differ = 0
+            for i in range(0, 256, 64):
+                reqs = [deep_request(t) for t in texts[i:i + 64]]
+                os.environ["S3_TRITON_BM25"] = "1"
+                on = [expand_hits(r) for r in index.search_batch(reqs, hits="columns", ids="bytes")]
+                os.environ["S3_TRITON_BM25"] = "0"
+                off = [expand_hits(r) for r in index.search_batch(reqs, hits="columns", ids="bytes")]
+                differ += sum({k: v for k, v in x.items() if k != "took_ms"} != {k: v for k, v in y.items() if k != "took_ms"}
+                              for x, y in zip(on, off))
+            result["deep_triton_responses_differ"] = {"of": 256, "differ": differ}
+            say(f"deep/triton: {differ} of 256 responses differ from the torch sum's")
+            os.environ["S3_TRITON_BM25"] = "0"
     if TORCH_PROFILE:
         result["torch_profile"] = {}
-        kinds = [("lexical", lexical_request), ("pipeline", pipeline_request)] + ([("deep", deep_request)] if DEEP else [])
+        kinds = [("lexical", lexical_request), ("pipeline", pipeline_request)] + ([("deep", deep_request)] if DEEP else []) \
+            + ([("deep_triton", deep_request)] if DEEP and TRITON else [])
         for label, make in kinds:
+            os.environ["S3_TRITON_BM25"] = "1" if label == "deep_triton" else "0"
             try:
                 result["torch_profile"][label] = torch_profile(
-                    index, make, texts, label, kw={"hits": "columns", "ids": "bytes"} if label == "deep" else None)
+                    index, make, texts, label, kw={"hits": "columns", "ids": "bytes"} if label.startswith("deep") else None)
             except Exception as e:                   # the profile is extra: never lose the run's numbers to it
                 result["torch_profile"][label] = {"error": repr(e)[:500]}
                 say(f"{label} torch profile failed: {e!r}")

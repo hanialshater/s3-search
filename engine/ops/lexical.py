@@ -127,6 +127,14 @@ def bm25f(b, st, terms, w, bb, k1: float, idf):
         norm = b.where(norm > 1e-6, norm, 1e-6)
         ptf = sum_lr(w * tf / norm, 1)
         imp = idf[t_rep] * ptf * (k1 + 1.0) / (k1 + ptf)
+        rows_sum = getattr(b, "segment_sum_rows", None)  # S6-18: the Triton segmented sum, when the backend has it
+        if rows_sum is not None and getattr(st, "identity", False):
+            res = rows_sum(docs, imp, ptf > 0, [lens[i] for i in g], [owners[i] for i in g], Q, N)
+            if res is not None:
+                s_g, n_g = res
+                scores = scores + s_g
+                nmatch = nmatch + n_g
+                continue
         keys = q_of * N + docs
         scores = scores + b.segment_sum(keys, imp, Q * N)
         hit = ptf > 0
