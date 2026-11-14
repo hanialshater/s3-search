@@ -33,5 +33,9 @@ def build(catalogue, path: str, fields=TEXT_FIELDS, id_field: str = "product_id"
     out = {"n_docs": len(ids), "insert_s": round(t_insert, 1), "build_s": round(time.time() - t0, 1),
            "fields": list(fields), "tokenizer": "standard", "filters": ["lowercase", "stemmer"],
            "zvec": getattr(zvec, "__version__", None)}
+    try:                                                        # segments: BM25 statistics are kept per segment
+        out["stats"] = str(col.stats)[:2000]
+    except Exception as e:  # noqa: BLE001
+        out["stats"] = f"unavailable: {e}"
     col.close() if hasattr(col, "close") else None
     return out
