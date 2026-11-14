@@ -256,24 +256,62 @@ def _post(url, body, route=None):
         return r.read(), r.headers.get("X-S3-Gpu-Process"), r.headers.get("X-S3-Index-Version")
 
 
-_TOOK = None
+def _json_value_end(raw: bytes, i: int) -> int:
+    """The end offset of the JSON value starting at raw[i] (any type: object, array, string, number, literal)."""
+    c = raw[i:i + 1]
+    if c == b'"':
+        j = i + 1
+        while raw[j:j + 1] != b'"':
+            j += 2 if raw[j:j + 1] == b"\\" else 1
+        return j + 1
+    if c in (b"{", b"["):
+        depth, j = 0, i
+        while True:
+            ch = raw[j:j + 1]
+            if ch == b'"':
+                j = _json_value_end(raw, j)
+                continue
+            if ch in (b"{", b"["):
+                depth += 1
+            elif ch in (b"}", b"]"):
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+    j = i
+    while j < len(raw) and raw[j:j + 1] not in (b",", b"}", b"]", b" ", b"\n", b"\r", b"\t"):
+        j += 1
+    return j
+
+
+def blank_took_ms(raw: bytes) -> tuple[bytes, int]:
+    """Every top-level-or-nested ``"took_ms": <value>`` becomes ``"took_ms": 0``, whatever the value's JSON type (the
+    steward's ask after plat-m18, where it was an object); returns the bytes and how many were blanked."""
+    out, k, pos, key = [], 0, 0, b'"took_ms":'
+    while True:
+        i = raw.find(key, pos)
+        if i < 0:
+            break
+        v = i + len(key)
+        while raw[v:v + 1] in (b" ", b"\n", b"\r", b"\t"):
+            v += 1
+        out.append(raw[pos:v] + b"0")
+        pos, k = _json_value_end(raw, v), k + 1
+    out.append(raw[pos:])
+    return b"".join(out), k
 
 
 def ab_dump(url, bodies, path, n) -> dict:
     """--ab-dump=FILE (S6-22s): the first n request bodies, one at a time and unloaded, each response's raw bytes
-    with only the took_ms value (a number, or the object of sub-timings) blanked, as length-prefixed records; colab/front_ab.py compares two such files byte
-    for byte (the stdlib front's and the native front's)."""
-    global _TOOK
+    with only the took_ms value blanked (any JSON type: blank_took_ms), as length-prefixed records; colab/front_ab.py
+    compares two such files byte for byte (the stdlib front's and the native front's) and fails if nothing was blanked."""
     import hashlib
-    import re
     import struct
-    if _TOOK is None:
-        _TOOK = re.compile(rb'("took_ms":\s*)(?:\{[^{}]*\}|-?[0-9][0-9.eE+-]*)')   # a number, or (plat-m18) an object
     digest, blanked = hashlib.sha256(), 0
     with open(path, "wb") as f:
         for b in bodies[:n]:
             raw, _, _ = _post(url, b)
-            raw, k = _TOOK.subn(rb"\g<1>0", raw, count=1)
+            raw, k = blank_took_ms(raw)
             blanked += k
             f.write(struct.pack("<I", len(raw)) + raw)
             digest.update(struct.pack("<I", len(raw)) + raw)

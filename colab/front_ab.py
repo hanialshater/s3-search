@@ -3,11 +3,16 @@
     python colab/front_ab.py A.bin B.bin [OUT.json]
 
 Each file holds the same request bodies' responses, in order, as length-prefixed records with only the took_ms value
-blanked. Prints and writes a JSON summary: records in each, how many are byte-identical, and the first differences
-(index, lengths, the first differing byte offset and 80 bytes around it on each side). Development only."""
+blanked. Prints and writes a JSON summary: records in each, how many are byte-identical, how many records on each
+side carry the blanked took_ms, and the first differences (index, lengths, the first differing byte offset and 80
+bytes around it on each side). Fails (exit 1) on any difference, on unequal or empty files, and, the steward's ask
+after plat-m18, when a record carries no blanked took_ms (the blanking did not happen). Development only."""
 import json
+import re
 import struct
 import sys
+
+BLANKED = re.compile(rb'"took_ms":\s*0[,}\]]')        # what fair_bench.blank_took_ms leaves
 
 
 def records(path):
@@ -32,7 +37,9 @@ def compare(a, b, keep=10):
                           "a": x[max(0, k - 40):k + 40].decode("utf-8", "replace"),
                           "b": y[max(0, k - 40):k + 40].decode("utf-8", "replace")})
     return {"a": a, "b": b, "records_a": len(ra), "records_b": len(rb), "compared": min(len(ra), len(rb)),
-            "identical": same, "differ": min(len(ra), len(rb)) - same, "first_differences": diffs}
+            "identical": same, "differ": min(len(ra), len(rb)) - same,
+            "blanked_a": sum(1 for x in ra if BLANKED.search(x)), "blanked_b": sum(1 for y in rb if BLANKED.search(y)),
+            "first_differences": diffs}
 
 
 if __name__ == "__main__":
@@ -40,4 +47,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 3:
         json.dump(r, open(sys.argv[3], "w"), indent=1)
     print(json.dumps(r, indent=1))
-    sys.exit(0 if r["differ"] == 0 and r["records_a"] == r["records_b"] > 0 else 1)
+    ok = (r["differ"] == 0 and r["records_a"] == r["records_b"] > 0
+          and r["blanked_a"] == r["records_a"] and r["blanked_b"] == r["records_b"])
+    sys.exit(0 if ok else 1)
