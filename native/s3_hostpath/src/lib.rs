@@ -537,7 +537,7 @@ impl HostIndex {
 }
 
 #[pymodule]
-fn s3_hostpath(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HostIndex>()?;
     Ok(())
 }

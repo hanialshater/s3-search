@@ -8,7 +8,7 @@ import pytest
 from engine import api, hostpath
 from referee import loader
 
-s3_hostpath = pytest.importorskip("s3_hostpath")
+from engine.backend import available_devices
 
 FIELDS = ["product_title^1.0", "product_brand^0.126", "product_color^0.14", "product_bullet_point^0.06",
           "product_description^0.036"]
@@ -45,6 +45,7 @@ def corpus(texts):
 
 @pytest.mark.parametrize("name", ["toy", "esci-sample"])
 def test_rust_prepare_equals_the_python_planner(name):
+    pytest.importorskip("s3_hostpath")
     try:
         ds = loader.load_dataset(name)
     except Exception as e:  # noqa: BLE001
@@ -67,3 +68,33 @@ def test_rust_prepare_equals_the_python_planner(name):
     assert a["ints"] == b["ints"]
     assert a["floats"] == b["floats"]
     assert a["chunks"] == b["chunks"]
+
+
+def _strip(r):
+    return {k: v for k, v in api.expand_hits(r).items() if k != "took_ms"}
+
+
+@pytest.mark.parametrize("device", available_devices())
+def test_search_prepared_gives_search_batchs_responses(device):
+    """The engine side: a prepared batch's responses equal search_batch's for the same requests, on every device
+    (the fused kernel on cuda, the reference elsewhere). The batch is prepared by the oracle, and also by Rust when the
+    extension is built."""
+    ds = loader.load_dataset("toy")
+    ix = api.build_index(ds.catalogue, ds.mapping, device=device)
+    st = ix._st
+    texts = list(dict.fromkeys(list(ds.fit["query"]) + list(ds.test_queries["query"])))
+    payloads = corpus([str(t) for t in texts])[:120]
+    preps = [hostpath.prepare_reference(st, payloads, hostpath._words(st))]
+    try:
+        preps.append(hostpath.host_index(st).prepare(payloads))
+    except ImportError:
+        pass
+    for prep in preps:
+        got = ix.search_prepared(prep, hits="columns", ids="bytes")
+        assert got and set(got).isdisjoint(prep["fallback"])
+        positions = sorted(got)
+        want = ix.search_batch([json.loads(payloads[p]) for p in positions], hits="columns", ids="bytes")
+        assert [_strip(got[p]) for p in positions] == [_strip(r) for r in want]
+        dicts = ix.search_prepared(prep, hits="dicts", ids="str")
+        want_d = ix.search_batch([json.loads(payloads[p]) for p in positions])
+        assert [_strip(dicts[p]) for p in positions] == [_strip(r) for r in want_d]

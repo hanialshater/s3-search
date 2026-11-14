@@ -194,8 +194,21 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     dev_i = torch.from_numpy(host_i).to(dev)
     dev_f = torch.from_numpy(host_f).to(dev)
     at = np.cumsum([0] + lens)
-    rs, rl, qlo, qhi, msm_d, off_d, nv_d, rt = (dev_i[at[k]:at[k + 1]] for k in range(len(ints)))
-    w_d, bb_d, omb_d, boost_d = dev_f[:F], dev_f[F:2 * F], dev_f[2 * F:3 * F], dev_f[3 * F:]
+    vi = [dev_i[at[k]:at[k + 1]] for k in range(len(ints))]
+    vf = [dev_f[:F], dev_f[F:2 * F], dev_f[2 * F:3 * F], dev_f[3 * F:]]
+    return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
+
+
+def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs):
+    """The kernel on device inputs: ``vi`` the int64 views (row_start, row_len, q_lo, q_hi, msm, facet offsets, facet
+    sizes, row_term), ``vf`` the float32 views (w, b, 1 - b, boost)."""
+    import torch
+    dev = b.device
+    N = part.N
+    F = int(part.tf.shape[1])
+    rs, rl, qlo, qhi, msm_d, off_d, nv_d, rt = vi
+    w_d, bb_d, omb_d, boost_d = vf
+    nf = len(facet_codes)
     row_idf = (idf[rt] if R else torch.zeros(1, dtype=torch.float32, device=dev)).contiguous()
     acc = torch.empty(Q * N, dtype=torch.float64, device=dev)
     cnt = torch.empty(Q * N, dtype=torch.int32, device=dev)
@@ -212,6 +225,32 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
                         c1, c2, F=F, NFACET=nf, TILE=TILE, BLOCK=BLOCK, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
     return out.view(Q, N), total.to(torch.int64), facets
+
+
+def run_prepared(b, part, k1, idf, chunk, host_i, host_f, dev_i, dev_f, live, facet_codes):
+    """One chunk of ``s3_hostpath.HostIndex.prepare``'s output. ``host_i`` and ``host_f`` are its int64 and float32
+    blocks as numpy arrays; ``dev_i`` and ``dev_f`` are the same blocks on the device, or None off the kernel path.
+    Gives ``run``'s outputs: the kernel reads the device views directly, and the reference rebuilds the terms from
+    the host blocks."""
+    F = int(part.tf.shape[1])
+    at, ln, fa = chunk["int_at"], chunk["int_len"], chunk["float_at"]
+    Q = len(chunk["positions"])
+    hi = [host_i[a:a + n] for a, n in zip(at, ln)]
+    qlo, qhi = hi[2], hi[3]
+    R = int(qhi[-1]) if Q else 0
+    sizes = [int(x) for x in hi[6]] if chunk["facets"] else []
+    offs = [int(x) for x in hi[5]] if chunk["facets"] else []
+    if mode(b) == "kernel":
+        vi = [dev_i[a:a + n] for a, n in zip(at, ln)]
+        vf = [dev_f[fa:fa + F], dev_f[fa + F:fa + 2 * F], dev_f[fa + 2 * F:fa + 3 * F], dev_f[fa + 3 * F:fa + 3 * F + Q]]
+        return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
+    rt = hi[7]
+    terms = [[int(t) for t in rt[qlo[g]:qhi[g]]] for g in range(Q)]
+    w = host_f[fa:fa + F]
+    bb = host_f[fa + F:fa + 2 * F]
+    boost = host_f[fa + 3 * F:fa + 3 * F + Q]
+    return reference(b, part, terms, w, bb, k1, idf, [int(m) for m in hi[4]], [float(x) for x in boost], live,
+                     facet_codes, sizes)
 
 
 def reference(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes=(), facet_sizes=()):

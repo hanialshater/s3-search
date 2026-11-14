@@ -7,7 +7,7 @@ license = "Proprietary"
 publish = false
 
 [lib]
-name = "s3_hostpath"
+name = "_native"
 crate-type = ["cdylib"]
 
 # Licences of the dependencies (checked 2026-11-14): pyo3 MIT OR Apache-2.0; serde_json MIT OR Apache-2.0.

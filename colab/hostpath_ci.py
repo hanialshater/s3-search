@@ -65,6 +65,7 @@ def main():
     lock = os.path.join(crate, "Cargo.lock")
     shutil.copy(lock, "/content/hostpath-Cargo.lock")
     say(f"wheel {os.path.basename(whl)} sha256 {sha(whl)}; Cargo.lock sha256 {sha(lock)}")
+    print("----- BEGIN Cargo.lock -----\n" + open(lock).read() + "----- END Cargo.lock -----", flush=True)
     sh([sys.executable, "-c", "from referee import loader; loader.fetch()"])     # esci-sample for the oracle test
     ok = True
     for name, cmd in [
