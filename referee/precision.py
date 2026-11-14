@@ -174,6 +174,7 @@ def main(argv=None) -> int:
     out["baseline"] = {"ndcg@10": mb["ndcg@10"], "exact_recall@1000": mb["exact_recall@1000"],
                        f"exact_recall@{a.k}": mb[f"exact_recall@{a.k}"], "equals_record": mb["ndcg@10"] == RECORD}
     say(f"baseline: nDCG@10 {mb['ndcg@10']!r} (record {RECORD!r}); deterministic {out['baseline_deterministic']}")
+    Path(a.out).write_text(json.dumps(out, indent=1, default=str) + "\n")     # written after every stage: a time limit keeps what ran
     ok_all = True
     for name, env in variants:
         v1 = run_all(index, reqs, env)
@@ -193,6 +194,7 @@ def main(argv=None) -> int:
         f = res["figures"]
         say(f"{name} {env}: nDCG@10 {f['ndcg10_variant']:.10f} (diff {f['ndcg10_diff']:+.6f}), top-10 list changed "
             f"{f['top10_list_changed_share']:.4f}, overlap {f['overlap_mean']:.5f}, gates 1-6 {res['passed_gates_1_to_6']}, contract exit {res['contract_exit_code']}")
+        Path(a.out).write_text(json.dumps(out, indent=1, default=str) + "\n")
     Path(a.out).write_text(json.dumps(out, indent=1, default=str) + "\n")
     return 0 if ok_all else 1
 
