@@ -208,6 +208,7 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
         Ok(b) => b.to_bytes(),
         Err(_) => return Ok(json(400, "{\"error\":{\"type\":\"invalid_request\",\"path\":\"\",\"reason\":\"bad body\"}}")),
     };
+    let t_read = t0.elapsed();                                  // S6-22s timers: the request body read
     let rid = format!("{:016x}", front.ids.fetch_add(1, Ordering::Relaxed) ^ 0x9e3779b97f4a7c15);
     if bare == "/healthz" && method == "GET" {
         return Ok(json(200, "{\"status\":\"ok\"}"));
@@ -224,14 +225,17 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
     } else {
         Front::call_frame(id, method.as_bytes(), path.as_bytes(), &body)
     };
+    let t_sent = t0.elapsed();
     let reply = match front.send(&gpu, frame, id).await {
         Some(r) => r,
         None => return Ok(json(503, "{\"error\":{\"type\":\"not_ready\",\"path\":\"\",\"reason\":\"the GPU process did not answer\"}}")),
     };
+    let t_reply = t0.elapsed();                                 // the round trip to the GPU process ends
     let (status, out, meta) = match render(&reply) {
         Some(x) => x,
         None => return Ok(json(500, "{\"error\":{\"type\":\"internal_error\",\"path\":\"\",\"reason\":\"bad reply frame\"}}")),
     };
+    let t_render = t0.elapsed();
     let ctype = meta.get("type").and_then(|v| v.as_str()).unwrap_or("application/json").to_string();
     let mut rb = Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("Content-Type", ctype).header("X-Request-Id", rid).header("X-S3-Worker", front.worker.as_str());
@@ -244,6 +248,17 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
             .header("X-S3-Batch-Size", meta.get("batch").map(|v| v.to_string()).unwrap_or_else(|| "1".into()));
         if let Some(b) = meta.get("batch_ms").and_then(|v| v.as_f64()) {   // S6-22s: the GPU process's batch time
             rb = rb.header("X-S3-Batch-Ms", format!("{:.3}", b));
+        }
+        // S6-22s timers: where the front's share goes. Read: arrival to body read; Build: frame built and queued;
+        // Rtt: frame sent to reply received; Render: the hits written as JSON. From the GPU process: Parse (its
+        // reader's parse of the frame) and Post (a reply's wait from its batch's end to the writer's encode).
+        let ms = |d: std::time::Duration| format!("{:.3}", d.as_secs_f64() * 1000.0);
+        rb = rb.header("X-S3-Front-Read-Ms", ms(t_read)).header("X-S3-Front-Build-Ms", ms(t_sent - t_read))
+            .header("X-S3-Front-Rtt-Ms", ms(t_reply - t_sent)).header("X-S3-Front-Render-Ms", ms(t_render - t_reply));
+        for (k, h) in [("parse_ms", "X-S3-Gpu-Parse-Ms"), ("post_ms", "X-S3-Gpu-Post-Ms")] {
+            if let Some(v) = meta.get(k).and_then(|v| v.as_f64()) {
+                rb = rb.header(h, format!("{:.3}", v));
+            }
         }
     }
     Ok(rb.body(Full::new(Bytes::from(out))).unwrap())

@@ -280,6 +280,11 @@ def test_timing_headers_include_the_batch_time(built, front):
         h = {k.lower(): v for k, v in h.items()}               # header names are case-insensitive (hyper: lower)
         q, s, b = (float(h[k]) for k in ("x-s3-queue-ms", "x-s3-serve-ms", "x-s3-batch-ms"))
         assert q >= 0 and b > 0 and s >= b, h
+        if front == "native":                                   # S6-22s timers: the front's share in parts
+            rd, bd, rtt, rn, parse, post = (float(h[k]) for k in (
+                "x-s3-front-read-ms", "x-s3-front-build-ms", "x-s3-front-rtt-ms", "x-s3-front-render-ms",
+                "x-s3-gpu-parse-ms", "x-s3-gpu-post-ms"))
+            assert min(rd, bd, rn, parse, post) >= 0 and rtt >= b and s >= rd + bd + rtt + rn - 0.01, h
     finally:
         assert _stop(p) == 0
 

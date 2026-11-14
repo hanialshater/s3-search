@@ -77,6 +77,11 @@ def reply_frame(msg) -> bytes:
                 "batch": rest[0] if rest else 1}
         if len(rest) > 1 and rest[1] is not None:              # S6-22s: X-S3-Batch-Ms on the native front
             meta["batch_ms"] = round(float(rest[1]), 3)
+        if len(rest) > 2 and rest[2] is not None:              # the reply's wait for the writer, batch end to here
+            import time as _t
+            meta["post_ms"] = round((_t.perf_counter() - float(rest[2])) * 1000.0, 3)
+        if len(rest) > 3 and rest[3] is not None:              # the reader's parse of the request frame
+            meta["parse_ms"] = round(float(rest[3]), 3)
         return binproto.columnar(id_, resp, meta) or binproto.whole(id_, 200, encode(resp), meta)
     if msg[0] == "search":                                  # ("search", id, "error", status, body)
         return binproto.whole(msg[1], msg[3], json.dumps(msg[4], separators=(",", ":")).encode())

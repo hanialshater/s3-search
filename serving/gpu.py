@@ -208,11 +208,12 @@ def binproto_search_body(raw):
 
 
 class _Item:
-    __slots__ = ("conn", "id", "name", "request", "t", "raw", "prep")
+    __slots__ = ("conn", "id", "name", "request", "t", "raw", "prep", "parse_ms")
 
     def __init__(self, conn, id_, name, request, raw=None):
         self.conn, self.id, self.name, self.request, self.raw = conn, id_, name, request, raw
         self.prep = None                                        # (Prepared, position) when s3_hostpath planned it
+        self.parse_ms = None                                    # the reader's parse of the frame (S6-22s timers)
         self.t = time.perf_counter()
 
 
@@ -316,12 +317,16 @@ class GpuServer:
                     _account("reader")
                     self._publish_load()
                     continue
+                tp = time.perf_counter()
                 msg = binproto.parse_request(bytes(payload))
+                parse_ms = (time.perf_counter() - tp) * 1000.0
                 if msg[0] == "search" and isinstance(msg[3], Exception):   # not JSON: 400, as the Python front
                     status, body = classify(msg[3])
                     conn.put(("search", msg[1], "error", status, body))
                 elif msg[0] == "search":
-                    self.q.put(_Item(conn, msg[1], msg[2], msg[3]))
+                    item = _Item(conn, msg[1], msg[2], msg[3])
+                    item.parse_ms = parse_ms
+                    self.q.put(item)
                     _account("reader")
                     self._publish_load()
                 else:
@@ -563,7 +568,9 @@ class GpuServer:
                 return self._fail([it], exc)
         mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
         msg = ("search", it.id, "ok", resp, version, wait_ms, size)
-        self._reply(it, msg if batch_ms is None else msg + (batch_ms,))   # [7]: X-S3-Batch-Ms (S6-22s)
+        # [7] batch_ms (X-S3-Batch-Ms), [8] the answer's perf_counter (the writer's wait from it: post_ms), [9] the
+        # reader's parse_ms: the front's share of a request split into its parts (S6-22s timers)
+        self._reply(it, msg + (batch_ms, time.perf_counter(), it.parse_ms))
 
     # -- what the process is doing, every 5 s in its log (and gauges): batches, queue, device memory
     def _stats(self, every: float = 5.0) -> None:
