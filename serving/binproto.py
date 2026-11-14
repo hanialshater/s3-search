@@ -73,6 +73,8 @@ def whole(id_: int, status: int, body: bytes, meta: dict | None = None) -> bytes
 
 
 def _plain_ids(ids) -> bool:
+    """NUL (numpy's padding) and printable ASCII other than " and \\ only. The numpy form stays: a bytes.translate
+    pass measured slower on a 2,000-hit reply (S6-plat-100: 36 against 30 us)."""
     if not (isinstance(ids, np.ndarray) and ids.dtype.kind == "S"):
         return False
     b = np.frombuffer(ids.tobytes(), np.uint8)
@@ -80,8 +82,16 @@ def _plain_ids(ids) -> bool:
 
 
 def _safe(a) -> bool:
-    m = np.abs(a)
-    return bool(np.isfinite(a).all() and ((m == 0) | ((m >= 1e-4) & (m < 1e16))).all())
+    """Every value finite and either 0 or in [1e-4, 1e16), where repr writes it positionally (9.5 against 16 us for
+    the earlier five-pass form on 2,000 values, S6-plat-100's breakdown). A NaN makes the max NaN
+    and an infinity makes it inf, so ``max < 1e16`` is the finiteness check too; then only the values under 1e-4 (in
+    practice none) must be 0."""
+    m = np.abs(np.asarray(a, np.float64))
+    if m.size == 0:
+        return True
+    if not m.max() < 1e16:
+        return False
+    return not m[m < 1e-4].any()
 
 
 def columnar(id_: int, resp: dict, meta: dict) -> bytes | None:
