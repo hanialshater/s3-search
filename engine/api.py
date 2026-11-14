@@ -262,10 +262,12 @@ class Index:
         from .plan.nodes import Lexical, Plan, TermsAgg
         if hits not in ("dicts", "columns") or (ids == "bytes" and hits != "columns"):
             raise ValueError("hits: 'dicts' or 'columns'; ids 'bytes' needs hits='columns'")
+        prep = getattr(prep, "layout", prep)
+        if "chunks" not in prep and "stub_bodies" in prep:   # serving's S3_HOSTPATH=stub-prepared: plain requests
+            return self.search_batch(list(prep["stub_bodies"]), hits=hits, ids=ids)
         st = self._st
         if len(st.parts) != 1 or not getattr(st.parts[0], "identity", False) or st.b.accumulate != "float64":
             raise ValueError("search_prepared: one segment with float64 accumulation only")
-        prep = getattr(prep, "layout", prep)
         root = Lexical((), (), 1, "global", 1.0, "query")
         plans, where = [], []
         for chunk in prep["chunks"]:
