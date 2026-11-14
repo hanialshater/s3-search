@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import functools
+import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -217,10 +219,11 @@ class Index:
             raise ValueError(f"ids: 'str', or 'bytes' with hits='columns' (S6-12), not {ids!r} with hits={hits!r}")
         st = self._st                     # one state for the whole batch, read once: no lock (S8-2c)
         plans, parse_ms, refused = [], [], {}
+        cache = _plan_cache(st)
         for i, r in enumerate(requests):
             t0 = time.perf_counter()
             try:
-                p = make_plan(r, st)
+                p = _cached_plan(cache, r, st)
                 if p.rescore is not None and p.rescore.model not in self.rankers:
                     raise InvalidRequest("rescore.s3_ranker.model", f"no ranker named {p.rescore.model!r} on this index")
             except UnsupportedQuery as e:
@@ -334,6 +337,39 @@ def _copy_for_write(seg):
     c = copy.copy(seg)
     c.manifest = dict(seg.manifest)
     return c
+
+
+PLAN_CACHE_SIZE = int(os.environ.get("S3_PLAN_CACHE", "4096"))   # S6-19: 0 turns the plan cache off
+
+
+def _plan_cache(st):
+    """This state's plan cache (S6-19). Plans read the state (field kinds, keyword dictionaries, segments' positions
+    and sources), so the cache belongs to one state: a write makes a new state (copy-on-write), whose copied attribute
+    names its old owner and is replaced here, so no plan outlives the state it was made for."""
+    if PLAN_CACHE_SIZE <= 0:
+        return None
+    c = st.__dict__.get("_plan_cache")
+    if c is None or c[0] is not st:
+        c = st._plan_cache = (st, {})
+    return c[1]
+
+
+def _cached_plan(cache, request, st):
+    """``make_plan(request, st)``, reused for a request equal to one already planned on this state. Plans are frozen
+    values, and a refused request is never cached."""
+    if cache is None or not isinstance(request, dict):
+        return make_plan(request, st)
+    try:
+        key = json.dumps(request, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):                      # not JSON (numpy values, say): plan it every time
+        return make_plan(request, st)
+    p = cache.get(key)
+    if p is None:
+        p = make_plan(request, st)
+        if len(cache) >= PLAN_CACHE_SIZE:
+            cache.pop(next(iter(cache)))                 # the oldest entry
+        cache[key] = p
+    return p
 
 
 def _error_entry(e) -> dict:
