@@ -24,9 +24,11 @@ except Exception:  # noqa: BLE001
 
 TESTED_TRITON = "3.8"
 # (major, minor) compute capabilities whose GPU CI passed the kernel tests, with the run that showed it.
+# The H100 (9.0) is not listed: Colab refused it on this account (no entitlement), so its GPU CI never ran.
 PASSED_CAPABILITIES = {
-    (8, 0): "A100, colab/gpu_ci.py at 06634b1 (BM25F sum); the top-k and facets pending",
-    (8, 9): "L4, colab/gpu_ci.py at e098a57",
+    (8, 0): "A100-SXM4-40GB, colab/gpu_ci.py at 8f5cb64 (every kernel test run, none skipped)",
+    (8, 9): "L4, colab/gpu_ci.py at e098a57 (before the 'kernel ran' checks; the deep top-k test did not run the kernel)",
+    (12, 0): "RTX PRO 6000 Blackwell Server Edition (Colab G4), colab/gpu_ci.py at 8f5cb64 (every kernel test run)",
 }
 
 
