@@ -1,6 +1,6 @@
 """`python -m referee bench`: quality, latency, throughput and cost of one implementation on one named dataset.
 
-    python -m referee bench --dataset=toy|esci-sample|esci-us [--device=cpu] [--engine=engine|reference|opensearch|zvec]
+    python -m referee bench --dataset=toy|esci-sample|esci-us [--device=cpu] [--engine=engine|reference|opensearch|zvec|vespa]
                             [--request=template.json] [--k=100] [--batch=64] [--queries=N] [--out=results.json]
 
 - Quality: whole-catalogue nDCG@10 and Exact recall@k (referee/metrics.py) on the **fit** split. The test split is
@@ -39,7 +39,7 @@ CPU_DEVICES = ("cpu", "torch-cpu")
 
 
 def get_api(engine: str):
-    """The implementation under test: `engine` (engine.api), `reference` (the referee's), `opensearch` or `zvec`."""
+    """The implementation under test: `engine` (engine.api), `reference` (the referee's), `opensearch`, `zvec` or `vespa`."""
     if engine == "engine":
         return importlib.import_module("engine.api")
     if engine == "reference":
@@ -51,6 +51,9 @@ def get_api(engine: str):
     if engine == "zvec":
         from referee import zvec
         return zvec
+    if engine == "vespa":
+        from referee import vespa
+        return vespa
     raise ValueError(f"unknown engine {engine!r}")
 
 
@@ -169,7 +172,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee bench", description=__doc__.split("\n\n")[0])
     ap.add_argument("--dataset", default="toy", choices=loader.DATASETS)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--engine", default="engine", choices=("engine", "reference", "opensearch", "zvec"))
+    ap.add_argument("--engine", default="engine", choices=("engine", "reference", "opensearch", "zvec", "vespa"))
     ap.add_argument("--request", help="JSON request template with the string {{query}}")
     ap.add_argument("--k", type=int, default=100, help="hits per query for quality (Exact recall@k)")
     ap.add_argument("--batch", type=int, default=64)
