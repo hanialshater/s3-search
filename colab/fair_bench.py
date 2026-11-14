@@ -3,7 +3,7 @@
 
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
-        [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97]
+        [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -70,7 +70,8 @@ MPS = opt("mps", "0") == "1"
 FRONTS = int(opt("fronts", "0"))                             # S6-10s: front processes (0: not that layout)
 GPUS = int(opt("gpu-processes", "1"))
 LOG = opt("log", "/content/serving.log")
-SAMPLE_EVERY = int(opt("sample-every", "97"))               # every n-th request is kept and replayed unloaded                     # one server log per configuration
+SAMPLE_EVERY = int(opt("sample-every", "97"))               # every n-th request is kept and replayed unloaded
+SAMPLE_BODIES = {int(x) for x in opt("sample-bodies", "").split(",") if x}   # these bodies are always sampled                     # one server log per configuration
 OUT = opt("out", "/content/fair-bench.json")
 t_start = time.time()
 
@@ -144,7 +145,7 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                             why[str(r.status)] = why.get(str(r.status), 0) + 1
                             return
                     lat.append((time.time() - due) * 1e3)
-                    if i % SAMPLE_EVERY == 0:                # sampled: hits, a digest, the bytes, who answered
+                    if i % SAMPLE_EVERY == 0 or (i % len(bodies)) in SAMPLE_BODIES:   # sampled: hits, digest, bytes, who
                         n_hits, digest = result_digest(raw)
                         hits.append(n_hits)
                         samples.append([i, n_hits, digest, r.headers.get("X-S3-Gpu-Process"),
@@ -230,7 +231,7 @@ def _diff(a: bytes, b: bytes) -> dict:
             "at_first": [hx[first], hy[first]] if first is not None else None, "other_keys_differing": other}
 
 
-def compare_unloaded(url, bodies, runs, limit=2000):
+def compare_unloaded(url, bodies, runs, limit=None):
     """Replay sampled requests one at a time after the ladder and compare with what the loaded runs returned: a
     response changed by load (or emptied) shows as a mismatch; a query with no matches has 0 hits both ways."""
     seen, out = {}, {"checked": 0, "mismatch": [], "zero_hits_loaded": 0, "zero_hits_unloaded_too": 0,
@@ -243,7 +244,7 @@ def compare_unloaded(url, bodies, runs, limit=2000):
             seen.setdefault(i, []).append((r["target_qps"], n, dg, gpu, ver, bs))
             out["answered_by"][f"{gpu}@{ver}"] = out["answered_by"].get(f"{gpu}@{ver}", 0) + 1
     n_gpus = max(1, GPUS if FRONTS else 1)
-    for i in sorted(seen)[:limit]:
+    for i in sorted(seen)[:limit]:                         # every sample (the steward: not only the first 2,000)
         body = bodies[i % len(bodies)]
         raw, g0, v0 = _post(url, body)
         n0, d0 = result_digest(raw)
@@ -443,7 +444,8 @@ def engine_target(ds, server_cpus):
            "S3_SERVING_MAX_WAIT_MS": opt("max-wait-ms", "2"), "S3_SEARCH_DEVICE": "cuda",
            "S3_SERVING_WORKERS": str(WORKERS), "S3_SERVING_COLUMNS": COLUMNS,
            "S3_SERVING_FRONTS": str(FRONTS), "S3_SERVING_GPU_PROCESSES": str(GPUS),
-           "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0")}
+           "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0"),
+           "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0")}
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
