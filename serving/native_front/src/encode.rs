@@ -124,6 +124,13 @@ fn itoa_buf(v: i64) -> Vec<u8> {
 /// decimal point position decpt (x = 0.d1d2... x 10^decpt) has -4 < decpt <= 16, else d[.ddd]e+XX / e-XX (at least
 /// two exponent digits); and NaN, Infinity, -Infinity as json.dumps writes them.
 pub fn push_pyrepr(out: &mut Vec<u8>, x: f64, buf: &mut ryu::Buffer) {
+    // The common case first (plat-m26: render 0.66 against 0.30 ms on kind 1): in repr's positional range ryu's text is
+    // already Python's (kind 1's whole premise, held by tests/float_vectors.txt), so no layout work and no allocation.
+    let m = x.abs();
+    if x.is_finite() && x != 0.0 && m >= 1e-4 && m < 1e16 {
+        out.extend_from_slice(buf.format_finite(x).as_bytes());
+        return;
+    }
     if x.is_nan() {
         out.extend_from_slice(b"NaN");
         return;
@@ -145,9 +152,17 @@ pub fn push_pyrepr(out: &mut Vec<u8>, x: f64, buf: &mut ryu::Buffer) {
         Some(p) => (&mant[..p], &mant[p + 1..]),
         None => (mant, ""),
     };
-    let mut digits: Vec<u8> = Vec::with_capacity(24);
-    digits.extend_from_slice(ip.as_bytes());
-    digits.extend_from_slice(fp.as_bytes());
+    let n = ip.len() + fp.len();
+    let mut dbuf = [0u8; 64];                                  // no allocation on the slow path (ryu's text is short)
+    let heap: Vec<u8>;
+    let digits: &[u8] = if n <= dbuf.len() {
+        dbuf[..ip.len()].copy_from_slice(ip.as_bytes());
+        dbuf[ip.len()..n].copy_from_slice(fp.as_bytes());
+        &dbuf[..n]
+    } else {
+        heap = [ip.as_bytes(), fp.as_bytes()].concat();
+        &heap
+    };
     let z = digits.iter().take_while(|&&c| c == b'0').count();
     let decpt = ip.len() as i32 - z as i32 + exp;
     let mut d: &[u8] = &digits[z..];
@@ -196,6 +211,13 @@ pub fn push_pyrepr(out: &mut Vec<u8>, x: f64, buf: &mut ryu::Buffer) {
 /// escapes; every other character outside space..~ as \uXXXX (lower-case hex; a surrogate pair above U+FFFF).
 pub fn push_json_ascii(out: &mut Vec<u8>, s: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    let b = s.as_bytes();
+    if b.iter().all(|&c| (0x20..0x7f).contains(&c) && c != b'"' && c != b'\\') {
+        out.push(b'"');                                         // printable ASCII, nothing to escape: copy it
+        out.extend_from_slice(b);
+        out.push(b'"');
+        return;
+    }
     out.push(b'"');
     for ch in s.chars() {
         match ch {
