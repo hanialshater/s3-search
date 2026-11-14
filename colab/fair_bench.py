@@ -534,12 +534,13 @@ def build_native_front() -> dict:
         subprocess.run("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable",
                        shell=True, check=True)
     t0 = time.time()
-    subprocess.run([cargo, "build", "--release", "--locked"], cwd="serving/native_front", check=True)
+    subprocess.run([cargo, "build", "--release"], cwd="serving/native_front", check=True)   # no Cargo.lock in the repo yet
     binary = os.path.abspath("serving/native_front/target/release/s3-native-front")
     info = {"cargo": subprocess.run([cargo, "--version"], capture_output=True, text=True).stdout.strip(),
             "build_s": round(time.time() - t0, 1), "binary": binary,
-            "binary_sha256": hashlib.sha256(open(binary, "rb").read()).hexdigest()}
-    say(f"engine: native front built {info}")
+            "binary_sha256": hashlib.sha256(open(binary, "rb").read()).hexdigest(),
+            "cargo_lock": open("serving/native_front/Cargo.lock").read() if os.path.exists("serving/native_front/Cargo.lock") else None}
+    say(f"engine: native front built { {k: v for k, v in info.items() if k != 'cargo_lock'} }")
     return info
 
 
