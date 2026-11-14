@@ -1,11 +1,11 @@
-"""S6-22s: the steward's send-schedule precondition (fairness-rulings, lab ca05113) for one rung's per-request records.
+"""S6-22s: the steward's send-schedule precondition (fairness-rulings, lab 2db4dfc; the per-millisecond rule of ca05113
+withdrawn) for one rung's per-request records.
 
     python colab/send_schedule.py RECORDS.csv RATE [OUT.json]
 
-A rung's figures stand only when the client's arrivals matched the schedule: send lag p99 at most 5 ms, and at most 4
-sends in any millisecond above the scheduled rate per millisecond (RATE / 1000). Each request's send time is its due
-time i / RATE plus its recorded lag. Prints and writes the lag percentiles, the busiest millisecond, the p99.9 of sends
-per millisecond and whether the precondition holds. Development only."""
+A rung's sends match the schedule when their send lag over every request has a p99 of at most 5 ms and a maximum of
+at most 20 ms; every native rung must meet it to count. Also reported, for information only: the busiest millisecond
+and the p99.9 of sends per millisecond (each send at its due time i / RATE plus its lag). Development only."""
 import csv
 import json
 import sys
@@ -24,11 +24,10 @@ def check(path, rate):
             lags.append(lag)
             per_ms[int(int(r["i"]) / rate * 1000.0 + lag)] += 1
     counts = np.array(list(per_ms.values()))
-    limit = rate / 1000.0 + 4
     out = {"records": path, "rate": rate, "sends": len(lags), "lag_p99_ms": float(np.percentile(lags, 99)),
            "lag_max_ms": float(max(lags)), "max_sends_in_a_ms": int(counts.max()),
-           "p999_sends_per_ms": float(np.percentile(counts, 99.9)), "limit_sends_per_ms": limit}
-    out["holds"] = out["lag_p99_ms"] <= 5.0 and out["max_sends_in_a_ms"] <= limit
+           "p999_sends_per_ms": float(np.percentile(counts, 99.9)), "rule": "lag p99 <= 5 ms and lag max <= 20 ms"}
+    out["holds"] = out["lag_p99_ms"] <= 5.0 and out["lag_max_ms"] <= 20.0   # the steward's definition (lab 2db4dfc)
     return out
 
 
