@@ -35,6 +35,7 @@ struct Front {
     gpus: Vec<Arc<Gpu>>,
     ids: AtomicU64,
     worker: String,
+    threads: usize,
 }
 
 async fn connect(path: &str) -> std::io::Result<Arc<Gpu>> {
@@ -159,6 +160,38 @@ fn render(payload: &[u8]) -> Option<(u16, Vec<u8>, serde_json::Value)> {
     Some((200, out, meta))
 }
 
+/// GET /readyz: every GPU process asked, as the Python front does (serving/front.py ``_readyz``): ready only when all
+/// are; the same keys in the same order (plat-m21: asking GPU process 0 alone let a routed warm-up reach a process
+/// still loading its index).
+async fn readyz(front: &Arc<Front>) -> Response<Full<Bytes>> {
+    let mut ready = 0usize;
+    let mut indexes = String::from("[]");
+    for g in &front.gpus {
+        let id = front.ids.fetch_add(1, Ordering::Relaxed);
+        let frame = Front::call_frame(id, b"GET", b"/readyz", b"");
+        if let Some(reply) = front.send(g, frame, id).await {
+            if let Some((st, body, _)) = render(&reply) {
+                if st == 200 {
+                    ready += 1;
+                }
+                if indexes == "[]" {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        if let Some(ix) = v.get("indexes") {
+                            indexes = ix.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ok = ready == front.gpus.len();
+    let worker = front.worker.parse::<i64>().map(|w| w.to_string()).unwrap_or_else(|_| format!("{:?}", front.worker));
+    let body = format!("{{\"ready\":{},\"draining\":false,\"indexes\":{},\"fronts\":{},\"gpu_processes\":{},\"gpu_ready\":{},\"worker\":{}}}",
+                       ok, indexes, front.threads, front.gpus.len(), ready, worker);
+    Response::builder().status(if ok { 200 } else { 503 }).header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body))).unwrap()
+}
+
 fn json(status: u16, body: &'static str) -> Response<Full<Bytes>> {
     Response::builder().status(status).header("Content-Type", "application/json")
         .body(Full::new(Bytes::from_static(body.as_bytes()))).unwrap()
@@ -178,6 +211,9 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
     let rid = format!("{:016x}", front.ids.fetch_add(1, Ordering::Relaxed) ^ 0x9e3779b97f4a7c15);
     if bare == "/healthz" && method == "GET" {
         return Ok(json(200, "{\"status\":\"ok\"}"));
+    }
+    if bare == "/readyz" && method == "GET" {
+        return Ok(readyz(&front).await);
     }
     let id = front.ids.fetch_add(1, Ordering::Relaxed);
     let parts: Vec<&str> = bare.trim_start_matches('/').split('/').collect();
@@ -236,7 +272,7 @@ fn main() {
                 }
             }
         }
-        let front = Arc::new(Front { gpus, ids: AtomicU64::new(1), worker });
+        let front = Arc::new(Front { gpus, ids: AtomicU64::new(1), worker, threads });
         let listener = TcpListener::bind((host.as_str(), port)).await.expect("bind");
         eprintln!("s3-native-front on {}:{} ({} threads, {} GPU processes)", host, port, threads, sockets.len());
         loop {
