@@ -698,14 +698,18 @@ class Executor:
             self._batched_fusion(plans, timer)
         shared = dict(timer.laps)
         shared_ms = (time.perf_counter() - shared_t0) * 1000.0
+        pre = self._batched_lexical_roots(plans) if self.BATCHED and len(plans) > 1 else {}
         states = []
-        for plan in plans:
+        for k, plan in enumerate(plans):
             t = Timer(b, sync=self.SYNC_PLAN_TIMES or len(plans) == 1)
             ctx = {"explain": {} if plan.explain else None}
             self.knn_outcome = {}
-            score, match = self.eval(plan.root, ctx)
-            match = match & st.live
-            score = b.where(match, score, 0.0)
+            if k in pre:                                  # S6-17: computed with the batch's other lexical roots
+                score, match, ctx["lexical"] = pre[k]
+            else:
+                score, match = self.eval(plan.root, ctx)
+                match = match & st.live
+                score = b.where(match, score, 0.0)
             t.lap("filter" if not isinstance(plan.root, Hybrid) else "fuse")
             hits_mask = match
             if plan.post_filter is not None:             # aggregations see the query's matches, hits these
@@ -862,6 +866,31 @@ class Executor:
                 r = b.concatenate([b.astype(r, "int64"), b.full((1, K - r.shape[1]), -1, "int64")], 1)
             out.append(b.astype(r, "int64"))
         return b.concatenate(out, 0)
+
+    def _batched_lexical_roots(self, plans):
+        """S6-17: ``{plan index: (score, match, ctx["lexical"])}`` for the plans whose query is a bare lexical node
+        (no explain), the same values ``eval`` and the live mask give, computed for a chunk of them at once: one
+        compare, one product, one select and one mask over the stacked rows instead of four or five small kernels
+        and their Python per plan. Element by element they are the same operations, so the same bits."""
+        b, st = self.b, self.st
+        idx = [k for k, p in enumerate(plans) if isinstance(p.root, Lexical) and not p.explain and p.root.msm != 0]
+        out = {}
+        if len(idx) < 2:
+            return out
+        for ch in self._chunks(idx):
+            nodes = [plans[k].root for k in ch]
+            G = len(ch)
+            S = b.stack([self.lex_cache[n][0] for n in nodes], 0)
+            NM = b.stack([self.lex_cache[n][1] for n in nodes], 0)
+            msm = b.asarray(np.array([n.msm for n in nodes], np.int64).reshape(G, 1), "int64")
+            boost = b.asarray(np.array([n.boost for n in nodes], np.float32).reshape(G, 1), "float32")
+            M = NM >= msm
+            raw = b.where(M, S * boost, 0.0)
+            match = M & st.live.reshape(1, -1)
+            score = b.where(match, raw, 0.0)
+            for g, (k, n) in enumerate(zip(ch, nodes)):
+                out[k] = (score[g], match[g], (n, self.lex_cache[n][0], M[g]))
+        return out
 
     def _batched_rescore(self, states):
         """S6-8: the rescored plans of the batch (without explain), per ranker and chunk: one top-k window over the

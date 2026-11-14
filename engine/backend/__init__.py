@@ -69,11 +69,12 @@ class Backend(Protocol):
         """Stable argsort along the last axis (equal keys keep index order)."""
 
     # ---- sparse CSR (BM25F) -------------------------------------------------------------------------------------
-    def csr_expand(self, ptr: Array, rows: Array, owners: Array) -> tuple[Array, Array]:
+    def csr_expand(self, ptr: Array, rows: Array, owners: Array, total: int | None = None) -> tuple[Array, Array]:
         """Expand CSR row ranges. ``rows`` are row ids (term ids), ``owners`` one owner (query id) per row.
 
         Returns ``(owner_of_entry int64[E], entry int64[E])``, where for each i the entries
-        ``ptr[rows[i]] .. ptr[rows[i]+1]-1`` appear in order, tagged with ``owners[i]``. E is the total length.
+        ``ptr[rows[i]] .. ptr[rows[i]+1]-1`` appear in order, tagged with ``owners[i]``. E is the total length;
+        ``total`` (S6-17), when the caller knows E on the host, saves the device read that finds it.
         """
 
     def segment_sum(self, keys: Array, values: Array, n: int) -> Array:
@@ -87,6 +88,10 @@ class Backend(Protocol):
 
     def segment_count(self, keys: Array, n: int) -> Array:
         """``int32[n]`` counts of ``keys``."""
+
+    def segment_count_where(self, keys: Array, mask: Array, n: int) -> Array:
+        """S6-17: ``segment_count(keys[mask], n)`` without a boolean index (which reads the device to size its
+        result)."""
 
     def accumulator(self, n: int) -> Array:
         """S6-13: ``zeros(n)`` in the accumulation dtype (float64, or float32 with ``accumulate="float32"``)."""

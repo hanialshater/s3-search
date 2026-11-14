@@ -71,11 +71,19 @@ class TorchBackend:
         return a.to(DTYPES[dtype])
 
     def where(self, cond, a, b):
+        # S6-17: next to a tensor, a Python scalar becomes a 0-dim tensor on the host, which torch passes to the kernel
+        # as a value. A device scalar was a host-to-device copy per call, and that copy waited for the stream (the GPU
+        # profile at 20bda25: about 2 per request, 40% of a depth-2,000 batch's host time on an L4). Same dtypes as
+        # before (a scalar takes the other operand's dtype), so the same results.
         ref = a if isinstance(a, torch.Tensor) else b if isinstance(b, torch.Tensor) else None
-        if not isinstance(a, torch.Tensor):
-            a = torch.tensor(a, device=self.device, dtype=ref.dtype if ref is not None else torch.float32)
-        if not isinstance(b, torch.Tensor):
+        if ref is None:                                   # two scalars: tensors on the device, as before
+            a = torch.tensor(a, device=self.device, dtype=torch.float32)
             b = torch.tensor(b, device=self.device, dtype=a.dtype)
+            return torch.where(cond, a, b)
+        if not isinstance(a, torch.Tensor):
+            a = torch.tensor(a, dtype=ref.dtype)
+        if not isinstance(b, torch.Tensor):
+            b = torch.tensor(b, dtype=a.dtype)
         return torch.where(cond, a, b)
 
     def copy(self, a):
@@ -123,17 +131,21 @@ class TorchBackend:
         return torch.sort(a, dim=-1, descending=descending, stable=True).indices
 
     # ---- sparse CSR
-    def csr_expand(self, ptr, rows, owners):
+    def csr_expand(self, ptr, rows, owners, total=None):
+        """``total``: the expanded length when the caller knows it on the host (S6-17), so no device read is needed
+        (the count, and repeat_interleave's own, each waited for the stream)."""
         rows = self.asarray(rows, "int64")
         owners = self.asarray(owners, "int64")
         starts = ptr[rows]
         n = ptr[rows + 1] - starts
-        total_t = n.sum()
-        self._wait()
-        total = int(total_t)
+        if total is None:
+            total_t = n.sum()
+            self._wait()
+            total = int(total_t)
         offsets = torch.cumsum(n, 0) - n
-        entry = torch.arange(total, device=self.device, dtype=torch.int64) + torch.repeat_interleave(starts - offsets, n)
-        return torch.repeat_interleave(owners, n), entry
+        entry = torch.arange(total, device=self.device, dtype=torch.int64) + \
+            torch.repeat_interleave(starts - offsets, n, output_size=total)
+        return torch.repeat_interleave(owners, n, output_size=total), entry
 
     def segment_sum(self, keys, values, n):
         # float64 accumulation through index_put_(accumulate=True), whose CUDA kernel is sort-based and
@@ -156,6 +168,13 @@ class TorchBackend:
     def segment_count(self, keys, n):
         return torch.bincount(keys, minlength=n).to(torch.int32)
 
+    def segment_count_where(self, keys, mask, n):
+        """``segment_count(keys[mask], n)`` without the boolean index (a host sync, S6-17): an integer scatter-add of
+        the mask (atomic integer adds: exact in any order). Not index_put(accumulate=True), which is sort-based on
+        cuda (22 ms of a depth-2,000 batch's device time on an A100 at 9729340), and not a weighted bincount, which
+        reads the keys' maximum from the device to size its result (12 ms of host CPU per batch at 4d5ce23)."""
+        return torch.zeros(n, dtype=torch.int32, device=self.device).scatter_add_(0, keys, mask.to(torch.int32))
+
     def accumulator(self, n):
         return torch.zeros(n, dtype=torch.float32 if self.accumulate == "float32" else torch.float64,
                            device=self.device)
@@ -177,7 +196,7 @@ class TorchBackend:
     def topk(self, scores, k, valid=None):
         s = scores.to(torch.float32)
         if valid is not None:
-            s = torch.where(valid, s, torch.tensor(float("-inf"), device=self.device))
+            s = torch.where(valid, s, torch.tensor(float("-inf"), dtype=torch.float32))  # a host scalar: no copy
         Q, N = s.shape
         k = min(int(k), N)
         if k == 0 or Q == 0:
