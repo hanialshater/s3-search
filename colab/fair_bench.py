@@ -4,6 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
+        [--server-env=K=V,...]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -499,7 +500,8 @@ def engine_target(ds, server_cpus):
            "S3_SERVING_WORKERS": str(WORKERS), "S3_SERVING_COLUMNS": COLUMNS,
            "S3_SERVING_FRONTS": str(FRONTS), "S3_SERVING_GPU_PROCESSES": str(GPUS),
            "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0"),
-           "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0")}
+           "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0"),
+           **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
