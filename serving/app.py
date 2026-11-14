@@ -278,6 +278,17 @@ def make_server(app: App, host: str | None = None, port: int | None = None, sock
         protocol_version = "HTTP/1.1"
         server_version = "s3-serving"
 
+        def setup(self) -> None:
+            super().setup()
+            # The headers and the body go out as two writes; with Nagle on, the second can wait for the client's
+            # delayed ACK (about 40 ms on Linux). plat-m13 showed a p95 near 45 to 50 ms at low rates on this stack,
+            # for the engine and for zvec behind the same server alike. TCP_NODELAY sends each write at once.
+            try:
+                import socket as _socket
+                self.connection.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+
         def _do(self) -> None:
             n = int(self.headers.get("Content-Length") or 0)
             if self.command == "POST" and self.path.split("?", 1)[0].endswith("/_bulk"):
