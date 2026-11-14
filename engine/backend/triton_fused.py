@@ -46,8 +46,8 @@ except Exception:  # noqa: BLE001
     triton = None
     tl = None
 
-TILE = 2048
-BLOCK = 256
+TILE = 1024        # S6-32: from the A100 sweep (arch-sweep1): 14% under (2048, 256, 4) at batch 64 without facets,
+BLOCK = 128        # 4% under with facets, 3% and 6% under at batch 32; every shape gave the same bits
 NUM_WARPS = 4
 
 
