@@ -225,6 +225,9 @@ class TorchBackend:
         if k == 0 or Q == 0:
             return (torch.full((Q, k), -1, dtype=torch.int32, device=self.device),
                     torch.full((Q, k), float("-inf"), device=self.device))
+        from . import triton_topk as TT
+        if TT.wanted(self, k):                            # S6-18: a float32 threshold and a Triton compaction
+            return TT.topk(s, k)
         # S6-14: one top-k over a unique int64 key, (the score's order-preserving bits, then N-1-index), so the
         # order is score descending, then index ascending, with no tie pass (the kth value, a cumsum over the row,
         # a nonzero and a sort before). -0.0 is made +0.0 first: they compare equal as floats.
@@ -262,6 +265,9 @@ class TorchBackend:
         return out.to(torch.float32) if weights is not None else out.to(torch.int64)
 
     def bincount_rows(self, codes, mask, n):
+        from . import triton_facets as TF
+        if TF.wanted(self):                               # S6-18: one kernel, no nonzero, no device reads
+            return TF.bincount_rows(mask, codes, n)
         Q = mask.shape[0]
         r, c = torch.nonzero(mask, as_tuple=True)
         return torch.bincount(r * n + codes[c].to(torch.int64), minlength=Q * n).view(Q, n)
