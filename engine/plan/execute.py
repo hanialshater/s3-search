@@ -6,6 +6,7 @@ leaves on one field share one matmul. The rest of each tree is elementwise work 
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import defaultdict
 
@@ -773,6 +774,14 @@ class Executor:
                                                    extra=extra_cols, tiekey=st.first_offset_dev, collapse=group,
                                                    count=sx["hits_mask"])
                 ids_a = None
+            fc = sx.pop("fused_cols", None)
+            if want_columns and fc is not None and ids_bytes:  # S6-31: views of the batch's arrays, built once
+                t.lap("page")
+                resp = {"hits": {"total": total, "columns": fc}, **resp}
+                if sx["knn"]:
+                    resp["knn"] = sx["knn"]
+                out.append(self._took(resp, shared, shared_ms, t))
+                continue
             if want_columns:
                 cols = {"_id": st.ids_bytes()[ids_a] if ids_bytes else st.ids[ids_a].tolist(),
                         "_score": extra_a[:, 0].astype(np.float32),
@@ -1054,14 +1063,28 @@ class Executor:
         host = b.to_numpy(b.concatenate(tots + bufs, 0))            # one transfer: every total, then every page
         need = (len(host) - n) // (3 * n)
         pg = host[n:].reshape(n, need, 3)
+        # S6-31: the columns of every fused page in one pass. The ids are gathered once, the scores are cast once,
+        # and the valid hits per row are counted once. Each plan then takes row views: the same values and dtypes as
+        # the per-plan arrays (the valid entries of a top-k row are a prefix: -1 pads only its tail).
+        idx_all = pg[:, :, 0].astype(np.int64)
+        valid_n = (idx_all >= 0).sum(axis=1)
+        ids_all = st.ids_bytes()[np.maximum(idx_all, 0)]
+        score32_all = pg[:, :, 1].astype(np.float32)
+        score64_all = np.ascontiguousarray(pg[:, :, 1])
+        fo_all = pg[:, :, 2].astype(np.int64)
         ms = (time.perf_counter() - t0) * 1000.0 / n
         for r, i in enumerate(order):
             p = states[i]["plan"]
             totals[i] = int(host[r])
-            h = pg[r, p.from_:p.from_ + p.size]
-            h = h[h[:, 0] >= 0]
-            pages[i] = (h[:, 0].astype("int64"), h[:, 1:2], h[:, 1:3])
+            f0 = p.from_
+            f1 = max(f0, min(int(valid_n[r]), f0 + p.size))
+            pages[i] = (idx_all[r, f0:f1], pg[r, f0:f1, 1:2], pg[r, f0:f1, 1:3])
             states[i]["page_ms"] = ms
+            if os.environ.get("S3_FUSED_ONEPASS", "1") == "0":   # the per-plan assembly, for comparison
+                continue
+            states[i]["fused_cols"] = {"_id": ids_all[r, f0:f1], "_score": score32_all[r, f0:f1],
+                                       "sort": [{"values": score64_all[r, f0:f1], "missing": None},
+                                                {"values": fo_all[r, f0:f1], "missing": None}]}
 
     def _fused_terms(self, states, out):
         """The fused plans' terms aggregations from the pass's counts: per field and size one ``top_buckets`` over
