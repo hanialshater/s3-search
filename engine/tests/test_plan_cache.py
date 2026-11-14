@@ -43,8 +43,9 @@ def test_a_refused_request_is_not_cached(ds):
     assert all("no_such_query" not in k for k in ix._st.__dict__.get("_plan_cache", (None, {}))[1])
 
 
-def test_phase_a_rows_are_reused_by_the_page_step(ds):
+def test_phase_a_rows_are_reused_by_the_page_step(ds, monkeypatch):
     """A batch of bare lexical queries stacks its rows once, in phase A, not again for the pages."""
+    monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "0")    # today's path (S6-22's fused path stacks no rows at all)
     ix = api.build_index(ds.catalogue, ds.mapping)
     b = ix._st.b
     reqs = [{"query": {"match": {"product_title": t}}, "size": 10}
