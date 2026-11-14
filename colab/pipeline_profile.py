@@ -83,6 +83,10 @@ DEEP = any(a == "--deep=1" for a in sys.argv[1:])
 # --triton=1 (S6-18): with --deep=1, measure the depth-2,000 request again with the Triton BM25F sum (S3_TRITON_BM25=1),
 # in the same process, and profile it.
 TRITON = any(a == "--triton=1" for a in sys.argv[1:])
+# --fused=1 (S6-22): a lexical-only index; the depth-2,000 request and the faceted lexical request (brand and colour
+# terms facets, size 10) at batch 64, each with S3_TRITON_FUSED_LEXICAL off (today's path, the engine's defaults) and on;
+# 256 responses of each compared field by field; one torch.profiler batch each. Use with --plan-cache=0.
+FUSED = any(a == "--fused=1" for a in sys.argv[1:])
 
 
 def measure(index, make, texts, label, kw=None):
@@ -120,6 +124,42 @@ def measure(index, make, texts, label, kw=None):
         say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms, "
             f"host CPU {cpu * 1e3 / len(reqs):.3f} ms per request ({cpu / total:.2f} cores)")
     return out
+
+
+def fused_runs(index, texts):
+    from engine.api import expand_hits
+    from engine.backend import triton_fused
+    facets = {"brand": {"terms": {"field": "product_brand.keyword", "size": 10}},
+              "color": {"terms": {"field": "product_color.keyword", "size": 10}}}
+    kinds = {"deep": (deep_request, {"hits": "columns", "ids": "bytes"}),
+             "faceted": (lambda q: {"query": lexical(q), "aggs": facets, "size": 10}, {})}
+    calls = []
+    real = triton_fused._run_kernel
+    triton_fused._run_kernel = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    res = {}
+    for kind, (make, kw) in kinds.items():
+        for on in ("0", "1"):
+            os.environ["S3_TRITON_FUSED_LEXICAL"] = on
+            label = f"{kind}_{'fused' if on == '1' else 'today'}"
+            res[label] = {"measure": measure(index, make, texts, label, kw)}
+            try:
+                res[label]["torch_profile"] = torch_profile(index, make, texts, label, kw=kw)
+            except Exception as e:  # noqa: BLE001
+                res[label]["torch_profile"] = {"error": repr(e)[:500]}
+        differ = 0
+        for i in range(0, 256, 64):
+            reqs = [make(t) for t in texts[i:i + 64]]
+            os.environ["S3_TRITON_FUSED_LEXICAL"] = "1"
+            a = [expand_hits(r) for r in index.search_batch(reqs, **kw)]
+            os.environ["S3_TRITON_FUSED_LEXICAL"] = "0"
+            c = [expand_hits(r) for r in index.search_batch(reqs, **kw)]
+            differ += sum({k: v for k, v in x.items() if k != "took_ms"} != {k: v for k, v in y.items() if k != "took_ms"}
+                          for x, y in zip(a, c))
+        res[f"{kind}_responses_differ"] = {"of": 256, "differ": differ}
+        say(f"{kind}: fused against today's path: {differ} of 256 responses differ")
+    res["fused_kernel_calls"] = len(calls)
+    os.environ.pop("S3_TRITON_FUSED_LEXICAL", None)
+    return res
 
 
 def torch_profile(index, make, texts, label, bs=64, kw=None):
@@ -185,6 +225,22 @@ def main():
               "color": {"terms": {"field": "product_color.keyword", "size": 20}}}
     m = copy.deepcopy(ds.mapping)
     m["_meta"]["engine"]["bm25"] = json.loads(open("referee/requests/bm25f-tuned.bm25.json").read())
+    if FUSED:                                        # lexical only: no encoder, no ranker
+        say(f"build (fused run): {len(ds.catalogue):,} products on cuda, lexical only")
+        t0 = time.perf_counter()
+        index = api.build_index(ds.catalogue, m, device="cuda")
+        build_s = time.perf_counter() - t0
+        texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
+        from engine.backend import triton_gate
+        result = {"kind": "pipeline-profile-fused", "label": "development only, never a score", "ref": REF,
+                  "commit": commit, "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
+                  "triton_effective": triton_gate.effective(index._st.b), "n_products": int(len(ds.catalogue)),
+                  "n_queries": len(texts), "build_s": build_s, "fused": fused_runs(index, texts)}
+        stop.set()
+        json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
+        say("DONE")
+        print(json.dumps(result, indent=1), flush=True)
+        return 0
     m["_meta"]["engine"]["embeddings"] = {"embedding": {"model": "tfidf-svd-128",
                                                        "inputs": ["product_title", "product_brand", "product_color"]}}
     m["properties"]["embedding"] = {"type": "knn_vector", "dimension": 128,
