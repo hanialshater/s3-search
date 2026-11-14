@@ -168,6 +168,29 @@ class TorchBackend:
     def segment_count(self, keys, n):
         return torch.bincount(keys, minlength=n).to(torch.int32)
 
+    def segment_sum_rows(self, docs, values, hits, row_lens, row_owners, n_queries, N):
+        """S6-18: ``(segment_sum(q * N + docs, values), segment_count_where(...))`` for a chunk whose entries are its term
+        rows one after another (each sorted by doc), summed by the Triton kernel in the rows' order: the same float64
+        additions in the same order as the sort-based kernel, so the same bits. ``None`` when it does not apply
+        (no Triton, not cuda, ``S3_TRITON_BM25`` not "1", float32 accumulation), and the caller takes the torch path."""
+        from . import triton_bm25 as TB
+        if self.accumulate != "float64" or not TB.wanted(self):
+            return None
+        row_start, at = [], 0
+        for n in row_lens:
+            row_start.append(at)
+            at += n
+        q_index, q_lo, q_hi = [], [], []
+        for r, q in enumerate(row_owners):                  # a query's rows are consecutive
+            if not q_index or q_index[-1] != q:
+                q_index.append(q)
+                q_lo.append(r)
+                q_hi.append(r)
+            q_hi[-1] = r + 1
+        acc, cnt = TB.segment_sum_and_count(self, docs, values.to(torch.float64), hits, row_start, list(row_lens),
+                                            q_lo, q_hi, q_index, n_queries, N)
+        return acc.to(torch.float32), cnt
+
     def segment_count_where(self, keys, mask, n):
         """``segment_count(keys[mask], n)`` without the boolean index (a host sync, S6-17): an integer scatter-add of
         the mask (atomic integer adds: exact in any order). Not index_put(accumulate=True), which is sort-based on
