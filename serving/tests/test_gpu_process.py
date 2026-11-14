@@ -263,6 +263,27 @@ def test_native_front_answers_as_one_process(built, single):
         assert _stop(p) == 0
 
 
+@pytest.mark.parametrize("front", ["stdlib", "native"])
+def test_timing_headers_include_the_batch_time(built, front):
+    """S6-22s: a search through either front carries X-S3-Queue-Ms, X-S3-Serve-Ms and X-S3-Batch-Ms (the GPU
+    process's search_batch wall time), the per-request tail breakdown's inputs (native skipped unless built)."""
+    env = {}
+    if front == "native":
+        if not _native_bin():
+            pytest.skip("serving/native_front is not built")
+        env = {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin()}
+    port = _free_port()
+    p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"], env)
+    try:
+        st, _, h = _http("POST", f"http://127.0.0.1:{port}/indexes/toy/_search", REQS[0])
+        assert st == 200
+        h = {k.lower(): v for k, v in h.items()}               # header names are case-insensitive (hyper: lower)
+        q, s, b = (float(h[k]) for k in ("x-s3-queue-ms", "x-s3-serve-ms", "x-s3-batch-ms"))
+        assert q >= 0 and b > 0 and s >= b, h
+    finally:
+        assert _stop(p) == 0
+
+
 def test_native_front_readyz_asks_every_gpu_process_and_honours_the_route(built, single):
     """S6-22s, plat-m21: the native front's /readyz counts every GPU process (as the Python front), and a search with
     X-S3-Route-Gpu goes to that process (skipped unless built)."""
