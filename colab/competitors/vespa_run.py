@@ -162,7 +162,7 @@ def feed(catalogue, threads: int = 32) -> dict:
                          {"yql": "select * from product where true", "hits": 0, "timeout": "20s"}, timeout=60)
         have = json.loads(body)["root"]["fields"]["totalCount"]
         if have == len(ids):
-            return {"fed": 0, "already": have, "failed": 0, "feed_s": 0.0}
+            return {"fed": 0, "already": have, "failed": 0, "feed_s": 0.0, "documents": have}   # (a) reads this
     except Exception:  # noqa: BLE001
         pass
     fc = feed_client(catalogue)
