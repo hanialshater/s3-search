@@ -40,6 +40,7 @@ import pickle
 import queue
 import socket
 import struct
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -719,6 +720,10 @@ def gpu_main(cfg, sock_path: str, index: int) -> int:
     import signal
     from .app import create_app
     from .workers import mark_ready
+    sw = os.environ.get("S3_SERVING_GPU_SWITCH_INTERVAL_MS")    # S6-22s: the GIL switch interval (default Python's 5 ms)
+    if sw:                                                      # so the reader and writer threads wait less behind
+        sys.setswitchinterval(float(sw) / 1000.0)               # the batch thread
+        log.info("gpu process %d: GIL switch interval %.3f ms", index, sys.getswitchinterval() * 1000.0)
     frac = float(os.environ.get("S3_SERVING_GPU_MEMORY_FRACTION", "0") or 0)
     if frac > 0:                                                # cap torch's cache so K processes fit predictably
         try:
