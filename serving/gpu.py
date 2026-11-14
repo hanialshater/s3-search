@@ -6,7 +6,9 @@ The supervisor (``serving/workers.py``) starts K GPU processes and F front proce
 process holds the only copy of each preloaded index it serves (one per process), a full ``App`` for every route that is
 not a search, and a batch loop that makes **one** ``search_batch(requests, hits="columns", errors="return")`` call at
 a time with at most ``MAX_BATCH`` (64) requests: whatever the fronts have queued when the previous call returns. There is
-no batch window. Requests with ``explain`` or ``highlight`` go in batches of their own (§5: per-hit work that would
+no batch window by default; ``S3_SERVING_GPU_BATCH_WAIT_MS`` (default 0) opens one, waiting up to that long after a
+batch's first request for more, and ``S3_SERVING_GPU_MAX_BATCH`` (default 64) caps it (S6-22s: plat-m20 found the
+scheduler's ``S3_SERVING_MAX_WAIT_MS`` and ``S3_SERVING_MAX_BATCH`` do not reach this loop). Requests with ``explain`` or ``highlight`` go in batches of their own (§5: per-hit work that would
 slow the whole batch); everything else shares a batch.
 
 **Transport.** A Unix-domain socket per GPU process, in the supervisor's state directory (mode 0700), the socket itself
@@ -47,6 +49,15 @@ from .errors import NotReady, Overloaded, classify, classify_entry
 
 log = logging.getLogger("serving.gpu")
 MAX_BATCH = 64
+
+
+def _batch_settings() -> tuple[int, float]:
+    """(max batch, wait in seconds) for the batch loop, from S3_SERVING_GPU_MAX_BATCH and S3_SERVING_GPU_BATCH_WAIT_MS."""
+    mb = int(os.environ.get("S3_SERVING_GPU_MAX_BATCH", str(MAX_BATCH)))
+    wait_ms = float(os.environ.get("S3_SERVING_GPU_BATCH_WAIT_MS", "0"))
+    if mb < 1 or wait_ms < 0:
+        raise ValueError(f"S3_SERVING_GPU_MAX_BATCH={mb} must be >= 1 and S3_SERVING_GPU_BATCH_WAIT_MS={wait_ms} >= 0")
+    return mb, wait_ms / 1000.0
 RETRY_CAP = 2
 _LEN = struct.Struct(">Q")
 _HEAD = struct.Struct(">QI")                                    # pickle length, number of out-of-band buffers
@@ -231,6 +242,7 @@ class GpuServer:
         self._out: dict[_Conn, list] | None = None              # replies of the batch in hand, per front
         self.in_batch = 0
         self.load = LoadTable(state_dir, create=False) if state_dir else None
+        self.batch_settings = _batch_settings()                # S3_SERVING_GPU_MAX_BATCH, S3_SERVING_GPU_BATCH_WAIT_MS
 
     # -- connections
     def serve_forever(self) -> None:
@@ -346,14 +358,26 @@ class GpuServer:
 
     # -- the batch loop
     def _collect(self) -> list[_Item]:
+        """The next batch: the first request, then whatever is queued, up to the max batch; with a batch wait, keep
+        taking arrivals until the wait after the first request has passed or the batch is full."""
+        mb, wait = getattr(self, "batch_settings", None) or _batch_settings()
         try:
             first = self.q.get(timeout=0.2)
         except queue.Empty:
             return []
         batch = [first]
-        while len(batch) < MAX_BATCH:
+        deadline = time.perf_counter() + wait
+        while len(batch) < mb:
             try:
                 batch.append(self.q.get_nowait())
+                continue
+            except queue.Empty:
+                pass
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                break
+            try:
+                batch.append(self.q.get(timeout=left))
             except queue.Empty:
                 break
         return batch
