@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--warm-rung=1] [--loadgen-bin=PATH --loadgen-sha256=HEX] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--warm-rung=1 --warm-duration=S] [--loadgen-bin=PATH --loadgen-sha256=HEX] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -953,8 +953,9 @@ def main():
             stop_ladder = False
             if opt("warm-rung", "0") == "1":                     # the steward's amended check: one discarded rung first
                 globals()["CLIENT"] = CLIENTS[0]
-                say(f"{name}: a discarded warm rung, {RATES[0]:.0f} QPS for {DURATION:.0f} s, client {CLIENTS[0]}")
-                w = load(url, bodies, RATES[0], DURATION, client_cpus)
+                wd = float(opt("warm-duration", str(DURATION)))     # --warm-duration: a shorter warm rung (plat-m24)
+                say(f"{name}: a discarded warm rung, {RATES[0]:.0f} QPS for {wd:.0f} s, client {CLIENTS[0]}")
+                w = load(url, bodies, RATES[0], wd, client_cpus)
                 out.setdefault("discarded_warm_rung", {})[name] = {k: w[k] for k in (
                     "target_qps", "achieved_qps", "latency_ms", "errors", "timeouts", "client")}
                 time.sleep(5)
