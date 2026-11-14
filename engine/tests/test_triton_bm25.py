@@ -65,8 +65,8 @@ def test_triton_sum_equals_the_torch_path_for_each_precision(addend, acc, monkey
     import torch
     from engine import api
     from engine.analysis import analyze
-    monkeypatch.setenv("S3_BM25_ADDEND", addend)
-    monkeypatch.setenv("S3_BM25_SUM", acc)
+    monkeypatch.setenv("S3_TRITON_BM25_WEIGHTS", addend)
+    monkeypatch.setenv("S3_TRITON_BM25_SUM", acc)
     ds = loader.load_dataset("toy")
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
     st = ix._st

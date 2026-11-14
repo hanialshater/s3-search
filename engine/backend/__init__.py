@@ -170,16 +170,18 @@ def resolve_device(device: str | None = None) -> str:
 
 _CACHE: dict = {}
 ENV_ACCUM = "S3_SEARCH_ACCUM"
-ENV_BM25_ADDEND = "S3_BM25_ADDEND"
-ENV_BM25_SUM = "S3_BM25_SUM"
+# Named S3_TRITON_* so the referee records them (referee/bench.py's engine_env); they apply on every path, not only
+# where a Triton kernel runs.
+ENV_BM25_ADDEND = "S3_TRITON_BM25_WEIGHTS"
+ENV_BM25_SUM = "S3_TRITON_BM25_SUM"
 
 
 def bm25_precision(b) -> tuple[str, str]:
     """S6-21, a precision experiment (development only; the default is today's): ``(addend, accumulate)`` for BM25F.
 
-    ``S3_BM25_ADDEND``: the dtype each posting's term weight (idf * saturated pseudo-tf, computed in float32) is rounded
+    ``S3_TRITON_BM25_WEIGHTS``: the dtype each posting's term weight (idf * saturated pseudo-tf, computed in float32) is rounded
     to before the sum: ``"float32"`` (default, unrounded) or ``"float16"`` (about 3 significant digits per weight).
-    ``S3_BM25_SUM``: the dtype the weights are summed in: ``"float64"`` or ``"float32"``; unset, the backend's own
+    ``S3_TRITON_BM25_SUM``: the dtype the weights are summed in: ``"float64"`` or ``"float32"``; unset, the backend's own
     ``accumulate`` (``S3_SEARCH_ACCUM``, float64 by default). A float16 sum is not offered: it keeps about 3 digits of
     the total, and at depth 2,000 that reorders near-ties. Read on every call, so one process can measure each variant
     on one index. Every combination stays deterministic and batch-invariant: the order of the adds does not change."""

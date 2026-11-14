@@ -1,6 +1,6 @@
-"""S6-21, the precision experiment: BM25F's term weights rounded to float16 (``S3_BM25_ADDEND``) and its sum in float32
-or float64 (``S3_BM25_SUM``). The default is unchanged. Every variant is deterministic, batch-invariant and the same
-bits on every device, and ``S3_BM25_SUM=float32`` equals the existing float32 accumulation option for BM25F."""
+"""S6-21, the precision experiment: BM25F's term weights rounded to float16 (``S3_TRITON_BM25_WEIGHTS``) and its sum in float32
+or float64 (``S3_TRITON_BM25_SUM``). The default is unchanged. Every variant is deterministic, batch-invariant and the same
+bits on every device, and ``S3_TRITON_BM25_SUM=float32`` equals the existing float32 accumulation option for BM25F."""
 import numpy as np
 import pytest
 
@@ -24,8 +24,8 @@ def seg(ds):
 
 
 def _set(monkeypatch, addend, acc):
-    monkeypatch.setenv("S3_BM25_ADDEND", addend)
-    monkeypatch.setenv("S3_BM25_SUM", acc)
+    monkeypatch.setenv("S3_TRITON_BM25_WEIGHTS", addend)
+    monkeypatch.setenv("S3_TRITON_BM25_SUM", acc)
 
 
 def _strip(r):
@@ -37,23 +37,23 @@ def _reqs(ds):
 
 
 def test_the_default_is_float32_weights_summed_in_the_backends_dtype(monkeypatch):
-    monkeypatch.delenv("S3_BM25_ADDEND", raising=False)
-    monkeypatch.delenv("S3_BM25_SUM", raising=False)
+    monkeypatch.delenv("S3_TRITON_BM25_WEIGHTS", raising=False)
+    monkeypatch.delenv("S3_TRITON_BM25_SUM", raising=False)
     assert bm25_precision(get_backend("cpu")) == ("float32", "float64")
     assert bm25_precision(get_backend("cpu", "float32")) == ("float32", "float32")
-    monkeypatch.setenv("S3_BM25_ADDEND", "bfloat16")
+    monkeypatch.setenv("S3_TRITON_BM25_WEIGHTS", "bfloat16")
     with pytest.raises(ValueError):
         bm25_precision(get_backend("cpu"))
-    monkeypatch.setenv("S3_BM25_ADDEND", "float32")
-    monkeypatch.setenv("S3_BM25_SUM", "float16")                 # a float16 sum is not offered
+    monkeypatch.setenv("S3_TRITON_BM25_WEIGHTS", "float32")
+    monkeypatch.setenv("S3_TRITON_BM25_SUM", "float16")                 # a float16 sum is not offered
     with pytest.raises(ValueError):
         bm25_precision(get_backend("cpu"))
 
 
 def test_unset_equals_the_explicit_default(ds, seg, monkeypatch):
     ix = api.Index(seg, "cpu")
-    monkeypatch.delenv("S3_BM25_ADDEND", raising=False)
-    monkeypatch.delenv("S3_BM25_SUM", raising=False)
+    monkeypatch.delenv("S3_TRITON_BM25_WEIGHTS", raising=False)
+    monkeypatch.delenv("S3_TRITON_BM25_SUM", raising=False)
     want = [_strip(r) for r in ix.search_batch(_reqs(ds))]
     _set(monkeypatch, "float32", "float64")
     assert [_strip(r) for r in ix.search_batch(_reqs(ds))] == want
@@ -61,8 +61,8 @@ def test_unset_equals_the_explicit_default(ds, seg, monkeypatch):
 
 def test_sum_float32_equals_the_float32_accumulation_option(ds, seg, monkeypatch):
     for dev in [d for d in available_devices() if d in ("cpu", "torch-cpu", "cuda")]:
-        monkeypatch.delenv("S3_BM25_ADDEND", raising=False)
-        monkeypatch.delenv("S3_BM25_SUM", raising=False)
+        monkeypatch.delenv("S3_TRITON_BM25_WEIGHTS", raising=False)
+        monkeypatch.delenv("S3_TRITON_BM25_SUM", raising=False)
         want = [_strip(r) for r in api.Index(seg, dev, accumulate="float32").search_batch(_reqs(ds))]
         _set(monkeypatch, "float32", "float32")
         got = [_strip(r) for r in api.Index(seg, dev).search_batch(_reqs(ds))]

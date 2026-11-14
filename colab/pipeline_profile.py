@@ -84,7 +84,7 @@ DEEP = any(a == "--deep=1" for a in sys.argv[1:])
 # in the same process, and profile it.
 TRITON = any(a == "--triton=1" for a in sys.argv[1:])
 # --precision=1 (S6-21, the founder's precision experiment): only the depth-2,000 request, with the Triton BM25F sum and
-# top-k on, for each BM25F precision (S3_BM25_ADDEND, S3_BM25_SUM) in the same process on one index: today's float32
+# top-k on, for each BM25F precision (S3_TRITON_BM25_WEIGHTS, S3_TRITON_BM25_SUM) in the same process on one index: today's float32
 # weights summed in float64 (the reference), float16 weights summed in float32 (variant a) and in float64 (a, the sum
 # kept), and float32 weights summed in float32 (variant b, the float32 accumulation option). Each: throughput, one
 # torch.profiler batch, and against the reference over every text: the share of queries whose top 10 changes (as an
@@ -149,9 +149,9 @@ def precision_runs(index, texts):
 
     res, ranked = {}, {}
     for label, addend, acc in PRECISIONS:
-        os.environ["S3_BM25_ADDEND"], os.environ["S3_BM25_SUM"] = addend, acc
-        say(f"precision {label}: S3_BM25_ADDEND={addend} S3_BM25_SUM={acc}")
-        res[label] = {"S3_BM25_ADDEND": addend, "S3_BM25_SUM": acc,
+        os.environ["S3_TRITON_BM25_WEIGHTS"], os.environ["S3_TRITON_BM25_SUM"] = addend, acc
+        say(f"precision {label}: S3_TRITON_BM25_WEIGHTS={addend} S3_TRITON_BM25_SUM={acc}")
+        res[label] = {"S3_TRITON_BM25_WEIGHTS": addend, "S3_TRITON_BM25_SUM": acc,
                       "measure": measure(index, deep_request, texts, f"deep/{label}", kw)}
         try:
             res[label]["torch_profile"] = torch_profile(index, deep_request, texts, f"deep/{label}", kw=kw)
@@ -174,8 +174,8 @@ def precision_runs(index, texts):
         say(f"precision {label} against the reference: top 10 changed (order) {top10:.2%}, (set) {top10_set:.2%}; "
             f"recall@2000 mean {res[label]['against_reference']['recall_at_2000_mean']:.6f}, min "
             f"{res[label]['against_reference']['recall_at_2000_min']:.4f}; identical lists {same} of {len(ref)}")
-    os.environ.pop("S3_BM25_ADDEND", None)
-    os.environ.pop("S3_BM25_SUM", None)
+    os.environ.pop("S3_TRITON_BM25_WEIGHTS", None)
+    os.environ.pop("S3_TRITON_BM25_SUM", None)
     os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "0", "0"
     return res
 
