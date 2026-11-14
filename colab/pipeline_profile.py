@@ -222,6 +222,19 @@ def main():
         if TRITON:
             os.environ["S3_TRITON_BM25"] = "1"
             result["deep_triton"] = measure(index, deep_request, texts, "deep/triton", {"hits": "columns", "ids": "bytes"})
+            # the same responses, kernel on and off: 4 batches of 64, field by field (took_ms aside)
+            from engine.api import expand_hits
+            differ = 0
+            for i in range(0, 256, 64):
+                reqs = [deep_request(t) for t in texts[i:i + 64]]
+                os.environ["S3_TRITON_BM25"] = "1"
+                on = [expand_hits(r) for r in index.search_batch(reqs, hits="columns", ids="bytes")]
+                os.environ["S3_TRITON_BM25"] = "0"
+                off = [expand_hits(r) for r in index.search_batch(reqs, hits="columns", ids="bytes")]
+                differ += sum({k: v for k, v in x.items() if k != "took_ms"} != {k: v for k, v in y.items() if k != "took_ms"}
+                              for x, y in zip(on, off))
+            result["deep_triton_responses_differ"] = {"of": 256, "differ": differ}
+            say(f"deep/triton: {differ} of 256 responses differ from the torch sum's")
             os.environ["S3_TRITON_BM25"] = "0"
     if TORCH_PROFILE:
         result["torch_profile"] = {}
