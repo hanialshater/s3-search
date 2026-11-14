@@ -160,8 +160,8 @@ def _raw_post(url, body):
         return e.code, e.read()
 
 
-@pytest.mark.parametrize("hostpath", ["0", "stub", "stub-prepared"])
-def test_binary_protocol_gives_the_same_bodies(built, single, hostpath):
+@pytest.mark.parametrize("hostpath,magic", [("0", b"S3B1"), ("stub", b"S3B1"), ("stub-prepared", b"S3B1"), ("0", b"S3B2")])
+def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic):
     """S6-22s: on a connection opened with S3B1, a GPU process answers in serving/binproto.py's frames, and the
     bodies decoded the way a native front must encode them equal one process's (but for took_ms); the same with the
     S3_HOSTPATH seam on its Python stub (serving/hostpath.py). A body that is not JSON gets the Python front's 400 on
@@ -180,7 +180,7 @@ def test_binary_protocol_gives_the_same_bodies(built, single, hostpath):
         want_bad = [_raw_post(f"http://127.0.0.1:{sp}/indexes/toy/_search", b) for b in BAD_BODIES]
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         s.connect(os.path.join(state, "gpu-0.sock"))
-        s.sendall(binproto.MAGIC)
+        s.sendall(magic)                                    # S3B2: kind 3 replies, each sent alone
 
         def ask(i, req):
             body = req if isinstance(req, bytes) else json.dumps(req).encode()
@@ -204,7 +204,7 @@ def test_binary_protocol_gives_the_same_bodies(built, single, hostpath):
                 assert b0.replace(json.dumps(t0, separators=(",", ":")).encode(), b"") == \
                     body.replace(json.dumps(t1, separators=(",", ":")).encode(), b"")
             kinds.add("pre" in meta)
-        assert kinds == {True, False}                     # some columnar (kind 1), some whole (kind 2)
+        assert kinds == {True, False}                     # some columnar (kind 1 or 3), some whole (kind 2)
         for k, (bad, (ws, wb)) in enumerate(zip(BAD_BODIES, want_bad)):
             id_, st, body, _ = ask(1000 + k, bad)
             assert (id_, st) == (1000 + k, ws) and json.loads(body) == json.loads(wb), (bad, body, wb)
@@ -245,13 +245,15 @@ def _native_bin():
     return os.environ.get("S3_NATIVE_FRONT_BIN") or (str(here) if here.exists() else None)
 
 
-def test_native_front_answers_as_one_process(built, single):
-    """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process (skipped unless built)."""
+@pytest.mark.parametrize("binproto", ["1", "2"])
+def test_native_front_answers_as_one_process(built, single, binproto):
+    """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process, on S3B1 and on S3B2 (kind 3:
+    the front escaping the ids and writing the floats; each reply sent alone) (skipped unless built)."""
     if not _native_bin():
         pytest.skip("serving/native_front is not built")
     port = _free_port()
     p = _start(built, port, ["--fronts", "2", "--gpu-processes", "1"],
-               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin()})
+               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin(), "S3_SERVING_BINPROTO": binproto})
     try:
         _same(single, _answers(port))
         url = f"http://127.0.0.1:{port}/indexes/toy/_search"

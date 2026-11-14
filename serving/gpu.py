@@ -169,14 +169,20 @@ class _Conn:
 
 class _BinConn(_Conn):
     """A native front's connection (S6-22s, ``serving/binproto.py``): replies as binary frames, the hits as columns
-    the front encodes itself, anything else encoded here."""
+    the front encodes itself, anything else encoded here. ``proto`` 2 (an S3B2 connection, opt-in): the hits go as
+    kind 3, unchecked, the front escaping the ids and writing the floats as Python does; and each reply of a batch is
+    sent as soon as it is encoded, not with the whole batch (plat-m25: every reply waited for its batch's encode)."""
+
+    def __init__(self, sock, proto: int = 1):
+        self.proto = proto
+        super().__init__(sock)
 
     def _bytes(self, msg) -> bytes:
         from . import hostpath
         hp = _hostpath()
-        if hp is not None:                                      # S3_HOSTPATH: the module writes the frames
+        if hp is not None and self.proto == 1:                  # S3_HOSTPATH: the module writes the frames
             return hp.reply(msg[1] if msg[0] == "multi" else [msg])
-        return hostpath.reply_frame(msg)
+        return hostpath.reply_frame(msg, self.proto)
 
     def _writer(self) -> None:
         while True:
@@ -184,9 +190,11 @@ class _BinConn(_Conn):
             if msg is None:
                 return
             try:
-                data = self._bytes(msg)
-                with self.lock:
-                    self.sock.sendall(data)
+                parts = msg[1] if self.proto == 2 and msg[0] == "multi" else [msg]
+                for m in parts:                                 # S3B2: one send per reply, as it is ready
+                    data = self._bytes(m)
+                    with self.lock:
+                        self.sock.sendall(data)
             except OSError:
                 return
             _account("writer")
@@ -269,8 +277,8 @@ class GpuServer:
         first = _read_into(sock, 4)
         if first is None:
             return sock.close()
-        if bytes(first) == b"S3B1":                              # a native front (serving/binproto.py)
-            return self._bin_reader(sock)
+        if bytes(first) in (b"S3B1", b"S3B2"):                  # a native front (serving/binproto.py)
+            return self._bin_reader(sock, 2 if bytes(first) == b"S3B2" else 1)
         conn = _Conn(sock)
         pending = bytes(first)
         try:
@@ -300,9 +308,9 @@ class GpuServer:
             except OSError:
                 pass
 
-    def _bin_reader(self, sock: socket.socket) -> None:
+    def _bin_reader(self, sock: socket.socket, proto: int = 1) -> None:
         from . import binproto
-        conn = _BinConn(sock)
+        conn = _BinConn(sock, proto)
         try:
             while True:
                 head = _read_into(sock, 4)

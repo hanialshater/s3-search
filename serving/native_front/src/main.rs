@@ -40,7 +40,13 @@ struct Front {
 
 async fn connect(path: &str) -> std::io::Result<Arc<Gpu>> {
     let mut s = UnixStream::connect(path).await?;
-    s.write_all(b"S3B1").await?;
+    // S3_SERVING_BINPROTO=2 (opt-in, S6-22s): open S3B2, so the GPU process sends kind 3 replies and each reply alone
+    let magic: &[u8; 4] = if std::env::var("S3_SERVING_BINPROTO").map(|v| v.trim() == "2").unwrap_or(false) {
+        b"S3B2"
+    } else {
+        b"S3B1"
+    };
+    s.write_all(magic).await?;
     let (mut rd, mut wr) = s.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let gpu = Arc::new(Gpu { tx, pending: Mutex::new(HashMap::new()), inflight: AtomicUsize::new(0) });
@@ -155,7 +161,11 @@ fn render(payload: &[u8]) -> Option<(u16, Vec<u8>, serde_json::Value)> {
     let post = meta.get("post")?.as_str()?.as_bytes();
     let mut out = Vec::with_capacity(pre.len() + post.len() + blk.h * 64 + 2);
     out.extend_from_slice(pre);
-    encode::encode_hits(&blk, &mut out);
+    if kind == 3 {                                              // S3B2: unchecked ids and floats, written as Python does
+        encode::encode_hits3(&blk, &mut out)?;
+    } else {
+        encode::encode_hits(&blk, &mut out);
+    }
     out.extend_from_slice(post);
     Some((200, out, meta))
 }

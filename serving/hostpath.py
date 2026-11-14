@@ -66,11 +66,12 @@ def parse_body(body: bytes):
         raise BadJSON(f"body is not JSON: {exc}") from None
 
 
-def reply_frame(msg) -> bytes:
-    """One reply message as binproto frames (what ``_BinConn`` wrote before the seam)."""
+def reply_frame(msg, proto: int = 1) -> bytes:
+    """One reply message as binproto frames (what ``_BinConn`` wrote before the seam). ``proto`` 2 (S3B2): the hits as
+    kind 3 (``binproto.columnar3``: unchecked; the front escapes and formats)."""
     from .encode import encode
     if msg[0] == "multi":
-        return b"".join(reply_frame(m) for m in msg[1])
+        return b"".join(reply_frame(m, proto) for m in msg[1])
     if msg[0] == "search" and msg[2] == "ok":
         _, id_, _, resp, version, queue_ms, *rest = msg
         meta = {"version": f"{version[0]}:{version[1]}", "queue_ms": round(float(queue_ms), 3),
@@ -82,7 +83,8 @@ def reply_frame(msg) -> bytes:
             meta["post_ms"] = round((_t.perf_counter() - float(rest[2])) * 1000.0, 3)
         if len(rest) > 3 and rest[3] is not None:              # the reader's parse of the request frame
             meta["parse_ms"] = round(float(rest[3]), 3)
-        return binproto.columnar(id_, resp, meta) or binproto.whole(id_, 200, encode(resp), meta)
+        col = binproto.columnar3 if proto == 2 else binproto.columnar
+        return col(id_, resp, meta) or binproto.whole(id_, 200, encode(resp), meta)
     if msg[0] == "search":                                  # ("search", id, "error", status, body)
         return binproto.whole(msg[1], msg[3], json.dumps(msg[4], separators=(",", ":")).encode())
     _, id_, status, body, ctype, headers = msg               # ("call", ...)
