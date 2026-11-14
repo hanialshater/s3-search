@@ -398,6 +398,13 @@ def build_loadgen() -> dict:
     return _LOADGEN
 
 
+def _aiohttp_accept_encoding() -> str:
+    """What the installed aiohttp sends as Accept-Encoding (the steward: the native client sends aiohttp's headers)."""
+    from aiohttp.client_reqrep import ClientRequest
+    from aiohttp import hdrs
+    return str(ClientRequest.DEFAULT_HEADERS.get(hdrs.ACCEPT_ENCODING, "gzip, deflate"))
+
+
 def _bodies_file(bodies) -> str:
     """The request bodies, length-prefixed, for the native client (the same bytes aiohttp sends)."""
     import struct
@@ -419,7 +426,7 @@ def _load_native(url, bodies, rate, duration, client_cpus, t0):
            _bodies_file(bodies), "--rate", repr(float(rate)), "--duration", repr(float(duration)), "--t0", repr(t0),
            "--threads", str(len(client_cpus)), "--out", out, "--records", rec, "--sample-every", str(SAMPLE_EVERY),
            "--sample-bodies", ",".join(map(str, sorted(SAMPLE_BODIES))), "--samples-dir", SAMPLES,
-           "--timeout", repr(TIMEOUT_S)]
+           "--timeout", repr(TIMEOUT_S), "--accept-encoding", _aiohttp_accept_encoding()]
     pr = subprocess.Popen(cmd)
     deadline = time.time() + duration + TIMEOUT_S + 120
     while True:

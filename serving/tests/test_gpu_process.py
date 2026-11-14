@@ -277,7 +277,8 @@ def test_timing_headers_include_the_batch_time(built, front):
     try:
         st, _, h = _http("POST", f"http://127.0.0.1:{port}/indexes/toy/_search", REQS[0])
         assert st == 200
-        q, s, b = (float(h[k]) for k in ("X-S3-Queue-Ms", "X-S3-Serve-Ms", "X-S3-Batch-Ms"))
+        h = {k.lower(): v for k, v in h.items()}               # header names are case-insensitive (hyper: lower)
+        q, s, b = (float(h[k]) for k in ("x-s3-queue-ms", "x-s3-serve-ms", "x-s3-batch-ms"))
         assert q >= 0 and b > 0 and s >= b, h
     finally:
         assert _stop(p) == 0

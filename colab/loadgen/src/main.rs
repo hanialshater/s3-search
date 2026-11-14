@@ -2,7 +2,7 @@
 //! `_client_proc`), so the client is not the limit above 2,400 QPS. Development only.
 //!
 //!     s3-loadgen --url URL --bodies FILE --rate R --duration D --t0 EPOCH --threads N --out FILE --records FILE
-//!                [--sample-every K] [--sample-bodies a,b] [--samples-dir DIR] [--timeout S]
+//!                [--sample-every K] [--sample-bodies a,b] [--samples-dir DIR] [--timeout S] [--accept-encoding E]
 //!
 //! As the aiohttp client: request i (0 .. rate*duration) carries body i % len(bodies) and is due at t0 + i/rate (wall
 //! clock, epoch seconds); it is sent when due without waiting for any reply (open loop); its latency is from its due
@@ -99,6 +99,7 @@ fn main() {
         arg("--sample-bodies").unwrap_or_default().split(',').filter_map(|x| x.trim().parse().ok()).collect());
     let samples_dir = Arc::new(arg("--samples-dir").unwrap_or_else(|| "/content/fair-samples".into()));
     let timeout = Duration::from_secs_f64(arg("--timeout").and_then(|x| x.parse().ok()).unwrap_or(10.0));
+    let accept_encoding = Arc::new(arg("--accept-encoding").unwrap_or_else(|| "gzip, deflate".into()));
     let n_total = (rate * duration) as u64;
     let rate_tag = rate as u64;
 
@@ -123,11 +124,13 @@ fn main() {
             let client = client.clone();
             let url = url.clone();
             let dir = samples_dir.clone();
+            let enc = accept_encoding.clone();
             handles.push(tokio::spawn(async move {
                 // aiohttp's request headers but for the client name (the steward's condition): Host and
-                // Content-Length are set by hyper as by aiohttp; Accept and Accept-Encoding are aiohttp's defaults.
+                // Content-Length are set by hyper as by aiohttp; Accept is aiohttp's default and Accept-Encoding the
+                // value the installed aiohttp sends (fair_bench passes it: gzip, deflate, br with brotli installed).
                 let req = Request::post(url).header("Content-Type", "application/json").header("Accept", "*/*")
-                    .header("Accept-Encoding", "gzip, deflate").header("User-Agent", "s3-loadgen/0.1")
+                    .header("Accept-Encoding", enc.as_str()).header("User-Agent", "s3-loadgen/0.1")
                     .body(Full::new(body)).unwrap();
                 let fut = async {
                     let resp = client.request(req).await?;
