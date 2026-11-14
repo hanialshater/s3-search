@@ -33,10 +33,15 @@ except Exception:  # noqa: BLE001
 
 BLOCK = 2048
 MIN_K = 256
+WIDE_N = 65_536     # S6-27: on rows at least this wide the kernel serves any k (the facets' top buckets, k ~10)
 
 
-def wanted(b, k: int) -> bool:
-    return k >= MIN_K and os.environ.get("S3_TRITON_TOPK", "1") != "0" and triton_gate.supported(b)   # on by default
+def wanted(b, k: int, n: int = 0) -> bool:
+    """On by default where the gate allows, for k at least ``MIN_K``, or any k on rows of at least ``WIDE_N`` (S6-27:
+    the int64-key top-k's radix select over a wide row, such as a facet's counts, costs more than the threshold and
+    two passes even for a small k)."""
+    return ((k >= MIN_K or n >= WIDE_N) and k >= 1 and os.environ.get("S3_TRITON_TOPK", "1") != "0"
+            and triton_gate.supported(b))
 
 
 if triton is not None:
