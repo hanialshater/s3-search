@@ -7,12 +7,14 @@ out. The kernel reads the mask and the codes once: each program takes one query 
 the counts equal the torch path's exactly (summed in int32, at most N, returned as int64 as ``bincount`` does), and
 run to run.
 
-Used on cuda when ``triton`` imports and ``S3_TRITON_FACETS`` is "1"; the torch path stays the default until it is
+Used on cuda when ``S3_TRITON_FACETS`` is "1" and ``triton_gate.supported`` (Triton imports, at the tested version, on a GPU class that passed); the torch path stays the default until it is
 measured faster on the A100.
 """
 from __future__ import annotations
 
 import os
+
+from . import triton_gate
 
 try:
     import triton
@@ -25,7 +27,7 @@ BLOCK = 1024
 
 
 def wanted(b) -> bool:
-    return triton is not None and getattr(b, "name", "") == "cuda" and os.environ.get("S3_TRITON_FACETS", "0") == "1"
+    return os.environ.get("S3_TRITON_FACETS", "0") == "1" and triton_gate.supported(b)
 
 
 if triton is not None:

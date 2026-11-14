@@ -12,6 +12,17 @@ from referee import checks, loader
 pytestmark = pytest.mark.skipif(TT.triton is None or "cuda" not in available_devices(), reason="needs Triton and cuda")
 
 
+@pytest.fixture(autouse=True)
+def _any_gpu_class(monkeypatch):
+    """Run the kernel on whatever GPU this is (the gate's list is what these tests decide), and count its calls, so a
+    test cannot pass by falling back to the torch path."""
+    monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    calls = []
+    real = getattr(TT, "topk")
+    monkeypatch.setattr(TT, "topk", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    return calls
+
+
 def _cases(rng):
     for Q, N in ((1, 300), (4, 5000), (16, 70_000), (3, 4097)):
         for kind in ("ties", "negatives", "zeros", "dense"):
@@ -32,7 +43,7 @@ def _cases(rng):
                     yield x, valid, k
 
 
-def test_triton_topk_equals_the_key_topk(monkeypatch):
+def test_triton_topk_equals_the_key_topk(monkeypatch, _any_gpu_class):
     import torch
     b = get_backend("cuda")
     rng = np.random.default_rng(0)
@@ -45,9 +56,10 @@ def test_triton_topk_equals_the_key_topk(monkeypatch):
             gi, gv = b.topk(b.asarray(x, "float32"), k, vv)
             assert torch.equal(gi, wi), (x.shape, k)
             assert torch.equal(gv.view(torch.int32), wv.view(torch.int32)), (x.shape, k)
+    assert _any_gpu_class, "the Triton kernel never ran"
 
 
-def test_deep_responses_unchanged(monkeypatch):
+def test_deep_responses_unchanged(monkeypatch, _any_gpu_class):
     from engine import api
     ds = loader.load_dataset("toy")
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
@@ -58,6 +70,7 @@ def test_deep_responses_unchanged(monkeypatch):
     got = [api.expand_hits(r) for r in ix.search_batch(reqs, hits="columns", ids="bytes")]
     strip = lambda r: {k: v for k, v in r.items() if k != "took_ms"}  # noqa: E731
     assert [strip(r) for r in got] == [strip(r) for r in want]
+    assert _any_gpu_class, "the Triton kernel never ran"
 
 
 def test_off_by_default():

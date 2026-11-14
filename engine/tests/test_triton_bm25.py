@@ -13,8 +13,19 @@ from referee import loader
 pytestmark = pytest.mark.skipif(TB.triton is None or "cuda" not in available_devices(), reason="needs Triton and cuda")
 
 
+@pytest.fixture(autouse=True)
+def _any_gpu_class(monkeypatch):
+    """Run the kernel on whatever GPU this is (the gate's list is what these tests decide), and count its calls, so a
+    test cannot pass by falling back to the torch path."""
+    monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    calls = []
+    real = getattr(TB, "segment_sum_and_count")
+    monkeypatch.setattr(TB, "segment_sum_and_count", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    return calls
+
+
 @pytest.mark.parametrize("limit", [10**9, 150, 25])          # one chunk, and chunks that cut the batch
-def test_triton_sum_equals_the_torch_path(limit, monkeypatch):
+def test_triton_sum_equals_the_torch_path(limit, monkeypatch, _any_gpu_class):
     import torch
     from engine import api
     from engine.analysis import analyze
@@ -45,6 +56,7 @@ def test_triton_sum_equals_the_torch_path(limit, monkeypatch):
     for q in (0, 5, len(terms) - 1):
         sa, na = run(True, [terms[q]])
         assert np.array_equal(sa[0], s1[q]) and np.array_equal(na[0], n1[q])
+    assert _any_gpu_class, "the Triton kernel never ran"
 
 
 def test_off_by_default_and_never_on_cpu():

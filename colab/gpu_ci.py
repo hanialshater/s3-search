@@ -22,6 +22,11 @@ SUITES = [  # (name, pytest targets, hard limit in seconds)
     ("referee fast", None, 900),
     ("engine tests", ["engine/tests"], 1200),
     ("serving tests", ["serving/tests"], 600),       # the platform-engineer's suggestion: serving on cuda too
+    # S6-18: the Triton kernel tests again, verbose, and failed if any is skipped: a GPU class passes only if every
+    # kernel test ran on it. Then each kernel's first-call (compile) time, in a fresh process with an empty cache.
+    ("triton tests", ["engine/tests/test_triton_bm25.py", "engine/tests/test_triton_topk.py",
+                      "engine/tests/test_triton_facets.py", "engine/tests/test_triton_fallback.py"], 600),
+    ("triton first call", "colab/triton_first_call.py", 600),
 ]
 
 
@@ -38,6 +43,11 @@ def heartbeat(stop, label, t0):
 def run_suite(name, targets, limit):
     if targets is None:
         cmd = [sys.executable, "-u", "-m", "referee", "fast", "-o", "faulthandler_timeout=120", "--durations=10"]
+    elif isinstance(targets, str):
+        cmd = [sys.executable, "-u", targets, "/content/triton-first-call.json"]
+    elif name == "triton tests":
+        cmd = [sys.executable, "-u", "-m", "pytest", "-v", "-p", "no:cacheprovider", "-o", "faulthandler_timeout=120",
+               "-rfEs", *targets]
     else:
         cmd = [sys.executable, "-u", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-o", "faulthandler_timeout=120",
                "--durations=10", "-rfE", *targets]
@@ -54,6 +64,9 @@ def run_suite(name, targets, limit):
     text = open(log).read()
     print(f"[gpu-ci] {name}: exit {rc} in {took} s (limit {limit} s)", flush=True)
     print(text[-5000:], flush=True)
+    if name == "triton tests" and " SKIPPED" in text:
+        print("[gpu-ci] triton tests: a kernel test was skipped, so this GPU class is not shown to pass", flush=True)
+        return False, took
     return rc == 0, took
 
 
@@ -77,6 +90,10 @@ def main():
     devices = subprocess.run([sys.executable, "-c", "from engine import api; print(api.available_devices())"],
                              capture_output=True, text=True).stdout.strip()
     print(f"[gpu-ci] {REF} at {commit} on {gpu or 'no GPU'}; devices {devices}", flush=True)
+    versions = subprocess.run([sys.executable, "-c", "import torch, triton; print('torch', torch.__version__, 'triton', "
+                               "triton.__version__, 'capability', torch.cuda.get_device_capability())"],
+                              capture_output=True, text=True)
+    print(f"[gpu-ci] {(versions.stdout or versions.stderr).strip()[-300:]}", flush=True)
     if "cuda" not in devices:
         print("[gpu-ci] FAILED: cuda is not available, so this run would test nothing new", flush=True)
         return 1

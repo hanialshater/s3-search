@@ -12,7 +12,18 @@ from referee import checks, loader
 pytestmark = pytest.mark.skipif(TF.triton is None or "cuda" not in available_devices(), reason="needs Triton and cuda")
 
 
-def test_counts_equal_the_torch_path(monkeypatch):
+@pytest.fixture(autouse=True)
+def _any_gpu_class(monkeypatch):
+    """Run the kernel on whatever GPU this is (the gate's list is what these tests decide), and count its calls, so a
+    test cannot pass by falling back to the torch path."""
+    monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    calls = []
+    real = getattr(TF, "bincount_rows")
+    monkeypatch.setattr(TF, "bincount_rows", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    return calls
+
+
+def test_counts_equal_the_torch_path(monkeypatch, _any_gpu_class):
     import torch
     b = get_backend("cuda")
     rng = np.random.default_rng(0)
@@ -26,9 +37,10 @@ def test_counts_equal_the_torch_path(monkeypatch):
         again = b.bincount_rows(codes, mask, n)
         assert got.dtype == want.dtype == torch.int64
         assert torch.equal(got, want) and torch.equal(again, want)
+    assert _any_gpu_class, "the Triton kernel never ran"
 
 
-def test_facet_responses_unchanged(monkeypatch):
+def test_facet_responses_unchanged(monkeypatch, _any_gpu_class):
     from engine import api
     ds = loader.load_dataset("toy")
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
@@ -40,6 +52,7 @@ def test_facet_responses_unchanged(monkeypatch):
     got = ix.search_batch(reqs)
     strip = lambda r: {k: v for k, v in r.items() if k != "took_ms"}  # noqa: E731
     assert [strip(r) for r in got] == [strip(r) for r in want]
+    assert _any_gpu_class, "the Triton kernel never ran"
 
 
 def test_off_by_default():

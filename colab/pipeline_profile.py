@@ -3,6 +3,7 @@
 
     colab run --gpu A100 --timeout 900 colab/pipeline_profile.py [branch-or-commit] [--queries=1000]
         [--runtime=engine[,auto,...]]  (the pipeline is measured once per ranker runtime)
+        [--deep=1 [--triton=1]] [--torch-profile=1] [--plan-cache=0]
 
 The pipeline is the prototype's (S6): tuned BM25F and dense retrieval (tfidf-svd-128), RRF over a 20,000 window, the
 GBDT ranker over the top 1,000, two terms facets and page 1. It reads only what members may read (referee/loader.py):
@@ -31,6 +32,11 @@ RUNTIMES = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--run
 # --torch-profile=1: after the throughput runs, one batch of 64 of each kind under torch.profiler (device time by
 # kernel, and the number of kernel launches and host syncs per request), to show where a batch's time goes.
 TORCH_PROFILE = any(a == "--torch-profile=1" for a in sys.argv[1:])
+# --plan-cache=N (S6-19): the per-state plan cache's size, S3_PLAN_CACHE, set before the engine is imported; 0 plans
+# every request (the steward's item 5: S6-18's kernel gain apart from S6-19's cache). Default: the engine's own.
+PLAN_CACHE = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--plan-cache=")), None)
+if PLAN_CACHE is not None:
+    os.environ["S3_PLAN_CACHE"] = str(int(PLAN_CACHE))
 BATCHES = (1, 16, 64, 128)
 S6_QPS, S6_P99_MS = 694, 35.0
 
@@ -197,6 +203,7 @@ def main():
     say(f"ranker: trained on 2,000 fit queries in {train_s:.1f} s")
     texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
     result = {"kind": "pipeline-profile", "label": "development only, never a score", "ref": REF, "commit": commit,
+              "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"),
               "runtime": env, "n_products": int(len(ds.catalogue)), "n_queries": len(texts),
               "build_s": build_s, "ranker_train_s": train_s, "ranker_runtime": RUNTIMES[0],
               "lexical": measure(index, lexical_request, texts, "lexical"),

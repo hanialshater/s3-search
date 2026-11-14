@@ -1,7 +1,10 @@
 # GPU nodes and Colab only (docs/decisions/2026-11-09-gpu-portable-backend.md,
 # docs/decisions/2026-11-10-s9-gpu-dependencies.md). CI uses requirements.txt alone.
 -r requirements.txt
-torch>=2.3
+# torch and Triton move together: the Triton kernels (engine/backend/triton_*.py) are tested with this pair, and
+# engine/backend/triton_gate.py runs them only with Triton TESTED_TRITON (else the torch path, same results).
+torch>=2.14,<2.15
+triton>=3.8,<3.9
 --extra-index-url https://pypi.nvidia.com
 cupy-cuda12x>=13
 xgboost>=2.1
