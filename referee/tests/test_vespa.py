@@ -48,7 +48,7 @@ def test_convert_and_v1():
 
 
 def test_build_checks_the_corpus(monkeypatch):
-    cat = pd.DataFrame({"product_id": ["a", "b", "c"], "product_title": ["t a", "t b", None]})
+    cat = pd.DataFrame({"product_id": ["a", "b", "c"], "product_title": ["t a", "t\x08b", None]})
     store = {"a": "t a", "b": "t b", "c": ""}
     calls = []
 
@@ -77,3 +77,8 @@ def test_full_refuses_bm25_for_vespa(tmp_path, capsys):
     p.write_text(json.dumps({"k1": 0.5}))
     assert full.main(["--dataset=toy", "--engine=vespa", f"--bm25={p}", f"--out={tmp_path / 'r.json'}"]) == 2
     assert "vespa" in capsys.readouterr().err
+
+
+def test_vespa_text_matches_the_feed():
+    assert vs.vespa_text("a\x08b\x18c\td\ne\uffff") == "a b c\td\ne "
+    assert vs.vespa_text("plain") == "plain"
