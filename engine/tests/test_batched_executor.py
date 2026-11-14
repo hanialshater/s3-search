@@ -113,7 +113,8 @@ def test_host_transfers_do_not_grow_with_the_batch(ds):
             ix.search_batch(reqs)
         finally:
             undo()
-        assert len(calls) == 3, (n, len(calls))                # the pages and totals, and one per facet field
+        # the pages and totals, and one per facet field; on the fused route all of them in one (S6-34)
+        assert len(calls) in (1, 3), (n, len(calls))
 
 
 def test_features_equal_the_host_count_route(segment, catalogue, device):
