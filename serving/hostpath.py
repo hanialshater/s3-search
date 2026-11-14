@@ -75,6 +75,8 @@ def reply_frame(msg) -> bytes:
         _, id_, _, resp, version, queue_ms, *rest = msg
         meta = {"version": f"{version[0]}:{version[1]}", "queue_ms": round(float(queue_ms), 3),
                 "batch": rest[0] if rest else 1}
+        if len(rest) > 1 and rest[1] is not None:              # S6-22s: X-S3-Batch-Ms on the native front
+            meta["batch_ms"] = round(float(rest[1]), 3)
         return binproto.columnar(id_, resp, meta) or binproto.whole(id_, 200, encode(resp), meta)
     if msg[0] == "search":                                  # ("search", id, "error", status, body)
         return binproto.whole(msg[1], msg[3], json.dumps(msg[4], separators=(",", ":")).encode())

@@ -206,6 +206,9 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
             .header("X-S3-Gpu-Process", gi.to_string())
             .header("X-S3-Index-Version", meta.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string())
             .header("X-S3-Batch-Size", meta.get("batch").map(|v| v.to_string()).unwrap_or_else(|| "1".into()));
+        if let Some(b) = meta.get("batch_ms").and_then(|v| v.as_f64()) {   // S6-22s: the GPU process's batch time
+            rb = rb.header("X-S3-Batch-Ms", format!("{:.3}", b));
+        }
     }
     Ok(rb.body(Full::new(Bytes::from(out))).unwrap())
 }
