@@ -7,6 +7,11 @@ from engine.backend import available_devices, get_backend
 TORCH = [d for d in available_devices() if d != "cpu"]
 
 
+@pytest.fixture(autouse=True)
+def _torch_path(monkeypatch):
+    monkeypatch.setenv("S3_TRITON_TOPK", "0")       # S6-18c: this tests the int64-key top-k, not the Triton one
+
+
 def _tie_pass_topk(torch, s, k, valid):
     """The previous torch top-k (kth value, cumsum over ties, nonzero, stable sort), the reference."""
     s = s.to(torch.float32)

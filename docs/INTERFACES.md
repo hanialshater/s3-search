@@ -77,6 +77,17 @@ Decision record: `docs/decisions/2026-11-09-gpu-portable-backend.md`.
   way. It is off by default: on an A100 at depth 2,000 it saved no host CPU (the process was busy with its own work,
   not waiting) and added about 0.3 ms to a single request (the profile at 3bfeea4).
 
+- **Triton kernels (S6-18, on by default since S6-18c, 2026-11-14, the founder's decision; architect).** On cuda, BM25F's
+  per-(query, doc) sum and the top-k (k at least 256) run as Triton kernels (`engine/backend/triton_bm25.py`,
+  `triton_topk.py`). Each gives the torch path's results bit for bit (the same float64 adds in the same order; the
+  same selection and order), so responses do not change. They run only where `engine/backend/triton_gate.py` allows:
+  Triton imports at the tested version (3.8, pinned with torch 2.14 in `requirements-gpu.txt`) on a GPU class whose
+  GPU CI passed (A100 8.0, L4 8.9, G4 12.0). Anywhere else (CPU, an H100, a T4, another Triton) the torch path runs.
+  **Opt-out:** `S3_TRITON_BM25=0`, `S3_TRITON_TOPK=0`. The facet histogram kernel stays opt-in
+  (`S3_TRITON_FACETS=1`) until its A100 measurement holds. `S3_TRITON_CAPABILITIES` (a list such as `9.0,12.0`, or
+  `any`) overrides the GPU classes, for development and GPU CI only. `engine.backend.triton_gate.effective(b)` says
+  which kernels a backend would use, for provenance.
+
 ## 1. Datasets (evaluation-steward → everyone)
 
 Served only through `referee/loader.py`; nobody reads ESCI files any other way, and nobody loads test judgments.
@@ -1141,3 +1152,6 @@ status:
   writes the same bytes (section 7); `orjson` is added to `requirements.txt`.
 - 2026-11-13, platform-engineer (S6-15s, the plat-m8 mismatch): responses through a front carry `X-S3-Gpu-Process`,
   `X-S3-Index-Version` and `X-S3-Batch-Size`, and `X-S3-Route-Gpu` routes a replay (section 7). Additive.
+- 2026-11-14, architect (S6-18c): the Triton BM25F sum and top-k are on by default on cuda where the gate allows
+  (A100, L4, G4 with Triton 3.8); `S3_TRITON_BM25=0` and `S3_TRITON_TOPK=0` turn them off; results unchanged
+  (section 0). The founder's decision.

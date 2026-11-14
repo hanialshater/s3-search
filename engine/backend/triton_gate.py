@@ -10,7 +10,8 @@ there. So a kernel runs only where all of these hold, and otherwise the torch pa
   tests (``colab/gpu_ci.py``). A capability not listed falls back.
 
 ``S3_TRITON_CAPABILITIES`` overrides the list for development (for example "9.0" to try an H100 in GPU CI, or "any").
-The per-kernel flags (``S3_TRITON_BM25`` and the rest) still decide whether a kernel is wanted at all.
+The per-kernel flags still decide whether a kernel is wanted at all: ``S3_TRITON_BM25`` and ``S3_TRITON_TOPK`` are on
+unless "0" (S6-18c, the founder's decision); ``S3_TRITON_FACETS`` is off unless "1".
 """
 from __future__ import annotations
 
@@ -62,3 +63,19 @@ def supported(b) -> bool:
         import torch
         index = torch.cuda.current_device()
     return _allowed(_capability(index))
+
+
+def effective(b) -> dict:
+    """Which Triton kernels backend ``b`` would use now, for provenance (a score's record): the kernels on, the Triton
+    version, and the GPU's capability (None off cuda)."""
+    from . import triton_bm25, triton_facets, triton_topk
+    cap = None
+    if triton is not None and getattr(b, "name", "") == "cuda":
+        dev = getattr(b, "device", None)
+        index = getattr(dev, "index", None)
+        if index is None:
+            import torch
+            index = torch.cuda.current_device()
+        cap = list(_capability(index))
+    return {"bm25": bool(triton_bm25.wanted(b)), "topk": bool(triton_topk.wanted(b, triton_topk.MIN_K)),
+            "facets": bool(triton_facets.wanted(b)), "triton": getattr(triton, "__version__", None), "capability": cap}
