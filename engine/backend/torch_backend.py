@@ -227,7 +227,7 @@ class TorchBackend:
             return (torch.full((Q, k), -1, dtype=torch.int32, device=self.device),
                     torch.full((Q, k), float("-inf"), device=self.device))
         from . import triton_topk as TT
-        if TT.wanted(self, k):                            # S6-18: a float32 threshold and a Triton compaction
+        if TT.wanted(self, k, N):                         # S6-18: a float32 threshold and a Triton compaction
             return TT.topk(s, k)
         # S6-14: one top-k over a unique int64 key, (the score's order-preserving bits, then N-1-index), so the
         # order is score descending, then index ascending, with no tie pass (the kth value, a cumsum over the row,
