@@ -38,11 +38,16 @@ def _requests(ds):
     return out
 
 
-def test_off_by_default(monkeypatch):
+def test_on_by_default_where_the_gate_allows(monkeypatch):
     monkeypatch.delenv("S3_TRITON_FUSED_LEXICAL", raising=False)
-    assert TF.mode(get_backend("cpu")) is None
-    monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "1")
     assert TF.mode(get_backend("cpu")) is None                                  # the kernel: cuda only
+    if TF.triton is not None and "cuda" in available_devices():
+        monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+        assert TF.mode(get_backend("cuda")) == "kernel"                         # S6-26: on by default
+        monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "0")
+        assert TF.mode(get_backend("cuda")) is None
+    monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "1")
+    assert TF.mode(get_backend("cpu")) is None
     monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "reference")
     assert TF.mode(get_backend("cpu")) == "reference"
 
@@ -51,7 +56,7 @@ def test_off_by_default(monkeypatch):
 def test_fused_reference_gives_todays_responses(ds, device, monkeypatch):
     ix = api.build_index(ds.catalogue, ds.mapping, device=device)
     reqs = _requests(ds)
-    monkeypatch.delenv("S3_TRITON_FUSED_LEXICAL", raising=False)
+    monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "0")                          # the unfused path
     want = [_strip(r) for r in ix.search_batch(reqs)]
     want_cols = [_strip(r) for r in ix.search_batch(reqs, hits="columns", ids="bytes")]
     monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "reference")
@@ -99,7 +104,7 @@ def test_kernel_responses_equal_todays(ds, monkeypatch):
     monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
     reqs = _requests(ds)
-    monkeypatch.delenv("S3_TRITON_FUSED_LEXICAL", raising=False)
+    monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "0")                          # the unfused path
     want = [_strip(r) for r in ix.search_batch(reqs, hits="columns", ids="bytes")]
     monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "1")
     calls = []

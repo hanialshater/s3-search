@@ -275,6 +275,7 @@ def main():
     if DEEP:
         # "deep" is the torch path (the Triton kernels are on by default since S6-18c, so turn them off here)
         os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "0", "0"
+        os.environ["S3_TRITON_FUSED_LEXICAL"] = "0"         # S6-26: the deep figures are the unfused paths
         result["deep"] = measure(index, deep_request, texts, "deep", {"hits": "columns", "ids": "bytes"})
         b = index._st.b
         if hasattr(b, "blocking_sync"):                    # S6-15: the same with the other kind of host wait
