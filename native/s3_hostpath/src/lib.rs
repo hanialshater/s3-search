@@ -420,7 +420,7 @@ impl HostIndex {
     }
 
     /// The batch's kernel inputs (see the module docs). Returns a dict:
-    /// - `fallback`: the positions Python must serve;
+    /// - `fallback`: the positions Python must serve; `eligible`: the served ones, in chunk order;
     /// - `ints` and `floats`: little-endian int64 and float32 byte blocks;
     /// - `chunks`: one per kernel call, each with `positions`, `int_at`, `int_len` (row_start, row_len, q_lo, q_hi,
     ///   msm, facet offsets, facet sizes, row_term), `float_at` (w, b, 1 - b per text field, then a boost per query),
@@ -450,6 +450,7 @@ impl HostIndex {
         }
         let mut ints: Vec<i64> = Vec::new();
         let mut floats: Vec<f32> = Vec::new();
+        let mut eligible: Vec<usize> = Vec::new(); // the served positions in chunk order: search_prepared's order
         let chunks = PyList::empty_bound(py);
         for (g, mem) in members.iter().enumerate() {
             for ch in mem.chunks(BATCH_ROWS) {
@@ -506,6 +507,7 @@ impl HostIndex {
                 let d = PyDict::new_bound(py);
                 d.set_item("group", g)?;
                 d.set_item("positions", ch.iter().map(|&k| planned[k].pos).collect::<Vec<_>>())?;
+                eligible.extend(ch.iter().map(|&k| planned[k].pos));
                 d.set_item("int_at", int_at)?;
                 d.set_item("int_len", int_len)?;
                 d.set_item("float_at", float_at)?;
@@ -530,6 +532,7 @@ impl HostIndex {
         let fb: Vec<u8> = floats.iter().flat_map(|x| x.to_le_bytes()).collect();
         out.set_item("ints", PyBytes::new_bound(py, &ib))?;
         out.set_item("floats", PyBytes::new_bound(py, &fb))?;
+        out.set_item("eligible", &eligible)?;
         out.set_item("chunks", chunks)?;
         out.set_item("n_text_fields", self.text_fields.len())?;
         Ok(out)

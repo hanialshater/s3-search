@@ -130,7 +130,8 @@ def prepare_reference(st, payloads, words=None):
                            "from": [info[pos][0].from_ for pos in ch], "size": [info[pos][0].size for pos in ch],
                            "aggs": [[(a.name, a.field, a.size) for a in info[pos][0].aggs] for pos in ch],
                            "n_terms": [sum(1 for t in info[pos][0].root.terms if t in part.vocab) for pos in ch]})
-    return {"fallback": fallback, "ints": struct.pack(f"<{len(ints)}q", *ints),
+    return {"fallback": fallback, "eligible": [p for c in chunks for p in c["positions"]],
+            "ints": struct.pack(f"<{len(ints)}q", *ints),
             "floats": np.asarray(floats, np.float32).astype("<f4").tobytes(), "chunks": chunks, "n_text_fields": F}
 
 

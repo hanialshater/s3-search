@@ -231,10 +231,10 @@ def hostpath_runs(index, texts):
         for i in range(0, 256, 64):
             prep = hi.prepare(bodies[i:i + 64])
             got = index.search_prepared(prep, **kw)
-            want = index.search_batch([reqs[i + p] for p in sorted(got)], **kw)
-            for p, w in zip(sorted(got), want):
+            want = index.search_batch([reqs[i + p] for p in prep["eligible"]], **kw)
+            for g, w in zip(got, want):
                 n += 1
-                a = {k: v for k, v in expand_hits(got[p]).items() if k != "took_ms"}
+                a = {k: v for k, v in expand_hits(g).items() if k != "took_ms"}
                 c = {k: v for k, v in expand_hits(w).items() if k != "took_ms"}
                 differ += a != c
         res[f"{kind}_responses_differ"] = {"of": n, "differ": differ}

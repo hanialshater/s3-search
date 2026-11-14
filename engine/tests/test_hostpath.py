@@ -90,11 +90,12 @@ def test_search_prepared_gives_search_batchs_responses(device):
     except ImportError:
         pass
     for prep in preps:
+        positions = prep["eligible"]
         got = ix.search_prepared(prep, hits="columns", ids="bytes")
-        assert got and set(got).isdisjoint(prep["fallback"])
-        positions = sorted(got)
+        assert positions and len(got) == len(positions) and set(positions).isdisjoint(prep["fallback"])
         want = ix.search_batch([json.loads(payloads[p]) for p in positions], hits="columns", ids="bytes")
-        assert [_strip(got[p]) for p in positions] == [_strip(r) for r in want]
+        assert [_strip(r) for r in got] == [_strip(r) for r in want]
         dicts = ix.search_prepared(prep, hits="dicts", ids="str")
         want_d = ix.search_batch([json.loads(payloads[p]) for p in positions])
-        assert [_strip(dicts[p]) for p in positions] == [_strip(r) for r in want_d]
+        assert [_strip(r) for r in dicts] == [_strip(r) for r in want_d]
+        assert sorted(positions + list(prep["fallback"])) == list(range(len(payloads)))
