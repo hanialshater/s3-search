@@ -42,3 +42,12 @@ def test_bench_scores_only_what_it_is_given():
 def test_template_fill():
     t = {"query": {"bool": {"must": [{"match": {"product_title": "{{query}}"}}], "filter": [{"term": {"x": 1}}]}}}
     assert bench.fill(t, "red lamp")["query"]["bool"]["must"][0]["match"]["product_title"] == "red lamp"
+
+
+def test_results_record_the_engine_switches(monkeypatch):
+    """S3_TRITON_BM25, S3_PLAN_CACHE and S3_CUDA_BLOCKING_SYNC are recorded as set, null when unset."""
+    from referee import bench as b
+    monkeypatch.setenv("S3_TRITON_BM25", "1")
+    monkeypatch.delenv("S3_PLAN_CACHE", raising=False)
+    monkeypatch.setenv("S3_CUDA_BLOCKING_SYNC", "0")
+    assert b.engine_env() == {"S3_TRITON_BM25": "1", "S3_PLAN_CACHE": None, "S3_CUDA_BLOCKING_SYNC": "0"}

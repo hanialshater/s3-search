@@ -20,6 +20,7 @@ def test_full_on_toy(tmp_path, monkeypatch):
     sub = r["quality_subsets"]["held_out"]
     assert 0 < sub["ndcg@10"] <= 1 and sub["n_ndcg@10"] == 4
     assert r["freshness"]["passed"] and all(r["gates"].values())
+    assert set(r["engine_env"]) == {"S3_TRITON_BM25", "S3_PLAN_CACHE", "S3_CUDA_BLOCKING_SYNC"}
 
 
 def test_development_mode_is_labelled_and_never_writes_results_json(tmp_path, capsys):
