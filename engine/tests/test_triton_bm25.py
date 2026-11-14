@@ -59,6 +59,10 @@ def test_triton_sum_equals_the_torch_path(limit, monkeypatch, _any_gpu_class):
     assert _any_gpu_class, "the Triton kernel never ran"
 
 
-def test_off_by_default_and_never_on_cpu():
-    assert not TB.wanted(get_backend("cuda"))                  # S3_TRITON_BM25 unset
+def test_on_by_default_off_with_0_and_never_on_cpu(monkeypatch):
+    monkeypatch.delenv("S3_TRITON_BM25", raising=False)
+    assert TB.wanted(get_backend("cuda"))                      # S6-18c: on by default where the gate allows
+    monkeypatch.setenv("S3_TRITON_BM25", "0")
+    assert not TB.wanted(get_backend("cuda"))
+    monkeypatch.delenv("S3_TRITON_BM25", raising=False)
     assert not TB.wanted(get_backend("cpu"))

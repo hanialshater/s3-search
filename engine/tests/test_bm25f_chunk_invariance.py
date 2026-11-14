@@ -13,9 +13,11 @@ from engine.ops import lexical as L
 from referee import loader
 
 
+@pytest.mark.parametrize("triton_bm25", ["0", "1"])          # S6-18c: the torch sum, and the kernel where it runs
 @pytest.mark.parametrize("device", available_devices())
 @pytest.mark.parametrize("limit", [10**9, 500, 150, 70, 25])
-def test_batched_scores_equal_alone_bit_for_bit_whatever_the_chunking(device, limit, monkeypatch):
+def test_batched_scores_equal_alone_bit_for_bit_whatever_the_chunking(device, limit, triton_bm25, monkeypatch):
+    monkeypatch.setenv("S3_TRITON_BM25", triton_bm25)
     from engine import api
     ds = loader.load_dataset("toy")
     ix = api.build_index(ds.catalogue, ds.mapping, device=device)

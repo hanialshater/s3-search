@@ -172,7 +172,8 @@ class TorchBackend:
         """S6-18: ``(segment_sum(q * N + docs, values), segment_count_where(...))`` for a chunk whose entries are its term
         rows one after another (each sorted by doc), summed by the Triton kernel in the rows' order: the same float64
         additions in the same order as the sort-based kernel, so the same bits. ``None`` when it does not apply
-        (no Triton, not cuda, ``S3_TRITON_BM25`` not "1", float32 accumulation), and the caller takes the torch path."""
+        (no Triton, not cuda, an unpassed GPU class, ``S3_TRITON_BM25=0``, float32 accumulation), and the caller takes the
+        torch path."""
         from . import triton_bm25 as TB
         if self.accumulate != "float64" or not TB.wanted(self):
             return None

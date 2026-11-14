@@ -122,3 +122,15 @@ def test_installed_triton_and_torch_are_the_pinned_ones():
     import torch
     assert G._version_ok(), f"Triton {G.triton.__version__} is not the tested {G.TESTED_TRITON}"
     assert torch.__version__.split("+")[0].startswith(_pin("torch") + "."), torch.__version__
+
+
+def test_effective_says_which_kernels_run(fake_gpu, monkeypatch):
+    for f in FLAGS:
+        monkeypatch.delenv(f, raising=False)
+    monkeypatch.delenv("S3_TRITON_CAPABILITIES", raising=False)
+    e = G.effective(fake_gpu(cap=(8, 0)))
+    assert (e["bm25"], e["topk"], e["facets"], e["capability"]) == (True, True, False, [8, 0])   # S6-18c defaults
+    monkeypatch.setenv("S3_TRITON_BM25", "0")
+    assert not G.effective(fake_gpu(cap=(8, 0)))["bm25"]
+    assert G.effective(fake_gpu(cap=(9, 0)))["topk"] is False                                  # an unpassed class
+    assert G.effective(get_backend("cpu"))["bm25"] is False

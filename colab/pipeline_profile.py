@@ -217,6 +217,8 @@ def main():
         say(f"pipeline with the ranker on runtime {rt!r} ({type(index.rankers['gbdt']).__name__})")
         result.setdefault("pipeline_by_runtime", {})[rt] = measure(index, pipeline_request, texts, f"pipeline/{rt}")
     if DEEP:
+        # "deep" is the torch path (the Triton kernels are on by default since S6-18c, so turn them off here)
+        os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "0", "0"
         result["deep"] = measure(index, deep_request, texts, "deep", {"hits": "columns", "ids": "bytes"})
         b = index._st.b
         if hasattr(b, "blocking_sync"):                    # S6-15: the same with the other kind of host wait
@@ -259,13 +261,19 @@ def main():
             result["deep_triton_topk_responses_differ"] = {"of": 256, "differ": differ}
             say(f"deep/triton+topk: {differ} of 256 responses differ from the torch path's")
             os.environ["S3_TRITON_BM25"], os.environ["S3_TRITON_TOPK"] = "0", "0"
+        os.environ.pop("S3_TRITON_BM25", None)               # back to the engine's defaults
+        os.environ.pop("S3_TRITON_TOPK", None)
     if TORCH_PROFILE:
         result["torch_profile"] = {}
         kinds = [("lexical", lexical_request), ("pipeline", pipeline_request)] + ([("deep", deep_request)] if DEEP else []) \
             + ([("deep_triton", deep_request), ("deep_triton_topk", deep_request)] if DEEP and TRITON else [])
         for label, make in kinds:
-            os.environ["S3_TRITON_BM25"] = "1" if label.startswith("deep_triton") else "0"
-            os.environ["S3_TRITON_TOPK"] = "1" if label == "deep_triton_topk" else "0"
+            if label.startswith("deep"):                     # deep: the torch path; deep_triton*: the kernels named
+                os.environ["S3_TRITON_BM25"] = "1" if label.startswith("deep_triton") else "0"
+                os.environ["S3_TRITON_TOPK"] = "1" if label == "deep_triton_topk" else "0"
+            else:                                            # lexical, pipeline: the engine's defaults
+                os.environ.pop("S3_TRITON_BM25", None)
+                os.environ.pop("S3_TRITON_TOPK", None)
             try:
                 result["torch_profile"][label] = torch_profile(
                     index, make, texts, label, kw={"hits": "columns", "ids": "bytes"} if label.startswith("deep") else None)
