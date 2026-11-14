@@ -148,23 +148,42 @@ def test_two_gpu_processes_are_read_only(built, single):
         assert _stop(p) == 0
 
 
-def test_binary_protocol_gives_the_same_bodies(built, single):
+BAD_BODIES = [b"", b"   ", b"{not json", b'{"query": '] # refused before the engine: 400, as the Python front
+
+
+def _raw_post(url, body):
+    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+@pytest.mark.parametrize("hostpath", ["0", "stub"])
+def test_binary_protocol_gives_the_same_bodies(built, single, hostpath):
     """S6-22s: on a connection opened with S3B1, a GPU process answers in serving/binproto.py's frames, and the
-    bodies decoded the way a native front must encode them equal one process's (but for took_ms)."""
+    bodies decoded the way a native front must encode them equal one process's (but for took_ms); the same with the
+    S3_HOSTPATH seam on its Python stub (serving/hostpath.py). A body that is not JSON gets the Python front's 400 on
+    the same connection, which stays open."""
     import socket as _socket
     import struct
     import tempfile
     from serving import binproto
     state = tempfile.mkdtemp(prefix="s3b-")
     port = _free_port()
-    p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"], {"S3_SERVING_STATE_DIR": state})
+    p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"],
+               {"S3_SERVING_STATE_DIR": state, "S3_HOSTPATH": hostpath})
+    sp = _free_port()
+    ps = _start(built, sp, [])                              # one process: what the Python front says to a bad body
     try:
+        want_bad = [_raw_post(f"http://127.0.0.1:{sp}/indexes/toy/_search", b) for b in BAD_BODIES]
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         s.connect(os.path.join(state, "gpu-0.sock"))
         s.sendall(binproto.MAGIC)
 
         def ask(i, req):
-            body = json.dumps(req).encode()
+            body = req if isinstance(req, bytes) else json.dumps(req).encode()
             name = b"toy"
             s.sendall(binproto.frame(struct.pack("<BQ", 1, i) + struct.pack("<H", len(name)) + name
                                      + struct.pack("<I", len(body)) + body))
@@ -186,9 +205,30 @@ def test_binary_protocol_gives_the_same_bodies(built, single):
                     body.replace(json.dumps(t1, separators=(",", ":")).encode(), b"")
             kinds.add("pre" in meta)
         assert kinds == {True, False}                     # some columnar (kind 1), some whole (kind 2)
+        for k, (bad, (ws, wb)) in enumerate(zip(BAD_BODIES, want_bad)):
+            id_, st, body, _ = ask(1000 + k, bad)
+            assert (id_, st) == (1000 + k, ws) and json.loads(body) == json.loads(wb), (bad, body, wb)
+        id_, st, _, _ = ask(2000, REQS[0])                 # the connection is still open
+        assert (id_, st) == (2000, 200)
+        mixed = list(REQS) + BAD_BODIES                     # pipelined, so they batch (explain, highlight alone)
+        for k, req in enumerate(mixed):
+            body = req if isinstance(req, bytes) else json.dumps(req).encode()
+            s.sendall(binproto.frame(struct.pack("<BQ", 1, 3000 + k) + struct.pack("<H", 3) + b"toy"
+                                     + struct.pack("<I", len(body)) + body))
+        got = {}
+        for _ in mixed:
+            n = struct.unpack("<I", _recv(s, 4))[0]
+            id_, st, body, _ = binproto.decode_reply(_recv(s, n))
+            got[id_ - 3000] = (st, json.loads(body))
+        for k, req in enumerate(mixed):
+            want_st, want_body = (single[k] if k < len(REQS) else want_bad[k - len(REQS)])
+            j0 = json.loads(want_body)
+            j0.pop("took_ms", None); got[k][1].pop("took_ms", None)
+            assert got[k] == (want_st, j0), (k, req)
         s.close()
     finally:
         assert _stop(p) == 0
+        assert _stop(ps) == 0
 
 
 def _recv(sock, n):
