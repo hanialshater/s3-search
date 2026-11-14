@@ -1,7 +1,7 @@
 """`python -m referee full`: the score of record (B1-6). Run by the founder in Colab on a GPU
 (`referee/colab_referee.ipynb`); it writes results.json.
 
-    python -m referee full [--dataset=esci-us] [--device=cuda] [--engine=engine|opensearch] [--request=template.json]
+    python -m referee full [--dataset=esci-us] [--device=cuda] [--engine=engine|opensearch|zvec] [--request=template.json]
                            [--bm25=params.json] [--k=1000] [--price-per-hour=...] [--out=results.json]
 
 The run records what it was asked to run: the request template and the --bm25 file (each with its sha256), the BM25
@@ -82,7 +82,7 @@ def main(argv=None) -> int:
     import time
     ap = argparse.ArgumentParser(prog="python -m referee full")
     ap.add_argument("--dataset", default="esci-us", choices=loader.DATASETS)
-    ap.add_argument("--engine", default="engine", choices=("engine", "opensearch", "reference"))
+    ap.add_argument("--engine", default="engine", choices=("engine", "opensearch", "reference", "zvec"))
     ap.add_argument("--device", default=None, help="default: cuda if available, else cpu")
     ap.add_argument("--request", help="JSON request template with the string {{query}} (the engine's tuned request)")
     ap.add_argument("--bm25", help="JSON file of BM25F parameters for the engine's mapping (_meta.engine.bm25: k1, and b "
@@ -116,6 +116,10 @@ def main(argv=None) -> int:
         if a.engine == "opensearch":
             print("referee full: --bm25 sets the engine's BM25F; the OpenSearch adapter has one similarity per index "
                   "and does not take per-field b, so it does not apply to --engine=opensearch", file=sys.stderr)
+            return 2
+        if a.engine == "zvec":
+            print("referee full: --bm25 sets the engine's BM25F; zvec's k1 and b are fixed, so it does not apply to "
+                  "--engine=zvec", file=sys.stderr)
             return 2
         import hashlib
         raw = Path(a.bm25).read_bytes()
@@ -191,6 +195,10 @@ def main(argv=None) -> int:
         out["opensearch"] = {"analyzer": os.environ.get("S3_SEARCH_OS_ANALYZER") or "s3_english",
                              "version": opensearch.server_version()}
         say(f"opensearch: {out['opensearch']}")
+    if a.engine == "zvec":
+        from referee import zvec
+        out["zvec"] = zvec.settings()
+        say(f"zvec: {out['zvec']}")
     out["tree_clean"] = tree_clean()
     if a.engine == "engine":
         out["build_mode"] = build_mode()
