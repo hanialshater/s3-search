@@ -91,6 +91,11 @@ def conformance(argv=()) -> int:
     return main(list(argv))
 
 
+def precision(argv=()) -> int:
+    from referee.precision import main
+    return main(list(argv))
+
+
 def full(argv=()) -> int:
     if not _has_engine() and not any(x in ("--engine=opensearch", "--engine=reference") for x in argv):
         print("referee full: needs engine/api.py (INTERFACES section 5); S1 adds it", file=sys.stderr)
@@ -101,7 +106,7 @@ def full(argv=()) -> int:
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "fast"
-    cmds = {"fast": fast, "bench": bench, "conformance": conformance, "full": full}
+    cmds = {"fast": fast, "bench": bench, "conformance": conformance, "full": full, "precision": precision}
     if mode not in cmds:
         print(__doc__)
         sys.exit(2)
