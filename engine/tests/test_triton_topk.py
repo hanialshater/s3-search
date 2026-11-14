@@ -82,3 +82,15 @@ def test_on_by_default_and_off_with_0(monkeypatch):
     assert not TT.wanted(get_backend("cuda"), 10, TT.WIDE_N - 1)
     monkeypatch.setenv("S3_TRITON_TOPK", "0")
     assert not TT.wanted(get_backend("cuda"), 2000)
+
+
+def test_radix_kth_value_equals_torch_topk(_any_gpu_class):
+    """S6-29: the radix select's k-th value is torch.topk's, bit for bit, on ties, negatives, -inf, zeros and -0.0."""
+    import torch
+    rng = np.random.default_rng(1)
+    for x, _, k in _cases(rng):
+        s = (torch.as_tensor(x, device="cuda") + 0.0).contiguous()
+        want = torch.topk(s, k, dim=1, sorted=False).values.min(dim=1).values
+        got = TT.kth_value(s, k)
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), (x.shape, k)
+    _any_gpu_class.append(1)          # this test calls the kernels directly, not through TT.topk

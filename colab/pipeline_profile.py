@@ -37,7 +37,8 @@ TORCH_PROFILE = any(a == "--torch-profile=1" for a in sys.argv[1:])
 PLAN_CACHE = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--plan-cache=")), None)
 if PLAN_CACHE is not None:
     os.environ["S3_PLAN_CACHE"] = str(int(PLAN_CACHE))
-BATCHES = (1, 16, 64, 128)
+BATCHES = tuple(int(x) for x in next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--batches=")),
+                                     "1,16,64,128").split(","))
 S6_QPS, S6_P99_MS = 694, 35.0
 
 t_start = time.time()
@@ -137,15 +138,22 @@ def fused_runs(index, texts):
     real = triton_fused._run_kernel
     triton_fused._run_kernel = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
     res = {}
+    variants = [("0", None), ("1", None)]
+    if any(a == "--threshold=1" for a in sys.argv[1:]):     # S6-29: the fused path with each top-k threshold
+        variants = [("0", None), ("1", "torch"), ("1", "radix")]
     for kind, (make, kw) in kinds.items():
-        for on in ("0", "1"):
+        for on, thr in variants:
             os.environ["S3_TRITON_FUSED_LEXICAL"] = on
-            label = f"{kind}_{'fused' if on == '1' else 'today'}"
+            if thr:
+                os.environ["S3_TRITON_TOPK_THRESHOLD"] = thr
+            label = f"{kind}_{'fused' if on == '1' else 'today'}" + (f"_{thr}" if thr else "")
             res[label] = {"measure": measure(index, make, texts, label, kw)}
-            try:
-                res[label]["torch_profile"] = torch_profile(index, make, texts, label, kw=kw)
-            except Exception as e:  # noqa: BLE001
-                res[label]["torch_profile"] = {"error": repr(e)[:500]}
+            for pb in (32, 64):                            # device time per batch where serving's tail is (S6-29)
+                key = "torch_profile" if pb == 64 else f"torch_profile_{pb}"
+                try:
+                    res[label][key] = torch_profile(index, make, texts, f"{label}/{pb}", bs=pb, kw=kw)
+                except Exception as e:  # noqa: BLE001
+                    res[label][key] = {"error": repr(e)[:500]}
         differ = 0
         for i in range(0, 256, 64):
             reqs = [make(t) for t in texts[i:i + 64]]
