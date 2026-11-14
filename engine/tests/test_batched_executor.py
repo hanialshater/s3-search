@@ -32,6 +32,10 @@ def _batch(ds):
         {"query": q, "highlight": {"fields": {"product_title": {}}}},
         {"query": q, "explain": True, "size": 3},
         {"query": q, "size": 0, "aggs": FACETS},
+        {"query": {"match": {"product_title": {"query": "lamp mug", "boost": 2.5}}}, "size": 20},       # S6-17
+        {"query": {"match": {"product_title": {"query": "black lamp shoes", "operator": "and"}}}},
+        {"query": {"match": {"product_title": {"query": "black lamp shoes", "minimum_should_match": 2,
+                                               "boost": 0.5}}}, "size": 30},
     ]
     return out
 
