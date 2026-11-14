@@ -2,6 +2,7 @@
 on the toy dataset."""
 import json
 import os
+from pathlib import Path
 import urllib.request
 import stat
 import time
@@ -161,6 +162,81 @@ def test_granian_fronts_answer_as_one_process(built, single):
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(16) as ex:
             for st, body, _ in ex.map(lambda _: _http("POST", url, REQS[0]), range(100)):
+                assert st == 200 and _hits(body) == want
+    finally:
+        assert _stop(p) == 0
+
+
+def test_binary_protocol_gives_the_same_bodies(built, single):
+    """S6-22s: on a connection opened with S3B1, a GPU process answers in serving/binproto.py's frames, and the
+    bodies decoded the way a native front must encode them equal one process's (but for took_ms)."""
+    import socket as _socket
+    import struct
+    import tempfile
+    from serving import binproto
+    state = tempfile.mkdtemp(prefix="s3b-")
+    port = _free_port()
+    p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"], {"S3_SERVING_STATE_DIR": state})
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.connect(os.path.join(state, "gpu-0.sock"))
+        s.sendall(binproto.MAGIC)
+
+        def ask(i, req):
+            body = json.dumps(req).encode()
+            name = b"toy"
+            s.sendall(binproto.frame(struct.pack("<BQ", 1, i) + struct.pack("<H", len(name)) + name
+                                     + struct.pack("<I", len(body)) + body))
+            n = struct.unpack("<I", _recv(s, 4))[0]
+            return binproto.decode_reply(_recv(s, n))
+
+        kinds = set()
+        for i, req in enumerate(REQS):
+            id_, st, body, meta = ask(i, req)
+            assert id_ == i
+            s0, b0 = single[i]
+            assert st == s0, (req, body[:200])
+            j0, j1 = json.loads(b0), json.loads(body)
+            j0.pop("took_ms", None); j1.pop("took_ms", None)
+            assert j0 == j1, req
+            if st == 200:
+                t0, t1 = json.loads(b0)["took_ms"], json.loads(body)["took_ms"]
+                assert b0.replace(json.dumps(t0, separators=(",", ":")).encode(), b"") == \
+                    body.replace(json.dumps(t1, separators=(",", ":")).encode(), b"")
+            kinds.add("pre" in meta)
+        assert kinds == {True, False}                     # some columnar (kind 1), some whole (kind 2)
+        s.close()
+    finally:
+        assert _stop(p) == 0
+
+
+def _recv(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        assert chunk, "connection closed"
+        buf += chunk
+    return buf
+
+
+def _native_bin():
+    here = Path(__file__).resolve().parents[1] / "native_front" / "target" / "release" / "s3-native-front"
+    return os.environ.get("S3_NATIVE_FRONT_BIN") or (str(here) if here.exists() else None)
+
+
+def test_native_front_answers_as_one_process(built, single):
+    """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process (skipped unless built)."""
+    if not _native_bin():
+        pytest.skip("serving/native_front is not built")
+    port = _free_port()
+    p = _start(built, port, ["--fronts", "2", "--gpu-processes", "1"],
+               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin()})
+    try:
+        _same(single, _answers(port))
+        url = f"http://127.0.0.1:{port}/indexes/toy/_search"
+        want = _hits(_http("POST", url, REQS[0])[1])
+        with ThreadPoolExecutor(16) as ex:
+            for st, body, _ in ex.map(lambda _: _http("POST", url, REQS[0]), range(200)):
                 assert st == 200 and _hits(body) == want
     finally:
         assert _stop(p) == 0

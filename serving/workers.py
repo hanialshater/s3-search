@@ -136,7 +136,9 @@ class Supervisor:
         self.fronts, self.k = (n, gpu_processes) if gpu_processes else (0, 0)
         # S6-21s: S3_SERVING_FRONT_SERVER=granian runs the fronts as one granian process with ``fronts`` workers on the
         # port (serving/front_granian.py); stdlib (the default) keeps serving's own fronts on a shared socket.
-        self.granian = bool(self.k) and os.environ.get("S3_SERVING_FRONT_SERVER", "stdlib") == "granian"
+        self.front_server = os.environ.get("S3_SERVING_FRONT_SERVER", "stdlib") if self.k else "stdlib"
+        # granian (S6-21s) or native (S6-22s, serving/native_front): one process for all the fronts, binding the port
+        self.granian = self.front_server in ("granian", "native")
         n = (1 if self.granian else n) + self.k
         self.n, self.argv, self.restart_pause_s = n, list(argv), restart_pause_s
         self.host = host
@@ -165,6 +167,12 @@ class Supervisor:
         if kind == "gpu":
             return [sys.executable, "-m", "serving", *self.argv, "--gpu-process", str(j), "--gpu-socket",
                     self.gpu_sockets[j]]
+        if kind == "granian" and self.front_server == "native":
+            here = os.path.dirname(os.path.abspath(__file__))
+            binary = os.environ.get("S3_NATIVE_FRONT_BIN") or os.path.join(here, "native_front", "target", "release",
+                                                                            "s3-native-front")
+            return [binary, "--host", self.host, "--port", str(self.port), "--gpu-sockets", ",".join(self.gpu_sockets),
+                    "--threads", os.environ.get("S3_SERVING_FRONT_THREADS_NATIVE", str(self.fronts))]
         if kind == "granian":
             return [sys.executable, "-m", "granian", "--interface", "wsgi", "--workers", str(self.fronts),
                     "--blocking-threads", os.environ.get("S3_SERVING_FRONT_THREADS", "32"), "--host", self.host,

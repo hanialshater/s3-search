@@ -1,0 +1,23 @@
+[package]
+name = "s3-native-front"
+version = "0.1.0"
+edition = "2021"
+description = "S6-22s: a native HTTP front for the S3 search engine's GPU processes (serving/binproto.py)"
+license = "Proprietary"
+publish = false
+
+# Licences of the dependencies (checked 2026-11-14): tokio MIT; hyper MIT; hyper-util MIT; http-body-util MIT;
+# bytes MIT; ryu Apache-2.0 OR BSL-1.0; serde_json MIT OR Apache-2.0.
+[dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+hyper = { version = "1.4", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+ryu = "1.0"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
