@@ -83,7 +83,9 @@ Decision record: `docs/decisions/2026-11-09-gpu-portable-backend.md`.
   same selection and order), so responses do not change. They run only where `engine/backend/triton_gate.py` allows:
   Triton imports at the tested version (3.8, pinned with torch 2.14 in `requirements-gpu.txt`) on a GPU class whose
   GPU CI passed (A100 8.0, L4 8.9, G4 12.0). Anywhere else (CPU, an H100, a T4, another Triton) the torch path runs.
-  **Opt-out:** `S3_TRITON_BM25=0`, `S3_TRITON_TOPK=0`. The facet histogram kernel stays opt-in
+  **Opt-out:** `S3_TRITON_BM25=0`, `S3_TRITON_TOPK=0`. The fused lexical path (S6-22, `engine/backend/triton_fused.py`)
+  is on by default since S6-26 for the plans it serves (a batch of bare lexical queries sorted by score, plain terms
+  aggregations, one segment, float64 accumulation); `S3_TRITON_FUSED_LEXICAL=0` turns it off. Same responses. The facet histogram kernel stays opt-in
   (`S3_TRITON_FACETS=1`) until its A100 measurement holds. `S3_TRITON_CAPABILITIES` (a list such as `9.0,12.0`, or
   `any`) overrides the GPU classes, for development and GPU CI only. `engine.backend.triton_gate.effective(b)` says
   which kernels a backend would use, for provenance.
@@ -1170,3 +1172,5 @@ status:
 
 - 2026-11-14, platform-engineer (S6-22s): section 7 gains `S3_SERVING_GPU_BATCH_WAIT_MS` and `S3_SERVING_GPU_MAX_BATCH`,
   an opt-in batch window for the GPU processes (default: none, as before).
+- 2026-11-14, architect (S6-26): the fused lexical path is on by default where the gate allows;
+  `S3_TRITON_FUSED_LEXICAL=0` turns it off; responses unchanged (section 0). The founder's decision.

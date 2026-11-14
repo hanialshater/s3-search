@@ -17,6 +17,7 @@ def _any_gpu_class(monkeypatch):
     """Run the kernel on whatever GPU this is (the gate's list is what these tests decide), and count its calls, so a
     test cannot pass by falling back to the torch path."""
     monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "0")    # S6-26: this kernel's own path, not the fused pass's
     calls = []
     real = getattr(TF, "bincount_rows")
     monkeypatch.setattr(TF, "bincount_rows", lambda *a, **k: (calls.append(1), real(*a, **k))[1])

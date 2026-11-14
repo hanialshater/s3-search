@@ -53,8 +53,9 @@ ENV = "S3_TRITON_FUSED_LEXICAL"
 
 def mode(b) -> str | None:
     """``"kernel"`` (cuda, the gate passes, ``S3_TRITON_FUSED_LEXICAL=1``), ``"reference"``
-    (``S3_TRITON_FUSED_LEXICAL=reference``, any device, for tests), or None: today's path. Off by default."""
-    v = os.environ.get(ENV, "0")
+    (``S3_TRITON_FUSED_LEXICAL=reference``, any device, for tests), or None: the unfused path. On by default since
+    S6-26 (the founder's decision); ``S3_TRITON_FUSED_LEXICAL=0`` turns it off."""
+    v = os.environ.get(ENV, "1")
     if v == "reference":
         return "reference"
     if v == "1" and triton is not None and triton_gate.supported(b):
