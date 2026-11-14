@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -372,6 +372,8 @@ def compare_unloaded(url, bodies, runs, limit=None):
 
 
 CLIENT = opt("client", "aiohttp")                            # S6-22s: aiohttp (default) or native (colab/loadgen)
+CLIENTS = [c for c in opt("clients", CLIENT).split(",") if c]  # --clients=aiohttp,native,native,aiohttp: ABBA per rate
+assert set(CLIENTS) <= {"aiohttp", "native"}, CLIENTS
 _LOADGEN: dict = {}
 
 
@@ -865,7 +867,7 @@ def main():
     say(f"{len(ds.catalogue):,} products, {len(texts):,} query texts, depth {K}, rates {RATES} QPS x {DURATION:.0f} s")
     out = {"kind": "fair-bench", "label": "development only, never a score", "ref": REF, "commit": commit,
            "runtime": env, "cpus": os.cpu_count(), "client_cpus": client_cpus, "server_cpus": server_cpus,
-           "client": CLIENT, "client_build": ({k: v for k, v in build_loadgen().items()} if CLIENT == "native" else None),
+           "client": ",".join(CLIENTS), "client_build": (dict(build_loadgen()) if "native" in CLIENTS else None),
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
            "columns": COLUMNS, "mps": MPS, "fronts": FRONTS, "gpu_processes": GPUS, "log": LOG, "engines": {}}
     for name in ENGINES:
@@ -888,14 +890,18 @@ def main():
                 for b in bodies[:200]:
                     _post(url, b, route=j)
             runs = []
+            stop_ladder = False
             for rate in RATES:
-                say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s")
-                prof = start_profiles(proc.pid, rate) if rate in PROFILE_RATES else []
+              for k, client in enumerate(CLIENTS):               # S6-22s: --clients=a,b,... each rate once per client
+                globals()["CLIENT"] = client
+                say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s" + (f" (client {client}, {k + 1} of {len(CLIENTS)})"
+                                                                     if len(CLIENTS) > 1 else ""))
+                prof = start_profiles(proc.pid, rate) if rate in PROFILE_RATES and k == 0 else []
                 with Sampler(proc.pid) as smp:
                     r = load(url, bodies, rate, DURATION, client_cpus)
                 r["profiles"] = finish_profiles(prof)
                 if r.get("records"):                             # S6-22s: one CSV per rung, beside the results JSON
-                    keep = f"{os.path.splitext(OUT)[0]}-{name}-{int(rate)}.csv"
+                    keep = f"{os.path.splitext(OUT)[0]}-{name}-{int(rate)}" + (f"-{k}{client}" if len(CLIENTS) > 1 else "") + ".csv"
                     shutil.copy(r["records"][0], keep)
                     r["records"] = keep
                 r["resources"] = smp.summary(len(server_cpus))
@@ -903,13 +909,17 @@ def main():
                     f"{r['resources']['server_cpu_cores']} of {len(server_cpus)}; limit: {r['resources'].get('limit')}")
                 say(f"{name}: {rate:.0f} QPS -> achieved {r['achieved_qps']:.0f}, p50 {r['latency_ms']['p50']:.1f} ms, "
                     f"p99 {r['latency_ms']['p99']:.1f} ms, errors {r['errors']}, timeouts {r['timeouts']}, "
-                    f"hits {r['hits_per_response']}, client lag p99 {r['client_send_lag_ms_p99']:.1f} ms"
+                    f"hits {r['hits_per_response']}, client lag p99 {r['client_send_lag_ms_p99']:.1f} ms, "
+                    f"client {client} {r['client_cpu']['cores']:.2f} cores"
                     + (" (CLIENT-LIMITED)" if r["client_limited"] else ""))
                 runs.append(r)
                 if r["achieved_qps"] < 0.9 * rate or r["timeouts"] + r["errors"] > 0.01 * r["sent"]:
                     say(f"{name}: cannot sustain {rate:.0f} QPS; no higher rates (the same rule for every engine)")
+                    stop_ladder = True
                     break
                 time.sleep(5)
+              if stop_ladder:
+                break
             say(f"{name}: replaying sampled requests unloaded")
             try:                                                  # a dead server after the ladder must not lose it
                 check = compare_unloaded(url, bodies, runs)
