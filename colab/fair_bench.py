@@ -4,9 +4,9 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
-        --engines=zvec [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
+        --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
 --columns defaults to 1 since S6-7 (s3-search 67c1cd0): serving asks the engine for columnar hits. Runs before that
 commit were the dict form (--columns=0 now). --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
@@ -446,11 +446,13 @@ def zvec_target(ds, server_cpus):
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", wheel], check=True)
     say(f"zvec: installed {COMPETITOR['zvec']}")
     from colab.competitors.zvec_build import build
-    path = "/content/zvec/esci"
+    index_fields = [f for f in opt("zvec-index-fields", "").split(",") if f] or None   # e.g. product_title only
+    path = "/content/zvec/esci" + ("-" + "-".join(index_fields) if index_fields else "")
     t0 = time.time()
     if not os.path.exists(path):
-        say(f"zvec {ZVEC_VERSION}: building the collection")
-        info = build(ds.catalogue, path)
+        say(f"zvec {ZVEC_VERSION}: building the collection ({index_fields or 'all five text fields'})")
+        info = build(ds.catalogue, path, fields=tuple(index_fields)) if index_fields else build(ds.catalogue, path)
+        COMPETITOR["zvec"]["build"] = info
         say(f"zvec: built {info}")
     build_s = time.time() - t0
     port = free_port()
@@ -481,9 +483,19 @@ def zvec_target(ds, server_cpus):
 
 
 def engine_target(ds, server_cpus):
+    """--engine-bm25: the index's BM25 parameters, a JSON object or a file (default the tuned bm25f-tuned.bm25.json);
+    --engine-request: the request template file (default the tuned BM25F request; title-only.json for the parity
+    runs). A different --engine-bm25 builds its own index (its own serve dir)."""
+    global SERVE_DIR
+    spec = opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
+    bm25 = json.loads(spec) if spec.strip().startswith("{") else json.loads(Path(spec).read_text())
+    if spec != "referee/requests/bm25f-tuned.bm25.json":
+        import hashlib
+        SERVE_DIR = Path(f"/content/serve-{hashlib.sha1(json.dumps(bm25, sort_keys=True).encode()).hexdigest()[:8]}")
     SERVE_DIR.mkdir(parents=True, exist_ok=True)
     m = copy.deepcopy(ds.mapping)
-    m["_meta"]["engine"]["bm25"] = json.loads(Path("referee/requests/bm25f-tuned.bm25.json").read_text())
+    m["_meta"]["engine"]["bm25"] = bm25
+    COMPETITOR["engine"] = {"bm25": bm25, "request": opt("engine-request", "referee/requests/bm25f-tuned.json")}
     (SERVE_DIR / "mapping.json").write_text(json.dumps(m))
     src = SERVE_DIR / "products.parquet"
     ds.catalogue.to_parquet(src)
@@ -524,11 +536,15 @@ def engine_target(ds, server_cpus):
     say(f"engine: serving on cuda (index built in {build_s:.0f} s; query cache off, max_batch "
         f"{env['S3_SERVING_MAX_BATCH']}, max_wait {env['S3_SERVING_MAX_WAIT_MS']} ms, workers {WORKERS}, "
         f"columns {COLUMNS}, fronts {FRONTS}, gpu processes {GPUS}; log {LOG})")
-    tmpl = json.loads(Path("referee/requests/bm25f-tuned.json").read_text())
+    tmpl = json.loads(Path(opt("engine-request", "referee/requests/bm25f-tuned.json")).read_text())
+    say(f"engine: request {tmpl['query']}, bm25 {bm25}")
 
     def body(q):
         b = copy.deepcopy(tmpl)
-        b["query"]["multi_match"]["query"] = q
+        if "multi_match" in b["query"]:
+            b["query"]["multi_match"]["query"] = q
+        else:
+            b = json.loads(json.dumps(b).replace("{{query}}", json.dumps(q)[1:-1]))
         return {**b, "size": K}
 
     return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
