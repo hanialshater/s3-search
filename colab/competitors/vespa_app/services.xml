@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Vespa 8.781.11, one node, for the matched load test (S6-18s). The steward's approval: lab/benchmarks/vespa-config.md
+     and fairness-rulings.md (V1 to V6). Development only until approved. -->
+<services version="1.0">
+  <container id="default" version="1.0">
+    <search/>
+    <document-api/>
+    <!-- 8090: the Colab VM's own server holds 8080 -->
+    <http><server id="default" port="8090"/></http>
+  </container>
+  <content id="esci" version="1.0">
+    <redundancy>1</redundancy>
+    <documents><document type="product" mode="index"/></documents>
+    <nodes><node hostalias="node1" distribution-key="0"/></nodes>
+    <engine>
+      <proton>
+        <tuning>
+          <searchnode>
+            <!-- Vespa's sizing guide (performance/sizing-search) for 8 server cores: search = 2 x cores,
+                 persearch = 1 (the default; throughput over single-query latency), summary = cores -->
+            <requestthreads>
+              <search>16</search>
+              <persearch>1</persearch>
+              <summary>8</summary>
+            </requestthreads>
+          </searchnode>
+        </tuning>
+      </proton>
+    </engine>
+  </content>
+</services>

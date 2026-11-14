@@ -1,0 +1,66 @@
+schema product {
+  document product {
+    field product_id type string {
+      indexing: attribute | summary
+    }
+    field product_title type string {
+      indexing: index
+      index: enable-bm25
+    }
+    field product_brand type string {
+      indexing: index
+      index: enable-bm25
+    }
+    field product_color type string {
+      indexing: index
+      index: enable-bm25
+    }
+    field product_bullet_point type string {
+      indexing: index
+      index: enable-bm25
+    }
+    field product_description type string {
+      indexing: index
+      index: enable-bm25
+    }
+  }
+  fieldset default {
+    fields: product_title, product_brand, product_color, product_bullet_point, product_description
+  }
+  document-summary ids {
+    summary product_id {}
+  }
+  rank-profile title {
+    first-phase {
+      expression: bm25(product_title)
+    }
+    rank-properties {
+      bm25(product_title).k1: 1.2
+      bm25(product_title).b: 0.75
+    }
+  }
+  rank-profile bm25w {
+    inputs {
+      query(w_product_title) double: 1.0
+      query(w_product_brand) double: 0.126
+      query(w_product_color) double: 0.14
+      query(w_product_bullet_point) double: 0.06
+      query(w_product_description) double: 0.036
+    }
+    first-phase {
+      expression: query(w_product_title) * bm25(product_title) + query(w_product_brand) * bm25(product_brand) + query(w_product_color) * bm25(product_color) + query(w_product_bullet_point) * bm25(product_bullet_point) + query(w_product_description) * bm25(product_description)
+    }
+    rank-properties {
+      bm25(product_title).k1: 1.2
+      bm25(product_title).b: 0.75
+      bm25(product_brand).k1: 1.2
+      bm25(product_brand).b: 0.75
+      bm25(product_color).k1: 1.2
+      bm25(product_color).b: 0.75
+      bm25(product_bullet_point).k1: 1.2
+      bm25(product_bullet_point).b: 0.75
+      bm25(product_description).k1: 1.2
+      bm25(product_description).b: 0.75
+    }
+  }
+}

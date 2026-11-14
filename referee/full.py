@@ -1,11 +1,12 @@
 """`python -m referee full`: the score of record (B1-6). Run by the founder in Colab on a GPU
 (`referee/colab_referee.ipynb`); it writes results.json.
 
-    python -m referee full [--dataset=esci-us] [--device=cuda] [--engine=engine|opensearch|zvec] [--request=template.json]
+    python -m referee full [--dataset=esci-us] [--device=cuda] [--engine=engine|opensearch|zvec|vespa] [--request=template.json]
                            [--bm25=params.json] [--k=1000] [--price-per-hour=...] [--out=results.json]
 
 The run records what it was asked to run: the request template and the --bm25 file (each with its sha256), the BM25
 parameters the mapping carried, OpenSearch's version and analyzer, whether the checkout was clean, and its caveats.
+It also records the engine's switches (S3_TRITON_BM25, S3_TRITON_TOPK and any other S3_TRITON_*, S3_PLAN_CACHE, S3_CUDA_BLOCKING_SYNC) as set, or null.
 The engine's score of record needs the contract run on the device (no --skip-contract) and a clean checkout.
 
 1. The contract on this device: `referee/contract/` on toy (the notebook also runs `referee fast` first).
@@ -82,7 +83,7 @@ def main(argv=None) -> int:
     import time
     ap = argparse.ArgumentParser(prog="python -m referee full")
     ap.add_argument("--dataset", default="esci-us", choices=loader.DATASETS)
-    ap.add_argument("--engine", default="engine", choices=("engine", "opensearch", "reference", "zvec"))
+    ap.add_argument("--engine", default="engine", choices=("engine", "opensearch", "reference", "zvec", "vespa"))
     ap.add_argument("--device", default=None, help="default: cuda if available, else cpu")
     ap.add_argument("--request", help="JSON request template with the string {{query}} (the engine's tuned request)")
     ap.add_argument("--bm25", help="JSON file of BM25F parameters for the engine's mapping (_meta.engine.bm25: k1, and b "
@@ -120,6 +121,10 @@ def main(argv=None) -> int:
         if a.engine == "zvec":
             print("referee full: --bm25 sets the engine's BM25F; zvec's k1 and b are fixed, so it does not apply to "
                   "--engine=zvec", file=sys.stderr)
+            return 2
+        if a.engine == "vespa":
+            print("referee full: --bm25 sets the engine's BM25F; Vespa's k1 and b are its rank profiles' (overridden with "
+                  "S3_SEARCH_VESPA_RANK_PROPERTIES), so it does not apply to --engine=vespa", file=sys.stderr)
             return 2
         import hashlib
         raw = Path(a.bm25).read_bytes()
@@ -199,6 +204,10 @@ def main(argv=None) -> int:
         from referee import zvec
         out["zvec"] = zvec.settings()
         say(f"zvec: {out['zvec']}")
+    if a.engine == "vespa":
+        from referee import vespa
+        out["vespa"] = vespa.settings()
+        say(f"vespa: {out['vespa']}")
     out["tree_clean"] = tree_clean()
     if a.engine == "engine":
         out["build_mode"] = build_mode()

@@ -1,6 +1,6 @@
 """`python -m referee bench`: quality, latency, throughput and cost of one implementation on one named dataset.
 
-    python -m referee bench --dataset=toy|esci-sample|esci-us [--device=cpu] [--engine=engine|reference|opensearch|zvec]
+    python -m referee bench --dataset=toy|esci-sample|esci-us [--device=cpu] [--engine=engine|reference|opensearch|zvec|vespa]
                             [--request=template.json] [--k=100] [--batch=64] [--queries=N] [--out=results.json]
 
 - Quality: whole-catalogue nDCG@10 and Exact recall@k (referee/metrics.py) on the **fit** split. The test split is
@@ -39,7 +39,7 @@ CPU_DEVICES = ("cpu", "torch-cpu")
 
 
 def get_api(engine: str):
-    """The implementation under test: `engine` (engine.api), `reference` (the referee's), `opensearch` or `zvec`."""
+    """The implementation under test: `engine` (engine.api), `reference` (the referee's), `opensearch`, `zvec` or `vespa`."""
     if engine == "engine":
         return importlib.import_module("engine.api")
     if engine == "reference":
@@ -51,6 +51,9 @@ def get_api(engine: str):
     if engine == "zvec":
         from referee import zvec
         return zvec
+    if engine == "vespa":
+        from referee import vespa
+        return vespa
     raise ValueError(f"unknown engine {engine!r}")
 
 
@@ -66,6 +69,18 @@ def fill(template, text: str):
 
 def _pct(xs, q):
     return float(np.percentile(np.asarray(xs, dtype=np.float64), q)) if len(xs) else None
+
+
+ENGINE_ENV = ("S3_TRITON_BM25", "S3_TRITON_TOPK", "S3_PLAN_CACHE", "S3_CUDA_BLOCKING_SYNC")
+
+
+def engine_env() -> dict:
+    """The engine's switches that change how it computes or how fast (not what it returns): each as set in this
+    process's environment, or null when unset (the engine's default then applies). Recorded in every results file, so
+    two runs that differ only in a switch say so (the founder's approval, 2026-11-14)."""
+    out = {k: os.environ.get(k) for k in ENGINE_ENV}
+    out.update({k: v for k, v in sorted(os.environ.items()) if k.startswith("S3_TRITON_")})   # any later kernel switch too
+    return out
 
 
 def _rev():
@@ -145,6 +160,7 @@ def run(ds, queries, judgments, api, device="cpu", template=None, k=100, batch=6
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": {"cpus": os.cpu_count(), "machine": platform.machine(), "python": platform.python_version(),
                  "threads": __import__("referee").blas_threads()},
+        "engine_env": engine_env(),
         "n_queries": len(qids), "n_products": int(len(ds.catalogue)), "request_template": template,
         "quality": {k_: v for k_, v in quality.items()},
         **({"quality_subsets": quality_subsets} if subsets else {}),
@@ -169,7 +185,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m referee bench", description=__doc__.split("\n\n")[0])
     ap.add_argument("--dataset", default="toy", choices=loader.DATASETS)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--engine", default="engine", choices=("engine", "reference", "opensearch", "zvec"))
+    ap.add_argument("--engine", default="engine", choices=("engine", "reference", "opensearch", "zvec", "vespa"))
     ap.add_argument("--request", help="JSON request template with the string {{query}}")
     ap.add_argument("--k", type=int, default=100, help="hits per query for quality (Exact recall@k)")
     ap.add_argument("--batch", type=int, default=64)

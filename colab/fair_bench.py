@@ -3,7 +3,10 @@
 
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
-        [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97]
+        [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
+        --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
 --columns defaults to 1 since S6-7 (s3-search 67c1cd0): serving asks the engine for columnar hits. Runs before that
 commit were the dict form (--columns=0 now). --workers=N runs the engine's server as N worker processes behind the one port (serving/workers.py, S6-7; each holds
@@ -68,7 +71,8 @@ MPS = opt("mps", "0") == "1"
 FRONTS = int(opt("fronts", "0"))                             # S6-10s: front processes (0: not that layout)
 GPUS = int(opt("gpu-processes", "1"))
 LOG = opt("log", "/content/serving.log")
-SAMPLE_EVERY = int(opt("sample-every", "97"))               # every n-th request is kept and replayed unloaded                     # one server log per configuration
+SAMPLE_EVERY = int(opt("sample-every", "97"))               # every n-th request is kept and replayed unloaded
+SAMPLE_BODIES = {int(x) for x in opt("sample-bodies", "").split(",") if x}   # these bodies are always sampled                     # one server log per configuration
 OUT = opt("out", "/content/fair-bench.json")
 t_start = time.time()
 
@@ -141,8 +145,12 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                             errors += 1
                             why[str(r.status)] = why.get(str(r.status), 0) + 1
                             return
+                        if not full_coverage(raw):
+                            errors += 1
+                            why["coverage"] = why.get("coverage", 0) + 1
+                            return
                     lat.append((time.time() - due) * 1e3)
-                    if i % SAMPLE_EVERY == 0:                # sampled: hits, a digest, the bytes, who answered
+                    if i % SAMPLE_EVERY == 0 or (i % len(bodies)) in SAMPLE_BODIES:   # sampled: hits, digest, bytes, who
                         n_hits, digest = result_digest(raw)
                         hits.append(n_hits)
                         samples.append([i, n_hits, digest, r.headers.get("X-S3-Gpu-Process"),
@@ -170,15 +178,73 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
     asyncio.run(run())
 
 
+RESPONSE = {"kind": "hits"}                                 # "hits" (engine, OpenSearch, zvec) or "vespa"
+
+
+def hits_of(d: dict) -> list:
+    if RESPONSE["kind"] == "vespa":
+        return d.get("root", {}).get("children", []) or []
+    return d["hits"]["hits"]
+
+
+def _comparable(d: dict) -> dict:
+    """A response without what differs run to run: took_ms, and Vespa's timing and coverage block."""
+    d.pop("took_ms", None)
+    d.pop("timing", None)
+    if RESPONSE["kind"] == "vespa" and isinstance(d.get("root"), dict):
+        d["root"].pop("coverage", None)
+    return d
+
+
+def full_coverage(raw: bytes) -> bool:
+    """V1 (the steward's condition): a Vespa response counts only if its root coverage block, parsed, says coverage
+    100, full true and no degradation (``degraded`` absent, or every flag in it false)."""
+    if RESPONSE["kind"] != "vespa":
+        return True
+    try:
+        cov = json.loads(raw)["root"]["coverage"]
+    except (ValueError, KeyError, TypeError):
+        return False
+    deg = cov.get("degraded") or {}
+    return cov.get("coverage") == 100 and cov.get("full") is True and not any(bool(v) for v in deg.values())
+
+
 def result_digest(raw: bytes) -> tuple[int, str]:
     """A response's hit count and a digest of everything but took_ms (for the unloaded comparison)."""
     import hashlib
-    d = json.loads(raw)
-    d.pop("took_ms", None)
-    return len(d["hits"]["hits"]), hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
+    d = _comparable(json.loads(raw))
+    return len(hits_of(d)), hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
 
 SAMPLES = "/content/fair-samples"
+PROFILE_RATES = [float(x) for x in opt("profile", "").split(",") if x]   # rates at which py-spy records the server
+
+
+def start_profiles(root_pid, rate):
+    """py-spy (sampling, no code change, about 1% overhead at 100 Hz) on one GPU process and one front for 20 s in the
+    middle of the run, as speedscope JSON: where each process's own core goes (S6-17s)."""
+    import psutil
+    out = []
+    for p in psutil.Process(root_pid).children(recursive=True):
+        role = _role(p)
+        if role in ("gpu process 0", "front 0", "worker 0", "server") and not any(r == role for r, _, _ in out):
+            path = f"/content/pyspy-{int(rate)}-{role.replace(' ', '')}.json"
+            cmd = ["py-spy", "record", "--rate", "100", "--duration", "20", "--nonblocking", "--format", "speedscope",
+                   "-o", path, "--pid", str(p.pid)]
+            delayed = ["bash", "-c", f"sleep {max(1, DURATION / 2 - 10):.0f}; exec " + " ".join(cmd)]
+            out.append((role, path, subprocess.Popen(delayed, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)))
+    return out
+
+
+def finish_profiles(prof):
+    done = []
+    for role, path, pr in prof:
+        try:
+            pr.wait(60)
+        except Exception:
+            pr.kill()
+        done.append({"role": role, "path": path, "ok": os.path.exists(path)})
+    return done
 
 
 def _post(url, body, route=None):
@@ -191,16 +257,17 @@ def _post(url, body, route=None):
 
 def _diff(a: bytes, b: bytes) -> dict:
     """Where two responses first differ: totals, page lengths, the first differing hit and both sides of it."""
-    x, y = json.loads(a), json.loads(b)
-    hx, hy = x["hits"]["hits"], y["hits"]["hits"]
+    x, y = _comparable(json.loads(a)), _comparable(json.loads(b))
+    hx, hy = hits_of(x), hits_of(y)
     first = next((k for k, (p, q) in enumerate(zip(hx, hy)) if p != q), None)
     other = sorted(set(x) ^ set(y)) + [k for k in set(x) & set(y) if k not in ("hits", "took_ms") and x[k] != y[k]]
-    return {"total": [x["hits"].get("total"), y["hits"].get("total")], "len": [len(hx), len(hy)],
+    tot = (lambda z: z["root"]["fields"].get("totalCount")) if RESPONSE["kind"] == "vespa" else (lambda z: z["hits"].get("total"))
+    return {"total": [tot(x), tot(y)], "len": [len(hx), len(hy)],
             "first_differing_hit": first, "hits_differing": sum(p != q for p, q in zip(hx, hy)),
             "at_first": [hx[first], hy[first]] if first is not None else None, "other_keys_differing": other}
 
 
-def compare_unloaded(url, bodies, runs, limit=2000):
+def compare_unloaded(url, bodies, runs, limit=None):
     """Replay sampled requests one at a time after the ladder and compare with what the loaded runs returned: a
     response changed by load (or emptied) shows as a mismatch; a query with no matches has 0 hits both ways."""
     seen, out = {}, {"checked": 0, "mismatch": [], "zero_hits_loaded": 0, "zero_hits_unloaded_too": 0,
@@ -213,7 +280,7 @@ def compare_unloaded(url, bodies, runs, limit=2000):
             seen.setdefault(i, []).append((r["target_qps"], n, dg, gpu, ver, bs))
             out["answered_by"][f"{gpu}@{ver}"] = out["answered_by"].get(f"{gpu}@{ver}", 0) + 1
     n_gpus = max(1, GPUS if FRONTS else 1)
-    for i in sorted(seen)[:limit]:
+    for i in sorted(seen)[:limit]:                         # every sample (the steward: not only the first 2,000)
         body = bodies[i % len(bodies)]
         raw, g0, v0 = _post(url, body)
         n0, d0 = result_digest(raw)
@@ -340,10 +407,103 @@ def stop_mps():
     subprocess.run(["bash", "-c", "echo quit | nvidia-cuda-mps-control"], check=False)
 
 
+def vespa_target(ds, server_cpus):
+    """Vespa 8.781.11 under chroot (colab/competitors/vespa_run.py), pinned by digest, on the server CPUs.
+    --vespa-mode=any (exact, the headline) or weakAnd (targetHits = depth, declared approximate);
+    --vespa-profile=title (BM25 k1 1.2, b 0.75 on product_title: the parity run) or bm25w (the weighted sum).
+    Development only until the steward approves."""
+    from colab.competitors import vespa_run as V
+    RESPONSE["kind"] = "vespa"
+    info = V.setup()
+    t0 = time.time()
+    proc = V.start(server_cpus, LOG)
+    info.update(V.deploy())
+    info.update(V.feed(ds.catalogue))
+    build_s = time.time() - t0
+    info.update(V.check_proton())
+    COMPETITOR["vespa"] = info
+    say(f"vespa: {info}")
+    mode, profile = opt("vespa-mode", "any"), opt("vespa-profile", "title")
+
+    def body(q):
+        return V.request(q, K, mode, profile)
+
+    return proc, f"http://localhost:{V.PORT}/search/", body, build_s
+
+
+ZVEC_VERSION = "0.8.1"
+ZVEC_SHA256 = "87909dddd7d86c82cb49d4c03f1851df94473b32fa31f5b919179ab1ca45bc50"   # the steward's record (C1)
+COMPETITOR: dict = {}                                       # what each competitor ran: version, wheel or image digest
+
+
+def zvec_target(ds, server_cpus):
+    """zvec 0.8.1 behind colab/competitors/zvec_server.py (serving's HTTP stack and encoder) on the server CPUs.
+    Configuration for the steward: --zvec-fields (default the engine's tuned fields and weights), --zvec-fusion
+    (weighted or rrf), --zvec-workers (processes; default one per server CPU) and --zvec-query-threads (zvec's own query
+    threads per process; default 1, so workers x threads = the server CPUs). Development only until approved."""
+    wheel_dir = "/content/zvec-wheel"                        # C1: install from a downloaded wheel and record its sha256
+    subprocess.run([sys.executable, "-m", "pip", "download", "-q", "--no-deps", "-d", wheel_dir,
+                    f"zvec=={ZVEC_VERSION}"], check=True)
+    import glob
+    import hashlib
+    wheel = sorted(glob.glob(f"{wheel_dir}/zvec-{ZVEC_VERSION}-*.whl"))[0]
+    COMPETITOR["zvec"] = {"version": ZVEC_VERSION, "wheel": os.path.basename(wheel),
+                          "wheel_sha256": hashlib.sha256(open(wheel, "rb").read()).hexdigest()}
+    if COMPETITOR["zvec"]["wheel_sha256"] != ZVEC_SHA256:
+        raise RuntimeError(f"zvec wheel sha256 {COMPETITOR['zvec']['wheel_sha256']} is not the approved {ZVEC_SHA256}")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", wheel], check=True)
+    say(f"zvec: installed {COMPETITOR['zvec']}")
+    from colab.competitors.zvec_build import build
+    index_fields = [f for f in opt("zvec-index-fields", "").split(",") if f] or None   # e.g. product_title only
+    path = "/content/zvec/esci" + ("-" + "-".join(index_fields) if index_fields else "")
+    t0 = time.time()
+    if not os.path.exists(path):
+        say(f"zvec {ZVEC_VERSION}: building the collection ({index_fields or 'all five text fields'})")
+        info = build(ds.catalogue, path, fields=tuple(index_fields)) if index_fields else build(ds.catalogue, path)
+        COMPETITOR["zvec"]["build"] = info
+        say(f"zvec: built {info}")
+    build_s = time.time() - t0
+    port = free_port()
+    workers = int(opt("zvec-workers", str(len(server_cpus))))
+    cmd = ["taskset", "-c", ",".join(map(str, server_cpus)), sys.executable, "colab/competitors/zvec_server.py",
+           "--collection", path, "--port", str(port), "--workers", str(workers),
+           "--query-threads", opt("zvec-query-threads", "1"), "--fusion", opt("zvec-fusion", "weighted")]
+    proc = subprocess.Popen(cmd, stdout=open(LOG, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        wait_until(lambda: urllib.request.urlopen(f"http://localhost:{port}/readyz", timeout=5).status == 200,
+                   "zvec server", 600, proc=proc, log=LOG)
+    except Exception:
+        stop(proc)
+        raise
+    tmpl = json.loads(Path("referee/requests/bm25f-tuned.json").read_text())
+    fields = opt("zvec-fields", "")
+    if fields:
+        tmpl["query"]["multi_match"]["fields"] = fields.split(",")
+    say(f"zvec: serving {tmpl['query']['multi_match']['fields']} with {opt('zvec-fusion', 'weighted')} fusion, "
+        f"{workers} workers x {opt('zvec-query-threads', '1')} query threads")
+
+    def body(q):
+        b = copy.deepcopy(tmpl)
+        b["query"]["multi_match"]["query"] = q
+        return {**b, "size": K}
+
+    return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
+
+
 def engine_target(ds, server_cpus):
+    """--engine-bm25: the index's BM25 parameters, a JSON object or a file (default the tuned bm25f-tuned.bm25.json);
+    --engine-request: the request template file (default the tuned BM25F request; title-only.json for the parity
+    runs). A different --engine-bm25 builds its own index (its own serve dir)."""
+    global SERVE_DIR
+    spec = opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
+    bm25 = json.loads(spec) if spec.strip().startswith("{") else json.loads(Path(spec).read_text())
+    if spec != "referee/requests/bm25f-tuned.bm25.json":
+        import hashlib
+        SERVE_DIR = Path(f"/content/serve-{hashlib.sha1(json.dumps(bm25, sort_keys=True).encode()).hexdigest()[:8]}")
     SERVE_DIR.mkdir(parents=True, exist_ok=True)
     m = copy.deepcopy(ds.mapping)
-    m["_meta"]["engine"]["bm25"] = json.loads(Path("referee/requests/bm25f-tuned.bm25.json").read_text())
+    m["_meta"]["engine"]["bm25"] = bm25
+    COMPETITOR["engine"] = {"bm25": bm25, "request": opt("engine-request", "referee/requests/bm25f-tuned.json")}
     (SERVE_DIR / "mapping.json").write_text(json.dumps(m))
     src = SERVE_DIR / "products.parquet"
     ds.catalogue.to_parquet(src)
@@ -359,7 +519,13 @@ def engine_target(ds, server_cpus):
            "S3_SERVING_MAX_WAIT_MS": opt("max-wait-ms", "2"), "S3_SEARCH_DEVICE": "cuda",
            "S3_SERVING_WORKERS": str(WORKERS), "S3_SERVING_COLUMNS": COLUMNS,
            "S3_SERVING_FRONTS": str(FRONTS), "S3_SERVING_GPU_PROCESSES": str(GPUS),
-           "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0")}
+           "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0"),
+           "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0"),
+           **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
+    COMPETITOR.setdefault("engine", {})["server_env"] = {      # provenance: what the server ran with (the steward's ask)
+        k: v for k, v in env.items() if k.startswith(("S3_SERVING_", "S3_SEARCH_", "S3_TRITON", "S3_PLAN_CACHE",
+                                                      "S3_CUDA_"))}
+    COMPETITOR["engine"]["server_env_arg"] = opt("server-env", "")
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
@@ -382,11 +548,15 @@ def engine_target(ds, server_cpus):
     say(f"engine: serving on cuda (index built in {build_s:.0f} s; query cache off, max_batch "
         f"{env['S3_SERVING_MAX_BATCH']}, max_wait {env['S3_SERVING_MAX_WAIT_MS']} ms, workers {WORKERS}, "
         f"columns {COLUMNS}, fronts {FRONTS}, gpu processes {GPUS}; log {LOG})")
-    tmpl = json.loads(Path("referee/requests/bm25f-tuned.json").read_text())
+    tmpl = json.loads(Path(opt("engine-request", "referee/requests/bm25f-tuned.json")).read_text())
+    say(f"engine: request {tmpl['query']}, bm25 {bm25}")
 
     def body(q):
         b = copy.deepcopy(tmpl)
-        b["query"]["multi_match"]["query"] = q
+        if "multi_match" in b["query"]:
+            b["query"]["multi_match"]["query"] = q
+        else:
+            b = json.loads(json.dumps(b).replace("{{query}}", json.dumps(q)[1:-1]))
         return {**b, "size": K}
 
     return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
@@ -493,7 +663,7 @@ def main():
     os.chdir(REPO)
     sys.path.insert(0, REPO)
     os.environ.setdefault("S3_SEARCH_DATA", os.path.join(REPO, "data", "esci"))
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "aiohttp", "snowballstemmer", "orjson"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "aiohttp", "snowballstemmer", "orjson", "py-spy"], check=True)
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     from referee import loader, runtime
     env = runtime.environment()
@@ -508,7 +678,8 @@ def main():
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
            "columns": COLUMNS, "mps": MPS, "fronts": FRONTS, "gpu_processes": GPUS, "log": LOG, "engines": {}}
     for name in ENGINES:
-        target = engine_target if name == "engine" else opensearch_target
+        target = {"engine": engine_target, "opensearch": opensearch_target, "zvec": zvec_target,
+                  "vespa": vespa_target}[name]
         try:
             proc, url, make_body, build_s = target(ds, server_cpus)
         except Exception as e:                                   # recorded; the other engine still runs
@@ -526,8 +697,10 @@ def main():
             runs = []
             for rate in RATES:
                 say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s")
+                prof = start_profiles(proc.pid, rate) if rate in PROFILE_RATES else []
                 with Sampler(proc.pid) as smp:
                     r = load(url, bodies, rate, DURATION, client_cpus)
+                r["profiles"] = finish_profiles(prof)
                 r["resources"] = smp.summary(len(server_cpus))
                 say(f"{name}: {rate:.0f} QPS resources: GPU {r['resources']['gpu_util_pct']}, server CPU cores "
                     f"{r['resources']['server_cpu_cores']} of {len(server_cpus)}; limit: {r['resources'].get('limit')}")
@@ -544,7 +717,11 @@ def main():
             check = compare_unloaded(url, bodies, runs)
             say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
                 f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 unloaded)")
-            out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check}
+            out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check,
+                                    "competitor": COMPETITOR.get(name), "config": {k: opt(k, None) for k in (
+                                        "zvec-fields", "zvec-fusion", "zvec-workers", "zvec-query-threads")}
+                                    if name == "zvec" else {k: opt(k, None) for k in ("vespa-mode", "vespa-profile")}
+                                    if name == "vespa" else None}
         finally:
             stop(proc)
             time.sleep(5)

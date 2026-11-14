@@ -10,7 +10,7 @@ no batch window. Requests with ``explain`` or ``highlight`` go in batches of the
 slow the whole batch); everything else shares a batch.
 
 **Transport.** A Unix-domain socket per GPU process, in the supervisor's state directory (mode 0700), the socket itself
-mode 0600. A frame is an 8-byte big-endian length and a pickle. Pickle is code execution on load, so the socket must
+mode 0600. A frame is a 12-byte header (pickle length, a buffer count of 0) and a pickle (protocol 5). Pickle is code execution on load, so the socket must
 stay inside one trust boundary: the service user's own processes. Never expose it on TCP.
 
     front -> gpu   ("search", id, index, request)          ("call", id, method, path, body, headers)
@@ -49,32 +49,57 @@ log = logging.getLogger("serving.gpu")
 MAX_BATCH = 64
 RETRY_CAP = 2
 _LEN = struct.Struct(">Q")
+_HEAD = struct.Struct(">QI")                                    # pickle length, number of out-of-band buffers
 _OWN_BATCH = ("explain", "highlight")
+THREAD_CPU: dict = {}                                           # thread name -> its CPU seconds so far (S6-19s)
+
+
+def _account(kind: str) -> None:
+    """Record this thread's CPU time under its kind (reader, writer, batches, ...); the 5 s log sums them."""
+    THREAD_CPU[(kind, threading.get_ident())] = time.thread_time()
 
 
 # ---- frames ------------------------------------------------------------------------------------------------------------
 def send_msg(sock: socket.socket, obj: Any, lock: threading.Lock) -> None:
-    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    data = pickle.dumps(obj, protocol=5)
     with lock:
-        sock.sendall(_LEN.pack(len(data)) + data)
+        sock.sendall(_HEAD.pack(len(data), 0) + data)
+
+
+def _read_into(sock: socket.socket, n: int) -> bytearray | None:
+    buf = bytearray(n)
+    view, got = memoryview(buf), 0
+    while got < n:
+        k = sock.recv_into(view[got:], n - got)
+        if not k:
+            return None
+        got += k
+    return buf
 
 
 def _read_exact(sock: socket.socket, n: int) -> bytes | None:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(min(n - len(buf), 1 << 20))
-        if not chunk:
-            return None
-        buf += chunk
-    return bytes(buf)
+    b = _read_into(sock, n)
+    return None if b is None else bytes(b)
 
 
 def recv_msg(sock: socket.socket) -> Any | None:
-    head = _read_exact(sock, 8)
+    head = _read_into(sock, _HEAD.size)
     if head is None:
         return None
-    data = _read_exact(sock, _LEN.unpack(head)[0])
-    return None if data is None else pickle.loads(data)
+    n, k = _HEAD.unpack(head)
+    sizes = _read_into(sock, 8 * k) if k else b""
+    if sizes is None:
+        return None
+    data = _read_into(sock, n)
+    if data is None:
+        return None
+    bufs = []
+    for j in range(k):
+        b = _read_into(sock, _LEN.unpack_from(sizes, 8 * j)[0])
+        if b is None:
+            return None
+        bufs.append(b)
+    return pickle.loads(data, buffers=bufs)
 
 
 def unix_listen(path: str) -> socket.socket:
@@ -120,6 +145,7 @@ class _Conn:
                 send_msg(self.sock, msg, self.lock)
             except OSError:
                 return                                          # the front went away; its callers time out
+            _account("writer")
 
     def close(self) -> None:
         self.out.put(None)
@@ -188,6 +214,7 @@ class GpuServer:
                     return
                 if msg[0] == "search":
                     self.q.put(_Item(conn, msg[1], msg[2], msg[3]))
+                    _account("reader")
                     self._publish_load()
                 elif msg[0] == "call":
                     self.calls.submit(self._call, conn, msg)
@@ -256,6 +283,7 @@ class GpuServer:
                         self._reply(it, ("search", it.id, "error", status, body))
             self._flush()
             self.in_batch = 0
+            _account("batches")
             self._publish_load()
 
     def _fail(self, items: list[_Item], exc: BaseException) -> None:
@@ -329,7 +357,11 @@ class GpuServer:
     # -- what the process is doing, every 5 s in its log (and gauges): batches, queue, device memory
     def _stats(self, every: float = 5.0) -> None:
         last = (0, 0, 0.0, time.perf_counter())
+        last_cpu: dict = {}
         while not self._stop.wait(every):
+            cpu = {}
+            for (kind, _), v in list(THREAD_CPU.items()):
+                cpu[kind] = cpu.get(kind, 0.0) + v
             nb, nr, busy, t = self.n_batches, self.n_requests, self.busy_s, time.perf_counter()
             dt = t - last[3]
             mem = device_memory()
@@ -338,11 +370,13 @@ class GpuServer:
             for k, v in mem.items():
                 m.set("s3_device_memory_bytes", v, kind=k)
             if nb != last[0] or self.q.qsize():
+                share = {k: round(100 * (v - last_cpu.get(k, 0.0)) / dt) for k, v in sorted(cpu.items())}
                 log.info("gpu process %d: %.0f req/s in %.1f batches/s (mean %.1f), search_batch busy %.0f%%, "
-                         "queue %d, device MiB %s", self.index, (nr - last[1]) / dt, (nb - last[0]) / dt,
-                         (nr - last[1]) / max(1, nb - last[0]), 100 * (busy - last[2]) / dt, self.q.qsize(),
-                         {k: round(v / 2**20) for k, v in mem.items()})
+                         "queue %d, thread CPU %% of a core %s, device MiB %s", self.index, (nr - last[1]) / dt,
+                         (nb - last[0]) / dt, (nr - last[1]) / max(1, nb - last[0]), 100 * (busy - last[2]) / dt,
+                         self.q.qsize(), share, {k: round(v / 2**20) for k, v in mem.items()})
             last = (nb, nr, busy, t)
+            last_cpu = cpu
 
     # -- versions for the fronts' caches
     def _publish_versions(self) -> None:
