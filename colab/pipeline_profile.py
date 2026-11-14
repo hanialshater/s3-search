@@ -83,6 +83,12 @@ DEEP = any(a == "--deep=1" for a in sys.argv[1:])
 # --triton=1 (S6-18): with --deep=1, measure the depth-2,000 request again with the Triton BM25F sum (S3_TRITON_BM25=1),
 # in the same process, and profile it.
 TRITON = any(a == "--triton=1" for a in sys.argv[1:])
+# --facets=1 (S6-18, the facet kernel's A100 run, plan-facets-a100): a microbench of bincount_rows on [64, 1,215,854]
+# masks (30% true) with 50,000 and 2,000 codes, torch path against S3_TRITON_FACETS=1, counts compared exactly; then a
+# lexical-only index and the faceted lexical request (brand and colour terms facets, size 10) at batch 64 with the
+# facet kernel off and on (the BM25F and top-k kernels at their defaults), 256 responses compared field by field, and
+# one torch.profiler batch each. Use with --plan-cache=0.
+FACET_RUN = any(a == "--facets=1" for a in sys.argv[1:])
 
 
 def measure(index, make, texts, label, kw=None):
@@ -120,6 +126,76 @@ def measure(index, make, texts, label, kw=None):
         say(f"{label}: batch {bs}: {qps:.0f} QPS, batch latency p50 {pct(walls, 50):.1f} ms, p99 {pct(walls, 99):.1f} ms, "
             f"host CPU {cpu * 1e3 / len(reqs):.3f} ms per request ({cpu / total:.2f} cores)")
     return out
+
+
+def facet_microbench():
+    import torch
+    from engine.backend import get_backend
+    b = get_backend("cuda")
+    Q, N = 64, 1_215_854
+    g = torch.Generator(device="cuda").manual_seed(0)
+    valid = torch.rand((Q, N), generator=g, device="cuda") < 0.3
+    out = {"shape": [Q, N], "density": 0.3}
+
+    def timeit(f, reps=20):
+        for _ in range(3):
+            f()
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(reps):
+            f()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t) * 1000 / reps
+    for n in (50_000, 2_000):
+        codes = torch.randint(0, n, (N,), generator=g, device="cuda")
+        r = {}
+        for on in ("0", "1"):
+            os.environ["S3_TRITON_FACETS"] = on
+            r["triton_ms" if on == "1" else "torch_ms"] = timeit(lambda: b.bincount_rows(codes, valid, n))
+        os.environ["S3_TRITON_FACETS"] = "0"
+        want = b.bincount_rows(codes, valid, n)
+        os.environ["S3_TRITON_FACETS"] = "1"
+        got = b.bincount_rows(codes, valid, n)
+        r["counts_equal"] = bool(torch.equal(want, got))
+        r["speedup"] = r["torch_ms"] / r["triton_ms"]
+        out[f"codes_{n}"] = r
+        say(f"facet microbench, {n:,} codes: torch {r['torch_ms']:.2f} ms, Triton {r['triton_ms']:.2f} ms "
+            f"({r['speedup']:.2f}x), counts equal {r['counts_equal']}")
+    os.environ["S3_TRITON_FACETS"] = "0"
+    return out
+
+
+def facet_runs(index, texts):
+    from engine.api import expand_hits
+    facets = {"brand": {"terms": {"field": "product_brand.keyword", "size": 10}},
+              "color": {"terms": {"field": "product_color.keyword", "size": 10}}}
+    make = lambda q: {"query": lexical(q), "aggs": facets, "size": 10}  # noqa: E731
+    res = {}
+    for on in ("0", "1"):
+        os.environ["S3_TRITON_FACETS"] = on
+        label = "faceted_triton" if on == "1" else "faceted_torch"
+        res[label] = {"measure": measure(index, make, texts, label)}
+        try:
+            res[label]["torch_profile"] = torch_profile(index, make, texts, label)
+        except Exception as e:  # noqa: BLE001
+            res[label]["torch_profile"] = {"error": repr(e)[:500]}
+    differ = 0
+    for i in range(0, 256, 64):
+        reqs = [make(t) for t in texts[i:i + 64]]
+        os.environ["S3_TRITON_FACETS"] = "1"
+        on = [expand_hits(r) for r in index.search_batch(reqs)]
+        os.environ["S3_TRITON_FACETS"] = "0"
+        off = [expand_hits(r) for r in index.search_batch(reqs)]
+        differ += sum({k: v for k, v in x.items() if k != "took_ms"} != {k: v for k, v in y.items() if k != "took_ms"}
+                      for x, y in zip(on, off))
+    res["responses_differ"] = {"of": 256, "differ": differ}
+    q0 = res["faceted_torch"]["measure"]["throughput"]["64"]["qps"]
+    q1 = res["faceted_triton"]["measure"]["throughput"]["64"]["qps"]
+    res["qps_gain_batch_64"] = q1 / q0 - 1
+    say(f"faceted lexical at batch 64: {q0:.0f} QPS torch facets, {q1:.0f} with the kernel ({q1 / q0 - 1:+.1%}); "
+        f"{differ} of 256 responses differ")
+    os.environ.pop("S3_TRITON_FACETS", None)
+    return res
 
 
 def torch_profile(index, make, texts, label, bs=64, kw=None):
@@ -185,6 +261,24 @@ def main():
               "color": {"terms": {"field": "product_color.keyword", "size": 20}}}
     m = copy.deepcopy(ds.mapping)
     m["_meta"]["engine"]["bm25"] = json.loads(open("referee/requests/bm25f-tuned.bm25.json").read())
+    if FACET_RUN:                                    # lexical only: no encoder, no ranker
+        micro = facet_microbench()
+        say(f"build (facet run): {len(ds.catalogue):,} products on cuda, lexical only")
+        t0 = time.perf_counter()
+        index = api.build_index(ds.catalogue, m, device="cuda")
+        build_s = time.perf_counter() - t0
+        texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
+        from engine.backend import triton_gate
+        result = {"kind": "pipeline-profile-facets", "label": "development only, never a score", "ref": REF,
+                  "commit": commit, "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
+                  "triton_effective": triton_gate.effective(index._st.b),
+                  "n_products": int(len(ds.catalogue)), "n_queries": len(texts), "build_s": build_s,
+                  "microbench": micro, "faceted": facet_runs(index, texts)}
+        stop.set()
+        json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
+        say("DONE")
+        print(json.dumps(result, indent=1), flush=True)
+        return 0
     m["_meta"]["engine"]["embeddings"] = {"embedding": {"model": "tfidf-svd-128",
                                                        "inputs": ["product_title", "product_brand", "product_color"]}}
     m["properties"]["embedding"] = {"type": "knn_vector", "dimension": 128,
