@@ -46,7 +46,10 @@ def test_template_fill():
 
 def test_results_record_the_engine_switches(monkeypatch):
     """S3_TRITON_BM25, S3_PLAN_CACHE and S3_CUDA_BLOCKING_SYNC are recorded as set, null when unset."""
+    import os
     from referee import bench as b
+    for k in [k for k in os.environ if k.startswith("S3_TRITON_")]:   # the run's own switches must not leak in
+        monkeypatch.delenv(k)
     monkeypatch.setenv("S3_TRITON_BM25", "1")
     monkeypatch.delenv("S3_PLAN_CACHE", raising=False)
     monkeypatch.setenv("S3_CUDA_BLOCKING_SYNC", "0")
