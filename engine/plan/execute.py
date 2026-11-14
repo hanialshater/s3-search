@@ -101,14 +101,15 @@ class Executor:
         self.knn_outcome = {}
 
     # ---- retrieval, batched across plans
-    def _prefetch(self, plans, timer):
+    def _prefetch(self, plans, timer, skip=()):
+        """``skip``: lexical nodes the fused path (S6-22) scores instead; nothing else reads them."""
         st, b = self.st, self.b
         lex = defaultdict(list)
         dense = defaultdict(list)
         for p in plans:
             roots = [p.root] + ([p.post_filter] if p.post_filter is not None else [])
             for n in (m for r in roots for m in walk(r)):
-                if isinstance(n, Lexical):
+                if isinstance(n, Lexical) and n not in skip:
                     lex[(n.fields, n.idf)].append(n)
                 elif isinstance(n, Dense):
                     dense[n.field].append(n)
@@ -693,17 +694,31 @@ class Executor:
         b, st = self.b, self.st
         timer = Timer(b)
         shared_t0 = time.perf_counter()
-        self._prefetch(plans, timer)
+        fused = self._fused_plans(plans)                   # S6-22: bare lexical plans scored by one fused pass
+        if fused:
+            others = {n for k, p in enumerate(plans) if k not in fused
+                      for r in [p.root] + ([p.post_filter] if p.post_filter is not None else []) for n in walk(r)}
+            self._prefetch(plans, timer, skip={plans[k].root for k in fused} - others)
+            fused_out = self._fused_lexical(plans, sorted(fused))
+            timer.lap("retrieve")
+        else:
+            self._prefetch(plans, timer)
+            fused_out = {}
         if self.BATCHED and len(plans) > 1:              # a batch of one: the per-plan path is cheaper (S6-9 profile)
             self._batched_fusion(plans, timer)
         shared = dict(timer.laps)
         shared_ms = (time.perf_counter() - shared_t0) * 1000.0
-        pre = self._batched_lexical_roots(plans) if self.BATCHED and len(plans) > 1 else {}
+        pre = self._batched_lexical_roots(plans, skip=fused_out) if self.BATCHED and len(plans) > 1 else {}
         states = []
         for k, plan in enumerate(plans):
             t = Timer(b, sync=self.SYNC_PLAN_TIMES or len(plans) == 1)
             ctx = {"explain": {} if plan.explain else None}
             self.knn_outcome = {}
+            if k in fused_out:                            # S6-22: scores, total and facets from the fused pass
+                states.append({"plan": plan, "t": t, "ctx": ctx, "score": None, "match": None, "hits_mask": None,
+                               "tier": None, "knn": _knn_methods(b, plan, self.knn_outcome), "rescore_later": False,
+                               "stacked": None, "fused": fused_out[k]})
+                continue
             stacked = None
             if k in pre:                                  # S6-17: computed with the batch's other lexical roots
                 score, match, ctx["lexical"], stacked = pre[k]
@@ -869,13 +884,14 @@ class Executor:
             out.append(b.astype(r, "int64"))
         return b.concatenate(out, 0)
 
-    def _batched_lexical_roots(self, plans):
+    def _batched_lexical_roots(self, plans, skip=()):
         """S6-17: ``{plan index: (score, match, ctx["lexical"])}`` for the plans whose query is a bare lexical node
         (no explain), the same values ``eval`` and the live mask give, computed for a chunk of them at once: one
         compare, one product, one select and one mask over the stacked rows instead of four or five small kernels
         and their Python per plan. Element by element they are the same operations, so the same bits."""
         b, st = self.b, self.st
-        idx = [k for k, p in enumerate(plans) if isinstance(p.root, Lexical) and not p.explain and p.root.msm != 0]
+        idx = [k for k, p in enumerate(plans) if isinstance(p.root, Lexical) and not p.explain and p.root.msm != 0
+               and k not in skip]                         # S6-22: the fused plans have their rows already
         out = {}
         if len(idx) < 2:
             return out
@@ -944,6 +960,138 @@ class Executor:
                     states[i]["t"].laps["features"] += (t1 - t0) * 1000.0 / G
                     states[i]["t"].laps["rank"] += (t2 - t1) * 1000.0 / G
 
+    # ---- S6-22: the fused lexical path (engine/backend/triton_fused.py) -----------------------------------------------
+
+    def _fused_plans(self, plans) -> set:
+        """The plans the fused pass serves: a batch (more than one plan) on one segment, float64 accumulation, the
+        fused path on (``S3_TRITON_FUSED_LEXICAL``), and a plan that is a bare lexical query sorted by score, with
+        only plain terms aggregations: no explain, filter, rescore, collapse, search_after or highlight. Its query must
+        fit one postings chunk (as alone, today's path sums it in one float64 pass). Every other plan takes today's
+        path."""
+        from ..backend import triton_fused as TF
+        b, st = self.b, self.st
+        if not (self.BATCHED and len(plans) > 1 and TF.mode(b) is not None and len(st.parts) == 1
+                and getattr(st.parts[0], "identity", False) and getattr(b, "accumulate", "float64") == "float64"):
+            return set()
+        part = st.parts[0]
+        ptr = part.host_term_ptr
+        out = set()
+        for k, p in enumerate(plans):
+            r = p.root
+            if not (isinstance(r, Lexical) and r.msm >= 1 and not p.explain and p.post_filter is None
+                    and p.rescore is None and p.collapse is None and not p.search_after and p.highlight is None
+                    and len(p.sort) == 1 and p.sort[0].field == "_score" and p.sort[0].descending
+                    and p.from_ + p.size > 0 and all(a.kind == "terms" and not a.sub for a in p.aggs)):
+                continue
+            n_post = sum(int(ptr[part.vocab[t] + 1] - ptr[part.vocab[t]]) for t in r.terms if t in part.vocab)
+            if n_post <= ops.lexical.MAX_POSTINGS_PER_CHUNK:
+                out.add(k)
+        return out
+
+    def _fused_lexical(self, plans, idx) -> dict:
+        """``{plan index: (scores [G, N], row, totals [G], {facet field: counts [G, n]}, chunk id)}``: one fused call
+        per chunk of the plans sharing fields and idf mode."""
+        from ..backend import triton_fused as TF
+        b, st = self.b, self.st
+        part = st.parts[0]
+        by = defaultdict(list)
+        for k in idx:
+            r = plans[k].root
+            by[(r.fields, r.idf)].append(k)
+        out = {}
+        F = len(st.text_fields)
+        bb = np.array([st.mapping.b_of(f) for f in st.text_fields], np.float32)
+        for (fields, idf_mode), ks in by.items():
+            w = np.zeros(F, np.float32)
+            for f, wt in fields:
+                w[st.field_index[f]] = wt
+            f_i = next(st.field_index[f] for f, wt in fields if wt > 0) if idf_mode == "field" else None
+            idf = part.idf_field[:, f_i] if f_i is not None else part.idf
+            for ch in self._chunks(ks):
+                nodes = [plans[k].root for k in ch]
+                terms = [[part.vocab[t] for t in n.terms if t in part.vocab] for n in nodes]
+                ffields = list(dict.fromkeys(a.field for k in ch for a in plans[k].aggs))
+                codes = [self._facet_codes(f) for f in ffields]
+                scores, totals, facets = TF.run(b, part, terms, w, bb, st.mapping.k1, idf, [n.msm for n in nodes],
+                                                [n.boost for n in nodes], st.live, [c for c, _ in codes],
+                                                [len(keys) for _, keys in codes])
+                fac = {f: (counts, keys) for f, counts, (_, keys) in zip(ffields, facets, codes)}
+                cid = object()
+                for g, k in enumerate(ch):
+                    out[k] = (scores, g, totals, fac, cid)
+        return out
+
+    def _fused_totals_and_pages(self, states, totals, pages):
+        """The fused plans' totals and pages: per fused chunk one top-k over its score rows (-inf where not matched, so
+        no mask), then one transfer for every chunk's totals and pages, the same arrays as
+        ``_batched_totals_and_pages`` gives."""
+        b, st = self.b, self.st
+        by = defaultdict(list)
+        for i, sx in enumerate(states):
+            if "fused" in sx:
+                by[id(sx["fused"][4])].append(i)
+        if not by:
+            return
+        t0 = time.perf_counter()
+        k = max(states[i]["plan"].from_ + states[i]["plan"].size for ch in by.values() for i in ch)
+        order, tots, bufs = [], [], []
+        for ch in by.values():
+            S, _, tot, _, _ = states[ch[0]]["fused"]
+            rows_g = [states[i]["fused"][1] for i in ch]
+            if rows_g != list(range(S.shape[0])):
+                sel = b.asarray(rows_g, "int64")
+                S, tot = S[sel], tot[sel]
+            G = len(ch)
+            rows = b.arange(G).reshape(G, 1)
+            idx, _ = b.topk(S, k)
+            idx = b.astype(idx, "int64")
+            safe = b.where(idx >= 0, idx, 0)
+            bufs.append(b.stack([b.astype(idx, "float64"), b.astype(S[rows, safe], "float64"),
+                                 b.astype(st.first_offset_dev[safe], "float64")], 2).reshape(-1))
+            tots.append(b.astype(tot, "float64"))
+            order += ch
+        n = len(order)
+        host = b.to_numpy(b.concatenate(tots + bufs, 0))            # one transfer: every total, then every page
+        need = (len(host) - n) // (3 * n)
+        pg = host[n:].reshape(n, need, 3)
+        ms = (time.perf_counter() - t0) * 1000.0 / n
+        for r, i in enumerate(order):
+            p = states[i]["plan"]
+            totals[i] = int(host[r])
+            h = pg[r, p.from_:p.from_ + p.size]
+            h = h[h[:, 0] >= 0]
+            pages[i] = (h[:, 0].astype("int64"), h[:, 1:2], h[:, 1:3])
+            states[i]["page_ms"] = ms
+
+    def _fused_terms(self, states, out):
+        """The fused plans' terms aggregations from the pass's counts: per field and size one ``top_buckets`` over
+        every fused chunk's rows, as ``_batched_terms``."""
+        b = self.b
+        groups = defaultdict(list)
+        for i, sx in enumerate(states):
+            if "fused" in sx:
+                for a in sx["plan"].aggs:
+                    groups[(a.field, a.size)].append((i, a))
+        for (field, size), items in groups.items():
+            t0 = time.perf_counter()
+            keys_of = states[items[0][0]]["fused"][3][field][1]
+            by = defaultdict(list)
+            for i, a in items:
+                by[id(states[i]["fused"][4])].append((i, a))
+            rows, order = [], []
+            for its in by.values():
+                counts = states[its[0][0]]["fused"][3][field][0]
+                rows.append(counts[b.asarray([states[i]["fused"][1] for i, _ in its], "int64")])
+                order += its
+            counts = b.concatenate(rows, 0) if len(rows) > 1 else rows[0]
+            for (i, a), (top, with_value) in zip(order, ops.top_buckets(b, counts, size)):
+                out[i][a.name] = {"doc_count_error_upper_bound": 0,
+                                  "sum_other_doc_count": with_value - sum(c for _, c in top),
+                                  "buckets": [{"key": keys_of[c], "doc_count": n} for c, n in top]}
+            ms = (time.perf_counter() - t0) * 1000.0 / len(items)
+            for i, _ in items:
+                states[i]["facet_ms"] = states[i].get("facet_ms", 0.0) + ms
+
     def _chunks(self, idx):
         for k in range(0, len(idx), self.BATCH_ROWS):
             yield idx[k:k + self.BATCH_ROWS]
@@ -953,11 +1101,14 @@ class Executor:
         field and size: one bincount and one top-buckets transfer per group and chunk, the same buckets as ``_agg``."""
         b = self.b
         groups = defaultdict(list)
+        out = defaultdict(dict)
+        self._fused_terms(states, out)
         for i, sx in enumerate(states):
+            if "fused" in sx:
+                continue
             for a in sx["plan"].aggs:
                 if self.BATCHED and a.kind == "terms" and not a.sub:
                     groups[(a.field, a.size)].append((i, a))
-        out = defaultdict(dict)
         for (field, size), items in groups.items():
             t0 = time.perf_counter()
             codes, keys_of = self._facet_codes(field)
@@ -983,17 +1134,18 @@ class Executor:
 
         def is_plain(sx):
             p = sx["plan"]
-            return (sx["tier"] is None and p.collapse is None and not p.search_after and len(p.sort) == 1
+            return ("fused" not in sx and sx["tier"] is None and p.collapse is None and not p.search_after and len(p.sort) == 1
                     and p.sort[0].field == "_score" and p.sort[0].descending and p.from_ + p.size > 0
                     and str(sx["score"].dtype).endswith("float32"))
 
         def is_tiered(sx):                                # S6-11: a rescored plan sorted by score: tier, then score
             p = sx["plan"]
-            return (sx["tier"] is not None and p.collapse is None and not p.search_after and len(p.sort) == 1
+            return ("fused" not in sx and sx["tier"] is not None and p.collapse is None and not p.search_after and len(p.sort) == 1
                     and p.sort[0].field == "_score" and p.sort[0].descending and p.from_ + p.size > 0
                     and str(sx["score"].dtype).endswith("float32"))
 
         totals, pages = {}, {}
+        self._fused_totals_and_pages(states, totals, pages)
         for tiered in (False, True):
             if tiered and len(states) == 1:              # a batch of one: the per-plan page is cheaper (S6-12)
                 continue

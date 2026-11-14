@@ -25,7 +25,8 @@ SUITES = [  # (name, pytest targets, hard limit in seconds)
     # S6-18: the Triton kernel tests again, verbose, and failed if any is skipped: a GPU class passes only if every
     # kernel test ran on it. Then each kernel's first-call (compile) time, in a fresh process with an empty cache.
     ("triton tests", ["engine/tests/test_triton_bm25.py", "engine/tests/test_triton_topk.py",
-                      "engine/tests/test_triton_facets.py", "engine/tests/test_triton_fallback.py"], 600),
+                      "engine/tests/test_triton_facets.py", "engine/tests/test_triton_fallback.py",
+                      "engine/tests/test_fused_lexical.py"], 600),
     ("triton first call", "colab/triton_first_call.py", 600),
 ]
 
