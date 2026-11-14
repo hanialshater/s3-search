@@ -71,9 +71,11 @@ def test_fused_reference_gives_todays_responses(ds, device, monkeypatch):
 
 
 @pytest.mark.skipif(TF.triton is None or "cuda" not in available_devices(), reason="needs Triton and cuda")
-def test_kernel_equals_the_reference_bit_for_bit(ds, monkeypatch):
+@pytest.mark.parametrize("impacts", ["0", "1"])                                 # S6-33: weights precomputed per w
+def test_kernel_equals_the_reference_bit_for_bit(ds, impacts, monkeypatch):
     import torch
     monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    monkeypatch.setenv("S3_TRITON_FUSED_IMPACTS", impacts)
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
     st = ix._st
     part, b = st.parts[0], st.b
@@ -95,13 +97,17 @@ def test_kernel_equals_the_reference_bit_for_bit(ds, monkeypatch):
     assert torch.equal(got[1], want[1])
     for g, wv in zip(got[2], want[2]):
         assert torch.equal(g, wv)
+    if impacts == "1":                                                          # the impact path really ran
+        assert any(v is not None for k, v in part.__dict__.get("_fused_impacts", {}).items() if k != "terms")
     again = TF._run_kernel(b, part, terms, w, bb, 1.2, part.idf, msm, boost, live, codes, sizes)
     assert torch.equal(again[0].view(torch.int32), got[0].view(torch.int32))  # run to run
 
 
 @pytest.mark.skipif(TF.triton is None or "cuda" not in available_devices(), reason="needs Triton and cuda")
-def test_kernel_responses_equal_todays(ds, monkeypatch):
+@pytest.mark.parametrize("impacts", ["0", "1"])
+def test_kernel_responses_equal_todays(ds, impacts, monkeypatch):
     monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    monkeypatch.setenv("S3_TRITON_FUSED_IMPACTS", impacts)
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
     reqs = _requests(ds)
     monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "0")                          # the unfused path
