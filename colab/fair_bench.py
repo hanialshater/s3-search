@@ -522,6 +522,10 @@ def engine_target(ds, server_cpus):
            "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0"),
            "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0"),
            **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
+    COMPETITOR.setdefault("engine", {})["server_env"] = {      # provenance: what the server ran with (the steward's ask)
+        k: v for k, v in env.items() if k.startswith(("S3_SERVING_", "S3_SEARCH_", "S3_TRITON", "S3_PLAN_CACHE",
+                                                      "S3_CUDA_"))}
+    COMPETITOR["engine"]["server_env_arg"] = opt("server-env", "")
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
