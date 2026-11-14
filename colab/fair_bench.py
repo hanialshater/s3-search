@@ -791,10 +791,12 @@ def main():
         try:
             bodies = [json.dumps(make_body(t)).encode() for t in texts]
             os.makedirs(SAMPLES, exist_ok=True)
-            for b in bodies[:200]:                               # warm-up, one at a time
-                urllib.request.urlopen(urllib.request.Request(url, data=b, method="POST",
-                                                              headers={"Content-Type": "application/json"}),
-                                       timeout=60).read()
+            # Warm-up, one at a time: 200 bodies to every GPU process (X-S3-Route-Gpu). With one request in flight the
+            # least loaded process is always 0, so before plat-m19 the others met their first requests (and their
+            # first kernels) inside the measured rung: every run's first rung had a multi-second p99.
+            for j in (range(GPUS) if name == "engine" and GPUS > 1 else [None]):
+                for b in bodies[:200]:
+                    _post(url, b, route=j)
             runs = []
             for rate in RATES:
                 say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s")
