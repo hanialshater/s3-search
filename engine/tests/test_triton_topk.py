@@ -74,5 +74,8 @@ def test_deep_responses_unchanged(monkeypatch, _any_gpu_class):
     assert _any_gpu_class, "the Triton kernel never ran"
 
 
-def test_off_by_default():
+def test_on_by_default_and_off_with_0(monkeypatch):
+    monkeypatch.delenv("S3_TRITON_TOPK", raising=False)
+    assert TT.wanted(get_backend("cuda"), 2000)                # S6-18c: on by default where the gate allows
+    monkeypatch.setenv("S3_TRITON_TOPK", "0")
     assert not TT.wanted(get_backend("cuda"), 2000)

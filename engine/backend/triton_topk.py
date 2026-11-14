@@ -14,8 +14,9 @@ is the largest top-k cost. Here:
    of a [Q, k] int64 key: small next to the row.
 
 So the indices and values equal the int64-key top-k's exactly, and run to run: no float atomics, no order-dependent
-sums. Used on cuda when ``S3_TRITON_TOPK`` is "1" and ``triton_gate.supported`` (Triton imports, at the tested version, on a GPU class that passed), for k at least ``MIN_K`` (small windows
-stay on the one-call path).
+sums. Used on cuda where ``triton_gate.supported`` (Triton imports, at the tested version, on a GPU class that
+passed GPU CI), for k at least ``MIN_K`` (small windows stay on the one-call path). On by default since S6-18c (the
+founder's decision, 2026-11-14); ``S3_TRITON_TOPK=0`` turns it off.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ MIN_K = 256
 
 
 def wanted(b, k: int) -> bool:
-    return k >= MIN_K and os.environ.get("S3_TRITON_TOPK", "0") == "1" and triton_gate.supported(b)
+    return k >= MIN_K and os.environ.get("S3_TRITON_TOPK", "1") != "0" and triton_gate.supported(b)   # on by default
 
 
 if triton is not None:
