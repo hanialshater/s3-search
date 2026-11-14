@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -41,6 +41,7 @@ import multiprocessing as mp
 import os
 import subprocess
 import sys
+import shutil
 import tarfile
 import time
 import urllib.request
@@ -255,6 +256,70 @@ def _post(url, body, route=None):
         return r.read(), r.headers.get("X-S3-Gpu-Process"), r.headers.get("X-S3-Index-Version")
 
 
+def _json_value_end(raw: bytes, i: int) -> int:
+    """The end offset of the JSON value starting at raw[i] (any type: object, array, string, number, literal)."""
+    c = raw[i:i + 1]
+    if c == b'"':
+        j = i + 1
+        while raw[j:j + 1] != b'"':
+            j += 2 if raw[j:j + 1] == b"\\" else 1
+        return j + 1
+    if c in (b"{", b"["):
+        depth, j = 0, i
+        while True:
+            ch = raw[j:j + 1]
+            if ch == b'"':
+                j = _json_value_end(raw, j)
+                continue
+            if ch in (b"{", b"["):
+                depth += 1
+            elif ch in (b"}", b"]"):
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+    j = i
+    while j < len(raw) and raw[j:j + 1] not in (b",", b"}", b"]", b" ", b"\n", b"\r", b"\t"):
+        j += 1
+    return j
+
+
+def blank_took_ms(raw: bytes) -> tuple[bytes, int]:
+    """Every top-level-or-nested ``"took_ms": <value>`` becomes ``"took_ms": 0``, whatever the value's JSON type (the
+    steward's ask after plat-m18, where it was an object); returns the bytes and how many were blanked."""
+    out, k, pos, key = [], 0, 0, b'"took_ms":'
+    while True:
+        i = raw.find(key, pos)
+        if i < 0:
+            break
+        v = i + len(key)
+        while raw[v:v + 1] in (b" ", b"\n", b"\r", b"\t"):
+            v += 1
+        out.append(raw[pos:v] + b"0")
+        pos, k = _json_value_end(raw, v), k + 1
+    out.append(raw[pos:])
+    return b"".join(out), k
+
+
+def ab_dump(url, bodies, path, n) -> dict:
+    """--ab-dump=FILE (S6-22s): the first n request bodies, one at a time and unloaded, each response's raw bytes
+    with only the took_ms value blanked (any JSON type: blank_took_ms), as length-prefixed records; colab/front_ab.py
+    compares two such files byte for byte (the stdlib front's and the native front's) and fails if nothing was blanked."""
+    import hashlib
+    import struct
+    digest, blanked = hashlib.sha256(), 0
+    with open(path, "wb") as f:
+        for b in bodies[:n]:
+            raw, _, _ = _post(url, b)
+            raw, k = blank_took_ms(raw)
+            blanked += k
+            f.write(struct.pack("<I", len(raw)) + raw)
+            digest.update(struct.pack("<I", len(raw)) + raw)
+    out = {"path": path, "n": min(n, len(bodies)), "took_ms_blanked": blanked, "sha256": digest.hexdigest()}
+    say(f"ab dump: {out}")
+    return out
+
+
 def _diff(a: bytes, b: bytes) -> dict:
     """Where two responses first differ: totals, page lengths, the first differing hit and both sides of it."""
     x, y = _comparable(json.loads(a)), _comparable(json.loads(b))
@@ -420,6 +485,10 @@ def vespa_target(ds, server_cpus):
     info.update(V.deploy())
     info.update(V.feed(ds.catalogue))
     build_s = time.time() - t0
+    info["documents_expected"] = int(len(ds.catalogue))
+    if info.get("documents") != info["documents_expected"]:     # (a), the steward: every document or no run
+        COMPETITOR["vespa"] = info
+        raise RuntimeError(f"Vespa holds {info.get('documents')} documents, not {info['documents_expected']}")
     info.update(V.check_proton())
     COMPETITOR["vespa"] = info
     say(f"vespa: {info}")
@@ -490,12 +559,35 @@ def zvec_target(ds, server_cpus):
     return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
 
 
+
+
+def build_native_front() -> dict:
+    """--front-server=native (S6-22s): build serving/native_front on the VM (Rust stable by rustup when cargo is
+    missing) and record the toolchain and the binary's sha256. The fronts' threads: --server-env=
+    S3_SERVING_FRONT_THREADS_NATIVE=N (default --fronts)."""
+    import hashlib
+    cargo = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+    if not os.path.exists(cargo):
+        subprocess.run("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable",
+                       shell=True, check=True)
+    t0 = time.time()
+    subprocess.run([cargo, "build", "--release"], cwd="serving/native_front", check=True)   # no Cargo.lock in the repo yet
+    binary = os.path.abspath("serving/native_front/target/release/s3-native-front")
+    info = {"cargo": subprocess.run([cargo, "--version"], capture_output=True, text=True).stdout.strip(),
+            "build_s": round(time.time() - t0, 1), "binary": binary,
+            "binary_sha256": hashlib.sha256(open(binary, "rb").read()).hexdigest(),
+            "cargo_lock": open("serving/native_front/Cargo.lock").read() if os.path.exists("serving/native_front/Cargo.lock") else None}
+    say(f"engine: native front built { {k: v for k, v in info.items() if k != 'cargo_lock'} }")
+    return info
+
+
 def engine_target(ds, server_cpus):
     """--engine-bm25: the index's BM25 parameters, a JSON object or a file (default the tuned bm25f-tuned.bm25.json);
     --engine-request: the request template file (default the tuned BM25F request; title-only.json for the parity
     runs). A different --engine-bm25 builds its own index (its own serve dir)."""
     global SERVE_DIR
-    spec = opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
+    native = build_native_front() if opt("front-server", "stdlib") == "native" else None
+    spec =opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
     bm25 = json.loads(spec) if spec.strip().startswith("{") else json.loads(Path(spec).read_text())
     if spec != "referee/requests/bm25f-tuned.bm25.json":
         import hashlib
@@ -521,11 +613,15 @@ def engine_target(ds, server_cpus):
            "S3_SERVING_FRONTS": str(FRONTS), "S3_SERVING_GPU_PROCESSES": str(GPUS),
            "S3_SERVING_GPU_MEMORY_FRACTION": opt("gpu-memory-fraction", "0"),
            "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0"),
+           "S3_SERVING_FRONT_SERVER": opt("front-server", "stdlib"),
+           **({"S3_NATIVE_FRONT_BIN": native["binary"]} if native else {}),
            **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
     COMPETITOR.setdefault("engine", {})["server_env"] = {      # provenance: what the server ran with (the steward's ask)
         k: v for k, v in env.items() if k.startswith(("S3_SERVING_", "S3_SEARCH_", "S3_TRITON", "S3_PLAN_CACHE",
                                                       "S3_CUDA_"))}
     COMPETITOR["engine"]["server_env_arg"] = opt("server-env", "")
+    if native:
+        COMPETITOR["engine"]["native_front"] = native
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
@@ -583,6 +679,7 @@ class Sampler:
     def __init__(self, pid):
         import threading
         self.pid, self.gpu, self.mem, self.cpu = pid, [], [], []
+        self.extra = None                                       # Vespa: its daemons, found by command line
         self.per_cpu, self.per_mem, self.role = {}, {}, {}      # per process: cores and device MiB samples
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
@@ -600,7 +697,11 @@ class Sampler:
                 pass
             try:
                 total = 0.0
-                for p in [root] + root.children(recursive=True):
+                procs_now = [root] + root.children(recursive=True)
+                if RESPONSE["kind"] == "vespa":
+                    from colab.competitors import vespa_run as _V
+                    procs_now += [psutil.Process(q) for q in _V.vespa_pids() if q not in {x.pid for x in procs_now}]
+                for p in procs_now:
                     if p.pid not in procs:
                         procs[p.pid] = p
                         p.cpu_percent(None)                     # the first call only starts the counter
@@ -690,10 +791,12 @@ def main():
         try:
             bodies = [json.dumps(make_body(t)).encode() for t in texts]
             os.makedirs(SAMPLES, exist_ok=True)
-            for b in bodies[:200]:                               # warm-up, one at a time
-                urllib.request.urlopen(urllib.request.Request(url, data=b, method="POST",
-                                                              headers={"Content-Type": "application/json"}),
-                                       timeout=60).read()
+            # Warm-up, one at a time: 200 bodies to every GPU process (X-S3-Route-Gpu). With one request in flight the
+            # least loaded process is always 0, so before plat-m19 the others met their first requests (and their
+            # first kernels) inside the measured rung: every run's first rung had a multi-second p99.
+            for j in (range(GPUS) if name == "engine" and GPUS > 1 else [None]):
+                for b in bodies[:200]:
+                    _post(url, b, route=j)
             runs = []
             for rate in RATES:
                 say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s")
@@ -714,9 +817,23 @@ def main():
                     break
                 time.sleep(5)
             say(f"{name}: replaying sampled requests unloaded")
-            check = compare_unloaded(url, bodies, runs)
-            say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
-                f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 unloaded)")
+            try:                                                  # a dead server after the ladder must not lose it
+                check = compare_unloaded(url, bodies, runs)
+                say(f"{name}: unloaded comparison: {check['checked']} checked, {len(check['mismatch'])} differ, "
+                    f"{check['zero_hits_loaded']} with 0 hits under load ({check['zero_hits_unloaded_too']} also 0 "
+                    f"unloaded)")
+            except Exception as e:  # noqa: BLE001
+                check = {"error": f"{type(e).__name__}: {e}"}
+                say(f"{name}: unloaded comparison FAILED: {check['error']}")
+            if opt("ab-dump", None) and "error" not in check:     # S6-22s: the front A/B, byte for byte
+                check["ab_dump"] = ab_dump(url, bodies, opt("ab-dump", None), int(opt("ab-n", "1000")))
+            if name == "vespa":                                   # V5: proton and mmap after the ladder, and the log itself
+                from colab.competitors import vespa_run as _V
+                try:
+                    COMPETITOR["vespa"]["after"] = _V.check_proton()
+                except Exception as e:  # noqa: BLE001
+                    COMPETITOR["vespa"]["after"] = {"error": f"{type(e).__name__}: {e}"}
+                COMPETITOR["vespa"]["log_fetched"] = _V.fetch_log(LOG.replace(".log", "") + "-vespa.log")
             out["engines"][name] = {"build_s": build_s, "url": url, "runs": runs, "unloaded_check": check,
                                     "competitor": COMPETITOR.get(name), "config": {k: opt(k, None) for k in (
                                         "zvec-fields", "zvec-fusion", "zvec-workers", "zvec-query-threads")}

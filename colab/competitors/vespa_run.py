@@ -111,10 +111,67 @@ def deploy(app_dir: Path = APP) -> dict:
     return {"deploy_status": st, "deploy": json.loads(body).get("message")}
 
 
+_ILLEGAL = None
+
+
+def clean(text: str) -> str:
+    """Vespa refuses string fields holding control characters (plat-m15: 34 of 1,215,854 ESCI documents, code points
+    0x8, 0x18 and the like). They become spaces, for Vespa only; the run records how many documents changed."""
+    global _ILLEGAL
+    if _ILLEGAL is None:
+        import re
+        _ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+    return _ILLEGAL.sub(" ", text)
+
+
+def feed_client(catalogue, connections: int = 8) -> dict | None:
+    """Vespa's own feed client (vespa-feed-client in the image, the vendor's tool for bulk feeding), from a JSONL file
+    inside the chroot. None if the image has no feed client (then ``feed`` uses HTTP POSTs)."""
+    exe = f"{ROOT}/opt/vespa/bin/vespa-feed-client"
+    if not os.path.exists(exe):
+        return None
+    ids = catalogue["product_id"].astype(str).tolist()
+    cols = {f: catalogue[f].fillna("").astype(str).tolist() for f in FIELDS}
+    changed = 0
+    t0 = time.time()
+    with open(f"{ROOT}/tmp/feed.jsonl", "w") as fh:
+        for i, pid in enumerate(ids):
+            fields = {"product_id": pid}
+            for f in FIELDS:
+                v = clean(cols[f][i])
+                changed += v != cols[f][i]
+                fields[f] = v
+            fh.write(json.dumps({"put": f"id:esci:product::{pid}", "fields": fields}) + "\n")
+    write_s = time.time() - t0
+    uid, gid = _uid()
+    java = _sh(f"ls -d {ROOT}/usr/lib/jvm/*/bin/java | head -1").stdout.strip()[len(ROOT):].rsplit("/bin/java", 1)[0]
+    t1 = time.time()
+    r = _sh(["chroot", "--userspec", f"{uid}:{gid}", ROOT, "/bin/bash", "-c",
+             f"export JAVA_HOME={java} PATH={java}/bin:/opt/vespa/bin:/usr/bin:/bin; "
+             f"vespa-feed-client --endpoint http://localhost:{PORT}/ --file /tmp/feed.jsonl --connections {connections} "
+             f"--show-errors 2>&1 | tail -40"], check=False)
+    return {"feeder": "vespa-feed-client", "fields_cleaned": changed, "write_jsonl_s": round(write_s, 1),
+            "feed_s": round(time.time() - t1, 1), "feed_client_tail": r.stdout[-2000:]}
+
+
 def feed(catalogue, threads: int = 32) -> dict:
     """Every product through /document/v1 with ``threads`` concurrent POSTs (the build is reported, not compared)."""
     ids = catalogue["product_id"].astype(str).tolist()
-    cols = {f: catalogue[f].fillna("").astype(str).tolist() for f in FIELDS}
+    try:                                                        # already fed (a restart keeps proton's data): skip
+        st, body = _http("POST", f"http://localhost:{PORT}/search/",
+                         {"yql": "select * from product where true", "hits": 0, "timeout": "20s"}, timeout=60)
+        have = json.loads(body)["root"]["fields"]["totalCount"]
+        if have == len(ids):
+            return {"fed": 0, "already": have, "failed": 0, "feed_s": 0.0, "documents": have}   # (a) reads this
+    except Exception:  # noqa: BLE001
+        pass
+    fc = feed_client(catalogue)
+    if fc is not None:
+        fc["documents"] = count()
+        return fc
+    raw = {f: catalogue[f].fillna("").astype(str).tolist() for f in FIELDS}
+    cols = {f: [clean(v) for v in raw[f]] for f in FIELDS}
+    changed = sum(1 for f in FIELDS for a, b in zip(raw[f], cols[f]) if a != b)   # (b): counted here too
     ok, failed, lock = [0], [], threading.Lock()
 
     def one(i):
@@ -135,8 +192,38 @@ def feed(catalogue, threads: int = 32) -> dict:
     t0 = time.time()
     with ThreadPoolExecutor(threads) as ex:
         list(ex.map(one, range(len(ids))))
-    return {"fed": ok[0], "failed": len(failed), "failed_first": failed[:5], "feed_s": round(time.time() - t0, 1),
-            "docs_per_s": round(len(ids) / max(1e-9, time.time() - t0))}
+    return {"feeder": "http-post", "fields_cleaned": changed, "fed": ok[0], "failed": len(failed),
+            "failed_first": failed[:5], "feed_s": round(time.time() - t0, 1),
+            "docs_per_s": round(len(ids) / max(1e-9, time.time() - t0)), "documents": count()}
+
+
+def count() -> int:
+    st, body = _http("POST", f"http://localhost:{PORT}/search/",
+                     {"yql": "select * from product where true", "hits": 0, "timeout": "20s"}, timeout=60)
+    return json.loads(body)["root"]["fields"]["totalCount"]
+
+
+def fetch_log(dest: str, log="/opt/vespa/logs/vespa/vespa.log") -> bool:
+    """Copy Vespa's own log out of the chroot (V5's evidence)."""
+    try:
+        import shutil
+        shutil.copy(f"{ROOT}{log}", dest)
+        return True
+    except OSError:
+        return False
+
+
+def vespa_pids() -> list:
+    """Vespa's processes (its daemons are not children of the launching process): those running under /opt/vespa."""
+    import psutil
+    out = []
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if any("/opt/vespa" in a or "vespa-proton" in a or "jdisc" in a for a in (p.info["cmdline"] or [])):
+                out.append(p.pid)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def check_proton(log="/opt/vespa/logs/vespa/vespa.log") -> dict:

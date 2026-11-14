@@ -86,6 +86,10 @@ def recv_msg(sock: socket.socket) -> Any | None:
     head = _read_into(sock, _HEAD.size)
     if head is None:
         return None
+    return _finish_msg(sock, bytes(head))
+
+
+def _finish_msg(sock: socket.socket, head: bytes) -> Any | None:
     n, k = _HEAD.unpack(head)
     sizes = _read_into(sock, 8 * k) if k else b""
     if sizes is None:
@@ -151,6 +155,39 @@ class _Conn:
         self.out.put(None)
 
 
+class _BinConn(_Conn):
+    """A native front's connection (S6-22s, ``serving/binproto.py``): replies as binary frames, the hits as columns
+    the front encodes itself, anything else encoded here."""
+
+    def _bytes(self, msg) -> bytes:
+        from . import binproto
+        from .encode import encode
+        if msg[0] == "multi":
+            return b"".join(self._bytes(m) for m in msg[1])
+        if msg[0] == "search" and msg[2] == "ok":
+            _, id_, _, resp, version, queue_ms, *rest = msg
+            meta = {"version": f"{version[0]}:{version[1]}", "queue_ms": round(float(queue_ms), 3),
+                    "batch": rest[0] if rest else 1}
+            return binproto.columnar(id_, resp, meta) or binproto.whole(id_, 200, encode(resp), meta)
+        if msg[0] == "search":                                  # ("search", id, "error", status, body)
+            return binproto.whole(msg[1], msg[3], json.dumps(msg[4], separators=(",", ":")).encode())
+        _, id_, status, body, ctype, headers = msg               # ("call", ...)
+        return binproto.whole(id_, status, body, {"type": ctype})
+
+    def _writer(self) -> None:
+        while True:
+            msg = self.out.get()
+            if msg is None:
+                return
+            try:
+                data = self._bytes(msg)
+                with self.lock:
+                    self.sock.sendall(data)
+            except OSError:
+                return
+            _account("writer")
+
+
 class _Item:
     __slots__ = ("conn", "id", "name", "request", "t")
 
@@ -206,10 +243,23 @@ class GpuServer:
         self._stop.set()
 
     def _reader(self, sock: socket.socket) -> None:
+        first = _read_into(sock, 4)
+        if first is None:
+            return sock.close()
+        if bytes(first) == b"S3B1":                              # a native front (serving/binproto.py)
+            return self._bin_reader(sock)
         conn = _Conn(sock)
+        pending = bytes(first)
         try:
             while True:
-                msg = recv_msg(sock)
+                if pending:                                     # the first frame's header began with those 4 bytes
+                    rest = _read_into(sock, _HEAD.size - 4)
+                    if rest is None:
+                        return
+                    msg = _finish_msg(sock, pending + bytes(rest))
+                    pending = b""
+                else:
+                    msg = recv_msg(sock)
                 if msg is None:
                     return
                 if msg[0] == "search":
@@ -219,6 +269,34 @@ class GpuServer:
                 elif msg[0] == "call":
                     self.calls.submit(self._call, conn, msg)
         except (OSError, EOFError, pickle.UnpicklingError):
+            return
+        finally:
+            conn.close()
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _bin_reader(self, sock: socket.socket) -> None:
+        from . import binproto
+        conn = _BinConn(sock)
+        try:
+            while True:
+                head = _read_into(sock, 4)
+                if head is None:
+                    return
+                payload = _read_into(sock, struct.unpack("<I", head)[0])
+                if payload is None:
+                    return
+                msg = binproto.parse_request(bytes(payload))
+                if msg[0] == "search":
+                    self.q.put(_Item(conn, msg[1], msg[2], msg[3]))
+                    _account("reader")
+                    self._publish_load()
+                else:
+                    _, id_, method, path, body = msg
+                    self.calls.submit(self._call, conn, ("call", id_, method, path, body, {}))
+        except (OSError, ValueError):
             return
         finally:
             conn.close()
