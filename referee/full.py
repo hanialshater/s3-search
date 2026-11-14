@@ -6,6 +6,7 @@
 
 The run records what it was asked to run: the request template and the --bm25 file (each with its sha256), the BM25
 parameters the mapping carried, OpenSearch's version and analyzer, whether the checkout was clean, and its caveats.
+It also records the engine's switches (S3_TRITON_BM25, S3_TRITON_TOPK and any other S3_TRITON_*, S3_PLAN_CACHE, S3_CUDA_BLOCKING_SYNC) as set, or null.
 The engine's score of record needs the contract run on the device (no --skip-contract) and a clean checkout.
 
 1. The contract on this device: `referee/contract/` on toy (the notebook also runs `referee fast` first).
