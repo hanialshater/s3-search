@@ -160,19 +160,11 @@ class _BinConn(_Conn):
     the front encodes itself, anything else encoded here."""
 
     def _bytes(self, msg) -> bytes:
-        from . import binproto
-        from .encode import encode
-        if msg[0] == "multi":
-            return b"".join(self._bytes(m) for m in msg[1])
-        if msg[0] == "search" and msg[2] == "ok":
-            _, id_, _, resp, version, queue_ms, *rest = msg
-            meta = {"version": f"{version[0]}:{version[1]}", "queue_ms": round(float(queue_ms), 3),
-                    "batch": rest[0] if rest else 1}
-            return binproto.columnar(id_, resp, meta) or binproto.whole(id_, 200, encode(resp), meta)
-        if msg[0] == "search":                                  # ("search", id, "error", status, body)
-            return binproto.whole(msg[1], msg[3], json.dumps(msg[4], separators=(",", ":")).encode())
-        _, id_, status, body, ctype, headers = msg               # ("call", ...)
-        return binproto.whole(id_, status, body, {"type": ctype})
+        from . import hostpath
+        hp = _hostpath()
+        if hp is not None:                                      # S3_HOSTPATH: the module writes the frames
+            return hp.reply(msg[1] if msg[0] == "multi" else [msg])
+        return hostpath.reply_frame(msg)
 
     def _writer(self) -> None:
         while True:
@@ -188,11 +180,28 @@ class _BinConn(_Conn):
             _account("writer")
 
 
-class _Item:
-    __slots__ = ("conn", "id", "name", "request", "t")
+_HOSTPATH: list = []
 
-    def __init__(self, conn, id_, name, request):
-        self.conn, self.id, self.name, self.request = conn, id_, name, request
+
+def _hostpath():
+    """serving/hostpath.py's load(), once per process (None by default)."""
+    if not _HOSTPATH:
+        from .hostpath import load
+        _HOSTPATH.append(load())
+    return _HOSTPATH[0]
+
+
+def binproto_search_body(raw):
+    from .binproto import search_body
+    return search_body(raw)
+
+
+class _Item:
+    __slots__ = ("conn", "id", "name", "request", "t", "raw", "prep")
+
+    def __init__(self, conn, id_, name, request, raw=None):
+        self.conn, self.id, self.name, self.request, self.raw = conn, id_, name, request, raw
+        self.prep = None                                        # (Prepared, position) when s3_hostpath planned it
         self.t = time.perf_counter()
 
 
@@ -288,8 +297,18 @@ class GpuServer:
                 payload = _read_into(sock, struct.unpack("<I", head)[0])
                 if payload is None:
                     return
+                hp = _hostpath()
+                if hp is not None and payload[0] == 1:          # S3_HOSTPATH: the batch loop prepares the raw frame
+                    id_, name = binproto.search_head(payload)
+                    self.q.put(_Item(conn, id_, name, None, raw=bytes(payload)))
+                    _account("reader")
+                    self._publish_load()
+                    continue
                 msg = binproto.parse_request(bytes(payload))
-                if msg[0] == "search":
+                if msg[0] == "search" and isinstance(msg[3], Exception):   # not JSON: 400, as the Python front
+                    status, body = classify(msg[3])
+                    conn.put(("search", msg[1], "error", status, body))
+                elif msg[0] == "search":
                     self.q.put(_Item(conn, msg[1], msg[2], msg[3]))
                     _account("reader")
                     self._publish_load()
@@ -347,6 +366,7 @@ class GpuServer:
             self.in_batch = len(batch)
             self._publish_load()
             self._out = {}
+            batch = self._prepare_raw(batch)                    # S3_HOSTPATH: the raw frames, before the grouping
             groups: dict[tuple, list[_Item]] = {}
             for it in batch:                                    # one search_batch per index; explain/highlight alone
                 own = isinstance(it.request, dict) and any(it.request.get(k) for k in _OWN_BATCH)
@@ -363,6 +383,42 @@ class GpuServer:
             self.in_batch = 0
             _account("batches")
             self._publish_load()
+
+    def _prepare_raw(self, batch: list[_Item]) -> list[_Item]:
+        """S3_HOSTPATH (serving/hostpath.py): the batch's raw search frames through ``prepare``, per index, so every
+        item has its request before the grouping (explain and highlight still run alone). Refused frames are answered
+        here; a fallback position, or an index the manager cannot give, is parsed in Python as before."""
+        raw = [it for it in batch if it.raw is not None and it.request is None]
+        if not raw:
+            return batch
+        from .hostpath import parse_body
+        hp, refused = _hostpath(), {}
+        by_name: dict[str, list[_Item]] = {}
+        for it in raw:
+            by_name.setdefault(it.name, []).append(it)
+        for name, its in by_name.items():
+            try:
+                index = self.app.manager.get(name).index
+            except Exception:  # noqa: BLE001 - UnknownIndex: _run answers it, from the parsed request
+                index = None
+            prep = hp.prepare([it.raw for it in its], index, None) if index is not None else None
+            errs = {i: (st, body) for i, st, body in (prep.errors if prep else [])}
+            eligible = set(prep.layout.get("eligible", ())) if prep is not None and prep.layout is not None else set()
+            for i, it in enumerate(its):
+                if i in errs:
+                    refused[id(it)] = (it, errs[i])
+                elif i in eligible and i not in prep.fallback:      # planned by the module: search_prepared in _run
+                    it.prep = (prep, i)
+                elif prep is not None and i not in prep.fallback and prep.requests[i] is not None:
+                    it.request = prep.requests[i]
+                else:
+                    try:
+                        it.request = parse_body(binproto_search_body(it.raw))
+                    except Exception as exc:  # noqa: BLE001
+                        refused[id(it)] = (it, classify(exc))
+        for it, (st, body) in refused.values():
+            self._reply(it, ("search", it.id, "error", st, body))
+        return [it for it in batch if id(it) not in refused]
 
     def _fail(self, items: list[_Item], exc: BaseException) -> None:
         status, body = classify(exc)
@@ -382,6 +438,14 @@ class GpuServer:
         m = self.app.metrics
         m.inc("s3_batches_total", index=name)
         m.observe("s3_batch_size", len(items), index=name)
+        planned = [it for it in items if it.prep is not None]
+        if planned:                                             # s3_hostpath: the eligible positions at once
+            by_prep: dict[int, list[_Item]] = {}
+            for it in planned:
+                by_prep.setdefault(id(it.prep[0]), []).append(it)
+            rest = [it for it in items if it.prep is None]     # before _run_prepared clears prep on a fallback
+            back = [x for group in by_prep.values() for x in self._run_prepared(index, version, mi, group, len(items))]
+            items = rest + back
         bad = [i for i, it in enumerate(items) if not isinstance(it.request, dict)]
         for i in bad:
             self._fail([items[i]], TypeError("a search request is a JSON object"))
@@ -400,6 +464,45 @@ class GpuServer:
             return self._one_by_one(index, version, mi, items, waits, exc)
         for it, resp, w in zip(items, out, waits):
             self._answer(it, resp, version, w, mi, len(items))
+
+    def _run_prepared(self, index, version, mi, planned: list[_Item], size: int) -> list[_Item]:
+        """``index.search_prepared`` (or hostpath.search_prepared_stub) for the planned items, answered here and matched
+        back by position; returns the items to run through search_batch instead (their bodies parsed in Python) when
+        the call fails, counted as a host-path fallback."""
+        from . import hostpath
+        prep = planned[0].prep[0]
+        order = list(prep.layout["eligible"])
+        kw = {}
+        from .scheduler import takes_param
+        fn = getattr(index, "search_prepared", None)
+        if fn is not None:
+            if takes_param(fn, "hits"):
+                kw["hits"] = "columns"
+            if takes_param(fn, "ids"):
+                kw["ids"] = "bytes"
+        else:
+            kw = {k: v for k, v in (("hits", "columns"), ("ids", "bytes")) if takes_param(index.search_batch, k)}
+        t0 = time.perf_counter()
+        try:
+            out = fn(prep, **kw) if fn is not None else hostpath.search_prepared_stub(index, prep, **kw)
+            if len(out) != len(order):
+                raise RuntimeError(f"search_prepared returned {len(out)} responses for {len(order)} positions")
+        except Exception:  # noqa: BLE001 - never lose a batch to the module
+            log.exception("search_prepared failed; the batch falls back to search_batch")
+            hp = _hostpath()
+            if hp is not None:
+                hp.fallbacks += 1
+            for it in planned:
+                it.prep = None
+                it.request = hostpath.parse_body(binproto_search_body(it.raw))
+            return planned
+        self.busy_s += time.perf_counter() - t0
+        self.n_batches += 1
+        self.n_requests += len(planned)
+        by_pos = dict(zip(order, out))
+        for it in planned:
+            self._answer(it, by_pos[it.prep[1]], version, (t0 - it.t) * 1000.0, mi, size)
+        return []
 
     def _one_by_one(self, index, version, mi, items, waits, exc) -> None:
         failures = 0
@@ -421,7 +524,7 @@ class GpuServer:
             status, body = classify_entry(resp["error"])
             mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="error")
             return self._reply(it, ("search", it.id, "error", status, body))
-        src = it.request.get("_source")
+        src = it.request.get("_source") if isinstance(it.request, dict) else None   # planned: no _source
         if src not in (None, False):
             from .encode import expand_columns
             try:
