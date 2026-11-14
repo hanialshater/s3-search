@@ -851,11 +851,16 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     sends a search to GPU process j instead of the least loaded one; it is for replays only.
   - **The native front (S6-22s).** `S3_SERVING_FRONT_SERVER=native` runs the fronts as one Rust process
     (`serving/native_front`, tokio and hyper; built with `cargo build --release`, its path from `S3_NATIVE_FRONT_BIN`)
-    with F threads (`S3_SERVING_FRONT_THREADS_NATIVE` overrides). It speaks the binary protocol on S3B1 connections
-    (`serving/binproto.py`): the hits come back as columns and the front writes them as JSON, the same bytes as the
-    Python front (floats by ryu, equal to Python's repr in the range the GPU process checks; otherwise the GPU process
-    encodes the whole response). TCP_NODELAY on every connection; `X-S3-Route-Gpu` honoured; the `X-S3-*` response
-    headers as above. `stdlib` (the default) keeps serving's own fronts.
+    with F threads (`S3_SERVING_FRONT_THREADS_NATIVE` overrides). It speaks the binary protocol
+    (`serving/binproto.py`), by default on S3B2 connections (the steward's ruling on plat-m28, 2026-11-14): the hits
+    come back as columns (kind 3, unchecked) and the front writes them as JSON, the same bytes as the Python front (ids
+    escaped as `json.encoder.encode_basestring_ascii`, floats as `json.dumps`, both held byte for byte by
+    `serving/native_front/tests`), and the GPU process sends each reply as soon as it is encoded.
+    `S3_SERVING_BINPROTO=1` opts out to S3B1 (kind 1: the GPU process checks the ids and floats and sends the rest
+    whole; a batch's replies in one write). Anything kind 3 cannot carry goes whole (kind 2). TCP_NODELAY on every
+    connection; `X-S3-Route-Gpu` honoured; the `X-S3-*` response headers as above, plus the front's timers
+    (`X-S3-Front-Read-Ms`, `-Build-Ms`, `-Rtt-Ms`, `-Render-Ms`, `X-S3-Gpu-Parse-Ms`, `-Post-Ms`). `stdlib` (the
+    default front) keeps serving's own fronts.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:
@@ -1174,3 +1179,7 @@ status:
   an opt-in batch window for the GPU processes (default: none, as before).
 - 2026-11-14, architect (S6-26): the fused lexical path is on by default where the gate allows;
   `S3_TRITON_FUSED_LEXICAL=0` turns it off; responses unchanged (section 0). The founder's decision.
+
+- 2026-11-14, platform-engineer (S6-22s): section 7: the native front speaks S3B2 by default (kind 3, the front escaping and
+  formatting, per-reply sends; the steward's ruling on plat-m28), `S3_SERVING_BINPROTO=1` opting out to S3B1; the front's
+  timer headers.

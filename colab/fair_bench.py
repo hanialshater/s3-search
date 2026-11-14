@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--warm-rung=1 --warm-duration=S] [--extra-headers=X-S3-Front-Rtt-Ms,...] [--loadgen-bin=PATH --loadgen-sha256=HEX] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -133,10 +133,11 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
         n_total = int(rate * duration)
         mine = range(p, n_total, n_procs)
         lat, errors, timeouts, hits, lag, samples, why = [], 0, 0, [], [], [], {}
+        recs = []                                           # S6-22s, the steward's amended check: per request, as native
         conn = aiohttp.TCPConnector(limit=0, force_close=False)
         tout = aiohttp.ClientTimeout(total=TIMEOUT_S)
         async with aiohttp.ClientSession(connector=conn, timeout=tout) as s:
-            async def one(i, due):
+            async def one(i, due, lag_ms):
                 nonlocal errors, timeouts
                 try:
                     async with s.post(url, data=bodies[i % len(bodies)],
@@ -145,12 +146,16 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                         if r.status != 200:
                             errors += 1
                             why[str(r.status)] = why.get(str(r.status), 0) + 1
+                            recs.append((i, "", lag_ms, r.status, "", "", "", "", ""))
                             return
                         if not full_coverage(raw):
                             errors += 1
                             why["coverage"] = why.get("coverage", 0) + 1
                             return
                     lat.append((time.time() - due) * 1e3)
+                    h = r.headers
+                    recs.append((i, lat[-1], lag_ms, 200, h.get("X-S3-Gpu-Process", ""), h.get("X-S3-Batch-Size", ""),
+                                 h.get("X-S3-Queue-Ms", ""), h.get("X-S3-Serve-Ms", ""), h.get("X-S3-Batch-Ms", "")))
                     if i % SAMPLE_EVERY == 0 or (i % len(bodies)) in SAMPLE_BODIES:   # sampled: hits, digest, bytes, who
                         n_hits, digest = result_digest(raw)
                         hits.append(n_hits)
@@ -160,6 +165,7 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                             fh.write(raw)
                 except asyncio.TimeoutError:
                     timeouts += 1
+                    recs.append((i, "", lag_ms, 0, "", "", "", "", ""))
                 except Exception as e:
                     errors += 1
                     why[type(e).__name__] = why.get(type(e).__name__, 0) + 1
@@ -171,10 +177,19 @@ def _client_proc(p, n_procs, url, bodies, rate, duration, t0, out_path, cpu):
                 if delay > 0:
                     await asyncio.sleep(delay)
                 lag.append((time.time() - due) * 1e3)
-                tasks.append(asyncio.create_task(one(i, due)))
+                tasks.append(asyncio.create_task(one(i, due, lag[-1])))
             await asyncio.gather(*tasks)
+        rec_path = out_path.replace(".json", "-records.csv")
+        with open(rec_path, "w") as fh:
+            fh.write("i,lat_ms,lag_ms,status,gpu,batch,queue_ms,serve_ms,batch_ms\n")
+            for t in recs:
+                fh.write(",".join("" if x == "" else (f"{x:.3f}" if isinstance(x, float) else str(x)) for x in t) + "\n")
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF)          # S6-22s: the client's own CPU (both clients record it)
         json.dump({"lat": lat, "errors": errors, "timeouts": timeouts, "hits": hits, "lag": lag,
-                   "sent": len(mine), "samples": samples, "why": why}, open(out_path, "w"))
+                   "sent": len(mine), "samples": samples, "why": why, "cpu_s": ru.ru_utime + ru.ru_stime,
+                   "records_part": rec_path},
+                  open(out_path, "w"))
 
     asyncio.run(run())
 
@@ -383,8 +398,109 @@ def compare_unloaded(url, bodies, runs, limit=None):
     return out
 
 
+CLIENT = opt("client", "aiohttp")                            # S6-22s: aiohttp (default) or native (colab/loadgen)
+CLIENTS = [c for c in opt("clients", CLIENT).split(",") if c]  # --clients=aiohttp,native,native,aiohttp: ABBA per rate
+assert set(CLIENTS) <= {"aiohttp", "native"}, CLIENTS
+_LOADGEN: dict = {}
+
+
+def build_loadgen() -> dict:
+    """colab/loadgen (Rust) built on the VM, its toolchain, lock and binary sha256 recorded (as the native front).
+    --loadgen-bin=PATH --loadgen-sha256=HEX: a binary built elsewhere (e.g. an earlier commit's, for the steward's
+    check of figures measured with it), refused unless its sha256 is the one named."""
+    if _LOADGEN:
+        return _LOADGEN
+    import hashlib
+    if opt("loadgen-bin", None):
+        binary = os.path.abspath(opt("loadgen-bin", None))
+        sha = hashlib.sha256(open(binary, "rb").read()).hexdigest()
+        if sha != opt("loadgen-sha256", ""):
+            raise RuntimeError(f"--loadgen-bin {binary} has sha256 {sha}, not {opt('loadgen-sha256', '')}")
+        _LOADGEN.update({"binary": binary, "binary_sha256": sha, "prebuilt": True})
+        say(f"client: native load client (prebuilt) {_LOADGEN}")
+        return _LOADGEN
+    cargo = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+    if not os.path.exists(cargo):
+        subprocess.run("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable",
+                       shell=True, check=True)
+    locked = ["--locked"] if os.path.exists("colab/loadgen/Cargo.lock") else []
+    subprocess.run([cargo, "build", "--release", *locked], cwd="colab/loadgen", check=True)
+    binary = os.path.abspath("colab/loadgen/target/release/s3-loadgen")
+    _LOADGEN.update({"cargo": subprocess.run([cargo, "--version"], capture_output=True, text=True).stdout.strip(),
+                     "binary": binary, "binary_sha256": hashlib.sha256(open(binary, "rb").read()).hexdigest(),
+                     "locked": bool(locked),
+                     "cargo_lock": open("colab/loadgen/Cargo.lock").read() if os.path.exists("colab/loadgen/Cargo.lock")
+                     else None})
+    say(f"client: native load client built { {k: v for k, v in _LOADGEN.items() if k != 'cargo_lock'} }")
+    return _LOADGEN
+
+
+def _aiohttp_accept_encoding() -> str:
+    """What the installed aiohttp sends as Accept-Encoding (the steward: the native client sends aiohttp's headers)."""
+    from aiohttp.client_reqrep import ClientRequest
+    from aiohttp import hdrs
+    return str(ClientRequest.DEFAULT_HEADERS.get(hdrs.ACCEPT_ENCODING, "gzip, deflate"))
+
+
+def _bodies_file(bodies) -> str:
+    """The request bodies, length-prefixed, for the native client (the same bytes aiohttp sends)."""
+    import struct
+    path = "/content/fair-bodies.bin"
+    with open(path, "wb") as f:
+        f.write(struct.pack("<I", len(bodies)))
+        for b in bodies:
+            f.write(struct.pack("<I", len(b)) + b)
+    return path
+
+
+_NATIVE_RUN = [0]
+
+
+def _load_native(url, bodies, rate, duration, client_cpus, t0):
+    """One s3-loadgen process on the client CPUs (taskset), its CPU time from wait4; returns load()'s parts."""
+    lg = build_loadgen()
+    if RESPONSE["kind"] == "vespa":
+        raise RuntimeError("the native client has no coverage check: not for Vespa (the steward's ruling)")
+    _NATIVE_RUN[0] += 1                                     # a file per run, not per rate (the steward's note)
+    out = f"/content/fair-client-native-{_NATIVE_RUN[0]}.json"
+    rec = f"/content/fair-records-{int(rate)}-run{_NATIVE_RUN[0]}.csv"
+    cmd = ["taskset", "-c", ",".join(map(str, client_cpus)), lg["binary"], "--url", url, "--bodies",
+           _bodies_file(bodies), "--rate", repr(float(rate)), "--duration", repr(float(duration)), "--t0", repr(t0),
+           "--threads", str(len(client_cpus)), "--out", out, "--records", rec, "--sample-every", str(SAMPLE_EVERY),
+           "--sample-bodies", ",".join(map(str, sorted(SAMPLE_BODIES))), "--samples-dir", SAMPLES,
+           "--timeout", repr(TIMEOUT_S), "--accept-encoding", _aiohttp_accept_encoding()]
+    if opt("extra-headers", None):                          # e.g. the native front's timers (S6-22s)
+        cmd += ["--extra-headers", opt("extra-headers", None)]
+    pr = subprocess.Popen(cmd)
+    deadline = time.time() + duration + TIMEOUT_S + 120
+    while True:
+        pid, status, ru = os.wait4(pr.pid, os.WNOHANG)
+        if pid:
+            pr.returncode = os.waitstatus_to_exitcode(status)
+            break
+        if time.time() > deadline:
+            pr.kill()
+            raise RuntimeError("the native load client did not finish")
+        time.sleep(0.2)
+    if pr.returncode != 0:
+        raise RuntimeError(f"the native load client exited {pr.returncode}")
+    d = json.load(open(out))
+    want = int(rate * duration)
+    if d["sent"] != want:                                   # the steward's counting condition: every request accounted for
+        raise RuntimeError(f"the native load client accounted for {d['sent']} requests, not {want}")
+    for smp in d["samples"]:                                 # the digest in Python, the same result_digest as aiohttp
+        raw = open(f"{SAMPLES}/{int(rate)}-{smp[0]}.json", "rb").read()
+        smp[1], smp[2] = result_digest(raw)
+        d["hits"].append(smp[1])
+    d["cpu_s"] = ru.ru_utime + ru.ru_stime
+    d["records"] = rec
+    return [d]
+
+
 def load(url, bodies, rate, duration, client_cpus):
     t0 = time.time() + 2.0
+    if CLIENT == "native":
+        return _merge(_load_native(url, bodies, rate, duration, client_cpus, t0), rate, duration, client_cpus)
     procs, outs = [], []
     for p in range(len(client_cpus)):
         out = f"/content/fair-client-{p}.json"
@@ -395,9 +511,13 @@ def load(url, bodies, rate, duration, client_cpus):
         procs.append(pr)
     for pr in procs:
         pr.join(duration + TIMEOUT_S + 120)
+    return _merge([json.load(open(out)) for out in outs], rate, duration, client_cpus)
+
+
+def _merge(parts, rate, duration, client_cpus):
     lat, hits, lag, errors, timeouts, sent, samples, why = [], [], [], 0, 0, 0, [], {}
-    for out in outs:
-        d = json.load(open(out))
+    cpu_s = sum(d.get("cpu_s", 0.0) for d in parts)
+    for d in parts:
         lat += d["lat"]; hits += d["hits"]; lag += d["lag"]; samples += d["samples"]
         for k, v in d["why"].items():
             why[k] = why.get(k, 0) + v
@@ -415,7 +535,21 @@ def load(url, bodies, rate, duration, client_cpus):
            "client_send_lag_ms_p99": pct(lag, 99)}
     res["errors_by"] = why
     res["samples"] = samples
-    res["client_limited"] = bool(res["client_send_lag_ms_p99"] and res["client_send_lag_ms_p99"] > 50)
+    # S6-22s: the client's own CPU (both clients; the aiohttp processes' rusage includes their start), and which client
+    res["client"] = CLIENT
+    res["client_cpu"] = {"cpus": len(client_cpus), "cpu_s": round(cpu_s, 3), "cores": round(cpu_s / wall, 3),
+                         "ms_per_request": round(1e3 * cpu_s / sent, 4) if sent else None}
+    res["client_limited"] = bool((res["client_send_lag_ms_p99"] and res["client_send_lag_ms_p99"] > 50)
+                                 or res["client_cpu"]["cores"] > 0.8 * len(client_cpus))
+    if any("records" in d for d in parts):
+        res["records"] = [d["records"] for d in parts if "records" in d]
+    elif any("records_part" in d for d in parts):          # aiohttp: its processes' records, as one file
+        comb = f"/content/fair-records-{int(rate)}-aiohttp.csv"
+        with open(comb, "w") as fo:
+            for k, d in enumerate(p for p in parts if "records_part" in p):
+                lines = open(d["records_part"]).read().splitlines(True)
+                fo.writelines(lines if k == 0 else lines[1:])
+        res["records"] = [comb]
     return res
 
 
@@ -794,6 +928,7 @@ def main():
     say(f"{len(ds.catalogue):,} products, {len(texts):,} query texts, depth {K}, rates {RATES} QPS x {DURATION:.0f} s")
     out = {"kind": "fair-bench", "label": "development only, never a score", "ref": REF, "commit": commit,
            "runtime": env, "cpus": os.cpu_count(), "client_cpus": client_cpus, "server_cpus": server_cpus,
+           "client": ",".join(CLIENTS), "client_build": (dict(build_loadgen()) if "native" in CLIENTS else None),
            "n_products": int(len(ds.catalogue)), "k": K, "duration_s": DURATION, "workers": WORKERS,
            "columns": COLUMNS, "mps": MPS, "fronts": FRONTS, "gpu_processes": GPUS, "log": LOG, "engines": {}}
     for name in ENGINES:
@@ -817,24 +952,44 @@ def main():
                 for b in bodies[:200]:
                     _post(url, b, route=j)
             runs = []
+            stop_ladder = False
+            if opt("warm-rung", "0") == "1":                     # the steward's amended check: one discarded rung first
+                globals()["CLIENT"] = CLIENTS[0]
+                wd = float(opt("warm-duration", str(DURATION)))     # --warm-duration: a shorter warm rung (plat-m24)
+                say(f"{name}: a discarded warm rung, {RATES[0]:.0f} QPS for {wd:.0f} s, client {CLIENTS[0]}")
+                w = load(url, bodies, RATES[0], wd, client_cpus)
+                out.setdefault("discarded_warm_rung", {})[name] = {k: w[k] for k in (
+                    "target_qps", "achieved_qps", "latency_ms", "errors", "timeouts", "client")}
+                time.sleep(5)
             for rate in RATES:
-                say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s")
-                prof = start_profiles(proc.pid, rate) if rate in PROFILE_RATES else []
+              for k, client in enumerate(CLIENTS):               # S6-22s: --clients=a,b,... each rate once per client
+                globals()["CLIENT"] = client
+                say(f"{name}: {rate:.0f} QPS for {DURATION:.0f} s" + (f" (client {client}, {k + 1} of {len(CLIENTS)})"
+                                                                     if len(CLIENTS) > 1 else ""))
+                prof = start_profiles(proc.pid, rate) if rate in PROFILE_RATES and k == 0 else []
                 with Sampler(proc.pid) as smp:
                     r = load(url, bodies, rate, DURATION, client_cpus)
                 r["profiles"] = finish_profiles(prof)
+                if r.get("records"):                             # S6-22s: one CSV per rung, beside the results JSON
+                    keep = f"{os.path.splitext(OUT)[0]}-{name}-{int(rate)}" + (f"-{k}{client}" if len(CLIENTS) > 1 else "") + ".csv"
+                    shutil.copy(r["records"][0], keep)
+                    r["records"] = keep
                 r["resources"] = smp.summary(len(server_cpus))
                 say(f"{name}: {rate:.0f} QPS resources: GPU {r['resources']['gpu_util_pct']}, server CPU cores "
                     f"{r['resources']['server_cpu_cores']} of {len(server_cpus)}; limit: {r['resources'].get('limit')}")
                 say(f"{name}: {rate:.0f} QPS -> achieved {r['achieved_qps']:.0f}, p50 {r['latency_ms']['p50']:.1f} ms, "
                     f"p99 {r['latency_ms']['p99']:.1f} ms, errors {r['errors']}, timeouts {r['timeouts']}, "
-                    f"hits {r['hits_per_response']}, client lag p99 {r['client_send_lag_ms_p99']:.1f} ms"
+                    f"hits {r['hits_per_response']}, client lag p99 {r['client_send_lag_ms_p99']:.1f} ms, "
+                    f"client {client} {r['client_cpu']['cores']:.2f} cores"
                     + (" (CLIENT-LIMITED)" if r["client_limited"] else ""))
                 runs.append(r)
                 if r["achieved_qps"] < 0.9 * rate or r["timeouts"] + r["errors"] > 0.01 * r["sent"]:
                     say(f"{name}: cannot sustain {rate:.0f} QPS; no higher rates (the same rule for every engine)")
+                    stop_ladder = True
                     break
                 time.sleep(5)
+              if stop_ladder:
+                break
             say(f"{name}: replaying sampled requests unloaded")
             try:                                                  # a dead server after the ladder must not lose it
                 check = compare_unloaded(url, bodies, runs)
