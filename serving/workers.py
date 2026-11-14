@@ -134,17 +134,18 @@ class Supervisor:
                  gpu_processes: int = 0):
         """``gpu_processes`` > 0: the S6-10s layout, ``n`` fronts and that many GPU processes (``serving/gpu.py``)."""
         self.fronts, self.k = (n, gpu_processes) if gpu_processes else (0, 0)
-        # S6-21s: S3_SERVING_FRONT_SERVER=granian runs the fronts as one granian process with ``fronts`` workers on the
-        # port (serving/front_granian.py); stdlib (the default) keeps serving's own fronts on a shared socket.
+        # S6-22s: S3_SERVING_FRONT_SERVER=native runs the fronts as one native process (serving/native_front, Rust) with
+        # ``fronts`` threads, binding the port; stdlib (the default) keeps serving's own fronts on a shared socket.
         self.front_server = os.environ.get("S3_SERVING_FRONT_SERVER", "stdlib") if self.k else "stdlib"
-        # granian (S6-21s) or native (S6-22s, serving/native_front): one process for all the fronts, binding the port
-        self.granian = self.front_server in ("granian", "native")
-        n = (1 if self.granian else n) + self.k
+        if self.front_server not in ("stdlib", "native"):
+            raise ValueError(f"S3_SERVING_FRONT_SERVER={self.front_server!r}: stdlib or native")
+        self.native = self.front_server == "native"
+        n = (1 if self.native else n) + self.k
         self.n, self.argv, self.restart_pause_s = n, list(argv), restart_pause_s
         self.host = host
-        self.http = None if self.granian else listen(host, port)
+        self.http = None if self.native else listen(host, port)
         self.rpc = listen(host, rpc_port) if rpc_port else None
-        self.port = port if self.granian else self.http.getsockname()[1]
+        self.port = port if self.native else self.http.getsockname()[1]
         self.procs: list[subprocess.Popen | None] = [None] * n
         self.started = [0.0] * n
         self.stopping = threading.Event()
@@ -160,24 +161,19 @@ class Supervisor:
             return "worker", i
         if i < self.k:
             return "gpu", i
-        return ("granian", 0) if self.granian else ("front", i - self.k)
+        return ("native", 0) if self.native else ("front", i - self.k)
 
     def _cmd(self, i: int) -> list[str]:
         kind, j = self._kind(i)
         if kind == "gpu":
             return [sys.executable, "-m", "serving", *self.argv, "--gpu-process", str(j), "--gpu-socket",
                     self.gpu_sockets[j]]
-        if kind == "granian" and self.front_server == "native":
+        if kind == "native":
             here = os.path.dirname(os.path.abspath(__file__))
             binary = os.environ.get("S3_NATIVE_FRONT_BIN") or os.path.join(here, "native_front", "target", "release",
                                                                             "s3-native-front")
             return [binary, "--host", self.host, "--port", str(self.port), "--gpu-sockets", ",".join(self.gpu_sockets),
                     "--threads", os.environ.get("S3_SERVING_FRONT_THREADS_NATIVE", str(self.fronts))]
-        if kind == "granian":
-            return [sys.executable, "-m", "granian", "--interface", "wsgi", "--workers", str(self.fronts),
-                    "--blocking-threads", os.environ.get("S3_SERVING_FRONT_THREADS", "32"), "--host", self.host,
-                    "--port", str(self.port), "--backlog", "1024", "--no-ws", "--log-level", "warning",
-                    "serving.front_granian:app"]
         cmd = [sys.executable, "-m", "serving", *self.argv, "--worker-index", str(j),
                "--listen-fd", str(self.http.fileno())]
         if kind == "front":
@@ -199,7 +195,7 @@ class Supervisor:
         share = str(max(1, _cores() // self.n))                  # N workers x all-core thread pools oversubscribe
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             env.setdefault(var, share)
-        self.procs[i] = subprocess.Popen(self._cmd(i), pass_fds=() if kind in ("gpu", "granian") else fds, env=env)
+        self.procs[i] = subprocess.Popen(self._cmd(i), pass_fds=() if kind in ("gpu", "native") else fds, env=env)
         self.started[i] = time.monotonic()
         log.info("%s %d started (pid %d) on port %d", kind, j, self.procs[i].pid, self.port)
 

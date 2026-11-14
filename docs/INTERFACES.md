@@ -845,10 +845,13 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     (the GPU process), `X-S3-Index-Version` (`<segment_id>:<epoch>` of the index that batch read) and
     `X-S3-Batch-Size` (the size of the `search_batch` call that answered it). A request header `X-S3-Route-Gpu: j`
     sends a search to GPU process j instead of the least loaded one; it is for replays only.
-  - **The front's HTTP server (S6-21s).** `S3_SERVING_FRONT_SERVER=granian` runs the same `FrontApp` behind granian
-    2.8.8 (BSD-3-Clause; Rust and hyper) through WSGI, as one granian process with F workers on the port
-    (`serving/front_granian.py`). The response bodies are the same bytes. granian writes its own `server` and `date`
-    headers and sets TCP_NODELAY on its listener (`src/net.rs:89`). `stdlib` (the default) keeps serving's own fronts.
+  - **The native front (S6-22s).** `S3_SERVING_FRONT_SERVER=native` runs the fronts as one Rust process
+    (`serving/native_front`, tokio and hyper; built with `cargo build --release`, its path from `S3_NATIVE_FRONT_BIN`)
+    with F threads (`S3_SERVING_FRONT_THREADS_NATIVE` overrides). It speaks the binary protocol on S3B1 connections
+    (`serving/binproto.py`): the hits come back as columns and the front writes them as JSON, the same bytes as the
+    Python front (floats by ryu, equal to Python's repr in the range the GPU process checks; otherwise the GPU process
+    encodes the whole response). TCP_NODELAY on every connection; `X-S3-Route-Gpu` honoured; the `X-S3-*` response
+    headers as above. `stdlib` (the default) keeps serving's own fronts.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:
@@ -1160,5 +1163,5 @@ status:
   (A100, L4, G4 with Triton 3.8); `S3_TRITON_BM25=0` and `S3_TRITON_TOPK=0` turn them off; results unchanged
   (section 0). The founder's decision.
 
-- 2026-11-14, platform-engineer (S6-21s): section 7 gains `S3_SERVING_FRONT_SERVER=granian`, the fronts on granian
-  (opt-in; the stdlib front stays the default).
+- 2026-11-14, platform-engineer (S6-22s): section 7 gains `S3_SERVING_FRONT_SERVER=native`, the fronts as one Rust
+  process over the binary protocol (opt-in; the stdlib front stays the default).

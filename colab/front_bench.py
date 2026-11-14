@@ -1,5 +1,5 @@
 """Front-only CPU per request (S6-21s, S6-22s): a fake GPU process answers a canned 2,000-hit columnar response at once;
-one front serves HTTP (FRONT=stdlib, granian or native); two aiohttp client processes drive it. Development only.
+one front serves HTTP (FRONT=stdlib or native); two aiohttp client processes drive it. Development only.
 
     FRONT=native S3_NATIVE_FRONT_BIN=... python colab/front_bench.py REPO CONNECTIONS_PER_CLIENT [THREADS]
 """
@@ -66,12 +66,6 @@ if __name__ == "__main__":
         thr = sys.argv[3] if len(sys.argv) > 3 else "1"
         f = subprocess.Popen([os.environ["S3_NATIVE_FRONT_BIN"], "--host", "127.0.0.1", "--port", str(port), "--gpu-sockets", sock, "--threads", thr], start_new_session=True)
         time.sleep(2)
-    elif os.environ.get("FRONT") == "granian":
-        import socket as so, subprocess
-        t = so.socket(); t.bind(("127.0.0.1", 0)); port = t.getsockname()[1]; t.close()
-        env = {**os.environ, "S3_SERVING_GPU_SOCKETS": sock, "S3_SERVING_WORKER_STATE": state, "S3_SERVING_CACHE": "0", "PYTHONPATH": REPO}
-        f = subprocess.Popen([sys.executable, "-m", "granian", "--interface", "wsgi", "--workers", "1", "--blocking-threads", "32", "--host", "127.0.0.1", "--port", str(port), "--no-ws", "--log-level", "warning", "serving.front_granian:app"], env=env, start_new_session=True)
-        time.sleep(3)
     else:
         q = mp.Queue(); f = mp.Process(target=front, args=(sock, 0, state, q), daemon=True); f.start(); port = q.get()
     out = mp.Queue(); secs = 10
@@ -84,7 +78,7 @@ if __name__ == "__main__":
     import json as _j
     print(_j.dumps({"front": os.environ.get("FRONT", "stdlib"), "req_per_s": round(n / secs), "front_cores": round((c1 - c0) / (time.time() - t0), 2),
                     "front_cpu_ms_per_req": round((c1 - c0) / n * 1e3, 3)}), flush=True)
-    if os.environ.get("FRONT") in ("granian", "native"):
+    if os.environ.get("FRONT") == "native":
         import signal; os.killpg(f.pid, signal.SIGKILL)
     else:
         f.kill()

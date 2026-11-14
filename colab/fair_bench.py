@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|granian|native] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -521,7 +521,6 @@ def zvec_target(ds, server_cpus):
     return proc, f"http://localhost:{port}/indexes/esci/_search", body, build_s
 
 
-GRANIAN_VERSION = "2.8.8"                                   # BSD-3-Clause; only when --front-server=granian
 
 
 def build_native_front() -> dict:
@@ -549,8 +548,6 @@ def engine_target(ds, server_cpus):
     --engine-request: the request template file (default the tuned BM25F request; title-only.json for the parity
     runs). A different --engine-bm25 builds its own index (its own serve dir)."""
     global SERVE_DIR
-    if opt("front-server", "stdlib") == "granian":
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", f"granian=={GRANIAN_VERSION}"], check=True)
     native = build_native_front() if opt("front-server", "stdlib") == "native" else None
     spec =opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
     bm25 = json.loads(spec) if spec.strip().startswith("{") else json.loads(Path(spec).read_text())

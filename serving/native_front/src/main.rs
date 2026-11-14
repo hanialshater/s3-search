@@ -2,7 +2,7 @@
 //!
 //!     s3-native-front --port 8080 --gpu-sockets /state/gpu-0.sock,/state/gpu-1.sock [--threads N] [--worker 0]
 //!
-//! Each search is sent to the GPU process with the fewest requests in flight, over the binary protocol
+//! Each search is sent to the GPU process with the fewest requests in flight (or the one `X-S3-Route-Gpu` names), over the binary protocol
 //! (`serving/binproto.py`). The hits come back as columns, and this process writes them as JSON (`encode.rs`), the same
 //! bytes as the Python front. Every other route goes to GPU process 0 as a call and is answered with what it returns.
 //! TCP_NODELAY is set on every accepted connection.
@@ -78,6 +78,14 @@ impl Front {
     fn pick(&self) -> (usize, Arc<Gpu>) {
         let (i, g) = self.gpus.iter().enumerate().min_by_key(|(_, g)| g.inflight.load(Ordering::Relaxed)).unwrap();
         (i, g.clone())
+    }
+
+    /// `X-S3-Route-Gpu: j` (for diagnosis, as the Python front): GPU process j when it exists, else the least loaded.
+    fn route(&self, j: Option<usize>) -> (usize, Arc<Gpu>) {
+        match j {
+            Some(j) if j < self.gpus.len() => (j, self.gpus[j].clone()),
+            _ => self.pick(),
+        }
     }
 
     async fn send(&self, gpu: &Arc<Gpu>, frame: Vec<u8>, id: u64) -> Option<Vec<u8>> {
@@ -161,6 +169,8 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
     let method = req.method().as_str().to_string();
     let path = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
     let bare = req.uri().path().to_string();
+    let route: Option<usize> = req.headers().get("x-s3-route-gpu").and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok());
     let body = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => return Ok(json(400, "{\"error\":{\"type\":\"invalid_request\",\"path\":\"\",\"reason\":\"bad body\"}}")),
@@ -172,7 +182,7 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
     let id = front.ids.fetch_add(1, Ordering::Relaxed);
     let parts: Vec<&str> = bare.trim_start_matches('/').split('/').collect();
     let is_search = method == "POST" && parts.len() == 3 && parts[0] == "indexes" && parts[2] == "_search";
-    let (gi, gpu) = if is_search { front.pick() } else { (0, front.gpus[0].clone()) };
+    let (gi, gpu) = if is_search { front.route(route) } else { (0, front.gpus[0].clone()) };
     let frame = if is_search {
         Front::search_frame(id, parts[1].as_bytes(), &body)
     } else {
