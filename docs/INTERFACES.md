@@ -797,7 +797,9 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     with the fewest requests in flight.
   - **GPU processes** (`serving/gpu.py`) each hold one copy of each preloaded index and a full `App`. A batch loop
     makes one `search_batch(requests, hits="columns", errors="return")` call at a time, with at most 64 requests:
-    whatever has queued when the last call returned, with no batch window. When the engine takes `ids` (S6-12) the GPU process and
+    whatever has queued when the last call returned, with no batch window by default (S6-22s: `S3_SERVING_GPU_BATCH_WAIT_MS`,
+    default 0, waits up to that long after a batch's first request for more; `S3_SERVING_GPU_MAX_BATCH`, default 64, caps it;
+    the scheduler's `S3_SERVING_MAX_WAIT_MS` and `S3_SERVING_MAX_BATCH` do not reach this loop). When the engine takes `ids` (S6-12) the GPU process and
     the single-process scheduler ask for `ids="bytes"`: `_id` is one numpy `S<w>` array. It pickles about 7x faster,
     and the encoder writes its bytes as they are when they are plain ASCII (else it decodes and escapes them); the
     HTTP bytes are unchanged. **Only `explain` and `highlight` requests
@@ -1167,5 +1169,8 @@ status:
 
 - 2026-11-14, platform-engineer (S6-22s): section 7 gains `S3_SERVING_FRONT_SERVER=native`, the fronts as one Rust
   process over the binary protocol (opt-in; the stdlib front stays the default).
+
+- 2026-11-14, platform-engineer (S6-22s): section 7 gains `S3_SERVING_GPU_BATCH_WAIT_MS` and `S3_SERVING_GPU_MAX_BATCH`,
+  an opt-in batch window for the GPU processes (default: none, as before).
 - 2026-11-14, architect (S6-26): the fused lexical path is on by default where the gate allows;
   `S3_TRITON_FUSED_LEXICAL=0` turns it off; responses unchanged (section 0). The founder's decision.
