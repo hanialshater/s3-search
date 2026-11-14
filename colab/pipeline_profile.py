@@ -87,6 +87,10 @@ TRITON = any(a == "--triton=1" for a in sys.argv[1:])
 # terms facets, size 10) at batch 64, each with S3_TRITON_FUSED_LEXICAL off (today's path, the engine's defaults) and on;
 # 256 responses of each compared field by field; one torch.profiler batch each. Use with --plan-cache=0.
 FUSED = any(a == "--fused=1" for a in sys.argv[1:])
+# --host-profile=1 (with --fused=1; CUDA graphs and the planner, the founder's CPU-headroom plan): where the host's time
+# per request goes on the depth-2,000 request at batch 64 with the fused path on: cProfile over 8 batches, the top
+# functions by own time and by cumulative time, and the torch.profiler's CPU-side op counts per request.
+HOST_PROFILE = any(a == "--host-profile=1" for a in sys.argv[1:])
 
 
 def measure(index, make, texts, label, kw=None):
@@ -158,8 +162,34 @@ def fused_runs(index, texts):
         res[f"{kind}_responses_differ"] = {"of": 256, "differ": differ}
         say(f"{kind}: fused against today's path: {differ} of 256 responses differ")
     res["fused_kernel_calls"] = len(calls)
+    if HOST_PROFILE:
+        res["host_profile"] = host_profile(index, texts)
     os.environ.pop("S3_TRITON_FUSED_LEXICAL", None)
     return res
+
+
+def host_profile(index, texts, bs=64, n_batches=8):
+    import cProfile
+    import io
+    import pstats
+    os.environ["S3_TRITON_FUSED_LEXICAL"] = "1"
+    kw = {"hits": "columns", "ids": "bytes"}
+    reqs = [deep_request(t) for t in texts[:bs * n_batches]]
+    index.search_batch(reqs[:bs], **kw)                   # warm
+    pr = cProfile.Profile()
+    t0 = time.perf_counter()
+    pr.enable()
+    for i in range(0, len(reqs), bs):
+        index.search_batch(reqs[i:i + bs], **kw)
+    pr.disable()
+    wall = time.perf_counter() - t0
+    out = {"requests": len(reqs), "wall_ms_per_request": wall * 1000 / len(reqs)}
+    for key in ("tottime", "cumulative"):
+        buf = io.StringIO()
+        pstats.Stats(pr, stream=buf).sort_stats(key).print_stats(30)
+        out[f"top_by_{key}"] = buf.getvalue()[-9000:]
+        say(f"host profile by {key}:\n" + buf.getvalue()[-6000:])
+    return out
 
 
 def torch_profile(index, make, texts, label, bs=64, kw=None):
