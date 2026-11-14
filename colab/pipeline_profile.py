@@ -139,19 +139,28 @@ def fused_runs(index, texts):
     triton_fused._run_kernel = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
     res = {}
     variants = [("0", None), ("1", None)]
-    if any(a == "--onepass=1" for a in sys.argv[1:]):       # S6-31: the fused path with each host assembly
-        variants = [("0", None), ("1", "0"), ("1", "1")]
+    if any(a == "--threshold=1" for a in sys.argv[1:]):     # S6-29: the fused path with each top-k threshold
+        variants = [("0", None, None), ("1", "torch", None), ("1", "radix", None)]
+    elif any(a == "--onepass=1" for a in sys.argv[1:]):     # S6-31: the fused path with each host assembly
+        variants = [("0", None, None), ("1", None, "0"), ("1", None, "1")]
+    else:
+        variants = [(on, None, None) for on, _ in variants]
     for kind, (make, kw) in kinds.items():
-        for on, op in variants:
+        for on, thr, op in variants:
             os.environ["S3_TRITON_FUSED_LEXICAL"] = on
+            if thr:
+                os.environ["S3_TRITON_TOPK_THRESHOLD"] = thr
             if op is not None:
                 os.environ["S3_FUSED_ONEPASS"] = op
-            label = f"{kind}_{'fused' if on == '1' else 'today'}" + ("" if op is None else f"_onepass{op}")
+            label = (f"{kind}_{'fused' if on == '1' else 'today'}" + (f"_{thr}" if thr else "")
+                     + ("" if op is None else f"_onepass{op}"))
             res[label] = {"measure": measure(index, make, texts, label, kw)}
-            try:
-                res[label]["torch_profile"] = torch_profile(index, make, texts, label, kw=kw)
-            except Exception as e:  # noqa: BLE001
-                res[label]["torch_profile"] = {"error": repr(e)[:500]}
+            for pb in (32, 64):                            # device time per batch where serving's tail is (S6-29)
+                key = "torch_profile" if pb == 64 else f"torch_profile_{pb}"
+                try:
+                    res[label][key] = torch_profile(index, make, texts, f"{label}/{pb}", bs=pb, kw=kw)
+                except Exception as e:  # noqa: BLE001
+                    res[label][key] = {"error": repr(e)[:500]}
         differ = 0
         for i in range(0, 256, 64):
             reqs = [make(t) for t in texts[i:i + 64]]
