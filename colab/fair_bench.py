@@ -320,6 +320,21 @@ def ab_dump(url, bodies, path, n) -> dict:
     return out
 
 
+def _wait_routed(url, body, route, timeout=900.0):
+    """Until a search routed to GPU process ``route`` answers 200: the native front's /readyz asked GPU process 0 only
+    (plat-m21's window-0 run failed its warm-up on a 404 from a process still loading its index)."""
+    import urllib.error
+    t0 = time.time()
+    while True:
+        try:
+            _post(url, body, route=route)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 503) or time.time() - t0 > timeout:
+                raise
+        time.sleep(1.0)
+
+
 def _diff(a: bytes, b: bytes) -> dict:
     """Where two responses first differ: totals, page lengths, the first differing hit and both sides of it."""
     x, y = _comparable(json.loads(a)), _comparable(json.loads(b))
@@ -798,6 +813,7 @@ def main():
             # least loaded process is always 0, so before plat-m19 the others met their first requests (and their
             # first kernels) inside the measured rung: every run's first rung had a multi-second p99.
             for j in (range(GPUS) if name == "engine" and GPUS > 1 else [None]):
+                _wait_routed(url, bodies[0], j)                  # plat-m21: a 404 while process j still loads
                 for b in bodies[:200]:
                     _post(url, b, route=j)
             runs = []
