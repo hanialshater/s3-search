@@ -50,4 +50,7 @@ def test_results_record_the_engine_switches(monkeypatch):
     monkeypatch.setenv("S3_TRITON_BM25", "1")
     monkeypatch.delenv("S3_PLAN_CACHE", raising=False)
     monkeypatch.setenv("S3_CUDA_BLOCKING_SYNC", "0")
-    assert b.engine_env() == {"S3_TRITON_BM25": "1", "S3_PLAN_CACHE": None, "S3_CUDA_BLOCKING_SYNC": "0"}
+    monkeypatch.delenv("S3_TRITON_TOPK", raising=False)
+    monkeypatch.setenv("S3_TRITON_FACETS", "0")
+    assert b.engine_env() == {"S3_TRITON_BM25": "1", "S3_TRITON_TOPK": None, "S3_PLAN_CACHE": None,
+                              "S3_CUDA_BLOCKING_SYNC": "0", "S3_TRITON_FACETS": "0"}

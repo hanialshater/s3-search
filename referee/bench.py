@@ -68,14 +68,16 @@ def _pct(xs, q):
     return float(np.percentile(np.asarray(xs, dtype=np.float64), q)) if len(xs) else None
 
 
-ENGINE_ENV = ("S3_TRITON_BM25", "S3_PLAN_CACHE", "S3_CUDA_BLOCKING_SYNC")
+ENGINE_ENV = ("S3_TRITON_BM25", "S3_TRITON_TOPK", "S3_PLAN_CACHE", "S3_CUDA_BLOCKING_SYNC")
 
 
 def engine_env() -> dict:
     """The engine's switches that change how it computes or how fast (not what it returns): each as set in this
     process's environment, or null when unset (the engine's default then applies). Recorded in every results file, so
     two runs that differ only in a switch say so (the founder's approval, 2026-11-14)."""
-    return {k: os.environ.get(k) for k in ENGINE_ENV}
+    out = {k: os.environ.get(k) for k in ENGINE_ENV}
+    out.update({k: v for k, v in sorted(os.environ.items()) if k.startswith("S3_TRITON_")})   # any later kernel switch too
+    return out
 
 
 def _rev():
