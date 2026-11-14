@@ -167,11 +167,11 @@ def feed(catalogue, threads: int = 32) -> dict:
         pass
     fc = feed_client(catalogue)
     if fc is not None:
-        st, body = _http("POST", f"http://localhost:{PORT}/search/",
-                         {"yql": "select * from product where true", "hits": 0, "timeout": "20s"}, timeout=60)
-        fc["documents"] = json.loads(body)["root"]["fields"]["totalCount"]
+        fc["documents"] = count()
         return fc
-    cols = {f: [clean(v) for v in catalogue[f].fillna("").astype(str).tolist()] for f in FIELDS}
+    raw = {f: catalogue[f].fillna("").astype(str).tolist() for f in FIELDS}
+    cols = {f: [clean(v) for v in raw[f]] for f in FIELDS}
+    changed = sum(1 for f in FIELDS for a, b in zip(raw[f], cols[f]) if a != b)   # (b): counted here too
     ok, failed, lock = [0], [], threading.Lock()
 
     def one(i):
@@ -192,8 +192,15 @@ def feed(catalogue, threads: int = 32) -> dict:
     t0 = time.time()
     with ThreadPoolExecutor(threads) as ex:
         list(ex.map(one, range(len(ids))))
-    return {"fed": ok[0], "failed": len(failed), "failed_first": failed[:5], "feed_s": round(time.time() - t0, 1),
-            "docs_per_s": round(len(ids) / max(1e-9, time.time() - t0))}
+    return {"feeder": "http-post", "fields_cleaned": changed, "fed": ok[0], "failed": len(failed),
+            "failed_first": failed[:5], "feed_s": round(time.time() - t0, 1),
+            "docs_per_s": round(len(ids) / max(1e-9, time.time() - t0)), "documents": count()}
+
+
+def count() -> int:
+    st, body = _http("POST", f"http://localhost:{PORT}/search/",
+                     {"yql": "select * from product where true", "hits": 0, "timeout": "20s"}, timeout=60)
+    return json.loads(body)["root"]["fields"]["totalCount"]
 
 
 def fetch_log(dest: str, log="/opt/vespa/logs/vespa/vespa.log") -> bool:

@@ -420,6 +420,10 @@ def vespa_target(ds, server_cpus):
     info.update(V.deploy())
     info.update(V.feed(ds.catalogue))
     build_s = time.time() - t0
+    info["documents_expected"] = int(len(ds.catalogue))
+    if info.get("documents") != info["documents_expected"]:     # (a), the steward: every document or no run
+        COMPETITOR["vespa"] = info
+        raise RuntimeError(f"Vespa holds {info.get('documents')} documents, not {info['documents_expected']}")
     info.update(V.check_proton())
     COMPETITOR["vespa"] = info
     say(f"vespa: {info}")
