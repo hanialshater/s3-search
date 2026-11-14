@@ -690,12 +690,18 @@ class Executor:
     # kept the host from queueing the next plan's work); its took_ms stages are then host times. True: as before.
     SYNC_PLAN_TIMES = False
 
-    def run(self, plans: list[Plan], columns: bool = False, ids_bytes: bool = False) -> list[dict]:
+    def run(self, plans: list[Plan], columns: bool = False, ids_bytes: bool = False, prepared=None) -> list[dict]:
+        """``prepared`` (R1): ``s3_hostpath.HostIndex.prepare``'s output for these plans, which are then all fused, in
+        its chunks' order (``Index.search_prepared`` builds them)."""
         b, st = self.b, self.st
         timer = Timer(b)
         shared_t0 = time.perf_counter()
-        fused = self._fused_plans(plans)                   # S6-22: bare lexical plans scored by one fused pass
-        if fused:
+        fused = set(range(len(plans))) if prepared is not None else self._fused_plans(plans)
+        if prepared is not None:                           # R1: the kernel inputs come from the Rust host path
+            self._prefetch(plans, timer, skip={p.root for p in plans})   # nothing to score: the caches only
+            fused_out = self._fused_from_prepared(prepared)
+            timer.lap("retrieve")
+        elif fused:                                        # S6-22: bare lexical plans scored by one fused pass
             others = {n for k, p in enumerate(plans) if k not in fused
                       for r in [p.root] + ([p.post_filter] if p.post_filter is not None else []) for n in walk(r)}
             self._prefetch(plans, timer, skip={plans[k].root for k in fused} - others)
@@ -1021,6 +1027,32 @@ class Executor:
                     out[k] = (scores, g, totals, fac, cid)
         return out
 
+    def _fused_from_prepared(self, prep) -> dict:
+        """``_fused_lexical``'s output from a prepared batch (R1): one copy of each block to the device, then one fused
+        call per chunk on views of it. The plans are in the chunks' order."""
+        from ..backend import triton_fused as TF
+        b, st = self.b, self.st
+        part = st.parts[0]
+        host_i = np.frombuffer(prep["ints"], "<i8")
+        host_f = np.frombuffer(prep["floats"], "<f4")
+        dev_i = dev_f = None
+        if TF.mode(b) == "kernel":
+            dev_i = b.asarray(host_i, "int64")
+            dev_f = b.asarray(host_f, "float32")
+        out, k = {}, 0
+        for chunk in prep["chunks"]:
+            f_i = chunk["idf_field"]
+            idf = part.idf_field[:, f_i] if f_i >= 0 else part.idf
+            codes = [self._facet_codes(f) for f in chunk["facets"]]
+            scores, totals, facets = TF.run_prepared(b, part, st.mapping.k1, idf, chunk, host_i, host_f, dev_i, dev_f,
+                                                     st.live, [c for c, _ in codes])
+            fac = {f: (counts, keys) for f, counts, (_, keys) in zip(chunk["facets"], facets, codes)}
+            cid = object()
+            for g in range(len(chunk["positions"])):
+                out[k] = (scores, g, totals, fac, cid)
+                k += 1
+        return out
+
     def _fused_totals_and_pages(self, states, totals, pages):
         """The fused plans' totals and pages: per fused chunk one top-k over its score rows (-inf where not matched, so
         no mask), then one transfer for every chunk's totals and pages, the same arrays as
@@ -1045,7 +1077,7 @@ class Executor:
             rows = b.arange(G).reshape(G, 1)
             idx, _ = b.topk(S, k)
             idx = b.astype(idx, "int64")
-            safe = b.where(idx >= 0, idx, 0)
+            safe = b.clamp_min(idx, 0)                    # the same values as where(idx >= 0, idx, 0)
             bufs.append(b.stack([b.astype(idx, "float64"), b.astype(S[rows, safe], "float64"),
                                  b.astype(st.first_offset_dev[safe], "float64")], 2).reshape(-1))
             tots.append(b.astype(tot, "float64"))
@@ -1183,7 +1215,7 @@ class Executor:
                     idx = b.where(first, i1, i0[rows, j0])
                     tier_col = b.astype(first, "float64")
                 need = idx.shape[1]                       # min(the largest from + size, N)
-                safe = b.where(idx >= 0, idx, 0)
+                safe = b.clamp_min(idx, 0)                    # the same values as where(idx >= 0, idx, 0)
                 cols = [b.astype(idx, "float64")] + ([tier_col] if tiered else []) + \
                     [b.astype(S[rows, safe], "float64"), b.astype(st.first_offset_dev[safe], "float64")]
                 w = len(cols)

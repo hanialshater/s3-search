@@ -252,6 +252,39 @@ class Index:
             refused[i] = resp
         return [refused[i] for i in range(len(requests))]
 
+    def search_prepared(self, prep, hits: str = "columns", ids: str = "bytes", parse_ms: float = 0.0) -> dict:
+        """R1 (the founder's CPU-headroom plan): the responses for a batch the Rust host path prepared, as a list in
+        the order of ``layout["eligible"]``, the positions it served. ``prep`` is ``s3_hostpath.prepare``'s
+        ``Prepared`` (serving/hostpath.py; its ``layout``) or the layout dict itself (``HostIndex.prepare``, built on
+        this index's state by ``engine.hostpath.host_index``). Each response equals what ``search_batch`` gives for
+        that request. The other positions (``layout["fallback"]``) are the caller's, through ``search_batch``.
+        ``parse_ms``: the host path's time per request, reported as took_ms.parse."""
+        from .plan.nodes import Lexical, Plan, TermsAgg
+        if hits not in ("dicts", "columns") or (ids == "bytes" and hits != "columns"):
+            raise ValueError("hits: 'dicts' or 'columns'; ids 'bytes' needs hits='columns'")
+        prep = getattr(prep, "layout", prep)
+        if "chunks" not in prep and "stub_bodies" in prep:   # serving's S3_HOSTPATH=stub-prepared: plain requests
+            return self.search_batch(list(prep["stub_bodies"]), hits=hits, ids=ids)
+        st = self._st
+        if len(st.parts) != 1 or not getattr(st.parts[0], "identity", False) or st.b.accumulate != "float64":
+            raise ValueError("search_prepared: one segment with float64 accumulation only")
+        root = Lexical((), (), 1, "global", 1.0, "query")
+        plans, where = [], []
+        for chunk in prep["chunks"]:
+            for pos, f, sz, aggs in zip(chunk["positions"], chunk["from"], chunk["size"], chunk["aggs"]):
+                plans.append(Plan(root=root, aggs=tuple(TermsAgg(n, fld, int(k), "terms", (("size", int(k)),), ())
+                                                        for n, fld, k in aggs), from_=int(f), size=int(sz)))
+                where.append(pos)
+        assert where == list(prep.get("eligible", where)), "eligible is the chunks' order"
+        if not plans:
+            return []
+        done = Executor(st, self.rankers).run(plans, columns=hits == "columns", ids_bytes=ids == "bytes",
+                                              prepared=prep)
+        for resp in done:
+            resp["took_ms"] = {"parse": round(parse_ms, 3), **resp["took_ms"]}
+            resp["took_ms"]["total"] = round(resp["took_ms"]["total"] + parse_ms, 3)
+        return done
+
     # ---- the updater's hooks (docs/INTERFACES.md §3, §4)
     @_locked
     def patch(self, field: str, ids: Sequence[str], values: Sequence) -> None:

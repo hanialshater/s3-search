@@ -87,6 +87,11 @@ TRITON = any(a == "--triton=1" for a in sys.argv[1:])
 # terms facets, size 10) at batch 64, each with S3_TRITON_FUSED_LEXICAL off (today's path, the engine's defaults) and on;
 # 256 responses of each compared field by field; one torch.profiler batch each. Use with --plan-cache=0.
 FUSED = any(a == "--fused=1" for a in sys.argv[1:])
+# --hostpath=1 (R1): builds native/s3_hostpath on the VM (rustup and maturin), a lexical-only index and its HostIndex,
+# then the depth-2,000 and faceted requests at batch 16, 64 and 128, the fused path on, through search_batch (Python
+# parse and plan) and through HostIndex.prepare plus Index.search_prepared; 256 responses of each compared; host CPU
+# and wall per request. Use with --plan-cache=0.
+HOSTPATH = any(a == "--hostpath=1" for a in sys.argv[1:])
 
 
 def measure(index, make, texts, label, kw=None):
@@ -162,6 +167,82 @@ def fused_runs(index, texts):
     return res
 
 
+def build_hostpath():
+    cargo = os.path.expanduser("~/.cargo/bin")
+    if not os.path.exists(os.path.join(cargo, "cargo")):
+        subprocess.run("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable",
+                       shell=True, check=True)
+    os.environ["PATH"] = cargo + os.pathsep + os.environ["PATH"]
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "maturin>=1.5,<2"], check=True)
+    subprocess.run([sys.executable, "-m", "maturin", "build", "--release", "-m", "native/s3_hostpath/Cargo.toml",
+                    "-o", "/content/hostpath-wheels"], check=True)
+    whl = os.path.join("/content/hostpath-wheels", sorted(os.listdir("/content/hostpath-wheels"))[-1])
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", whl], check=True)
+
+
+def hostpath_runs(index, texts):
+    import numpy as np
+    from engine import hostpath
+    from engine.api import expand_hits
+    os.environ["S3_TRITON_FUSED_LEXICAL"] = "1"
+    t0 = time.perf_counter()
+    hi = hostpath.host_index(index._st)
+    hi_s = time.perf_counter() - t0
+    say(f"hostpath: HostIndex built in {hi_s:.1f} s")
+    facets = {"brand": {"terms": {"field": "product_brand.keyword", "size": 10}},
+              "color": {"terms": {"field": "product_color.keyword", "size": 10}}}
+    kinds = {"deep": (deep_request, {"hits": "columns", "ids": "bytes"}),
+             "faceted": (lambda q: {"query": lexical(q), "aggs": facets, "size": 10}, {"hits": "columns", "ids": "bytes"})}
+    res = {"host_index_build_s": hi_s}
+    for kind, (make, kw) in kinds.items():
+        bodies = [json.dumps(make(t)).encode() for t in texts]
+        reqs = [make(t) for t in texts]
+        served = 0
+        for label in ("python", "rust"):
+            out = {}
+            for bs in (16, 64, 128):
+                for i in range(0, bs * 2, bs):             # warm this shape
+                    if label == "python":
+                        index.search_batch(reqs[i:i + bs], **kw)
+                    else:
+                        index.search_prepared(hi.prepare(bodies[i:i + bs]), **kw)
+                c0, t0 = time.process_time(), time.perf_counter()
+                walls = []
+                for i in range(0, len(reqs), bs):
+                    s = time.perf_counter()
+                    if label == "python":
+                        index.search_batch(reqs[i:i + bs], **kw)
+                    else:
+                        prep = hi.prepare(bodies[i:i + bs])
+                        if bs == 64:
+                            served += sum(len(c["positions"]) for c in prep["chunks"])
+                        got = index.search_prepared(prep, **kw)
+                        if prep["fallback"]:              # the rest through Python, as the GPU process would
+                            index.search_batch([reqs[i + p] for p in prep["fallback"]], **kw)
+                    walls.append((time.perf_counter() - s) * 1000)
+                total, cpu = time.perf_counter() - t0, time.process_time() - c0
+                out[str(bs)] = {"qps": len(reqs) / total, "batch_p50_ms": pct(walls, 50), "batch_p99_ms": pct(walls, 99),
+                                "cpu_ms_per_request": cpu * 1000 / len(reqs)}
+                say(f"hostpath {kind}/{label} batch {bs}: {len(reqs) / total:.0f} QPS, p99 {pct(walls, 99):.1f} ms, "
+                    f"host CPU {cpu * 1000 / len(reqs):.3f} ms per request")
+            res[f"{kind}_{label}"] = out
+        res[f"{kind}_served_share"] = served / len(reqs)
+        differ = n = 0
+        for i in range(0, 256, 64):
+            prep = hi.prepare(bodies[i:i + 64])
+            got = index.search_prepared(prep, **kw)
+            want = index.search_batch([reqs[i + p] for p in prep["eligible"]], **kw)
+            for g, w in zip(got, want):
+                n += 1
+                a = {k: v for k, v in expand_hits(g).items() if k != "took_ms"}
+                c = {k: v for k, v in expand_hits(w).items() if k != "took_ms"}
+                differ += a != c
+        res[f"{kind}_responses_differ"] = {"of": n, "differ": differ}
+        say(f"hostpath {kind}: served {res[f'{kind}_served_share']:.1%}; {differ} of {n} served responses differ")
+    os.environ.pop("S3_TRITON_FUSED_LEXICAL", None)
+    return res
+
+
 def torch_profile(index, make, texts, label, bs=64, kw=None):
     """One batch of ``bs`` under torch.profiler: the top CUDA kernels by device time, and launches and syncs per
     request."""
@@ -225,6 +306,22 @@ def main():
               "color": {"terms": {"field": "product_color.keyword", "size": 20}}}
     m = copy.deepcopy(ds.mapping)
     m["_meta"]["engine"]["bm25"] = json.loads(open("referee/requests/bm25f-tuned.bm25.json").read())
+    if HOSTPATH:                                     # R1: lexical only
+        build_hostpath()
+        say(f"build (hostpath run): {len(ds.catalogue):,} products on cuda, lexical only")
+        t0 = time.perf_counter()
+        index = api.build_index(ds.catalogue, m, device="cuda")
+        build_s = time.perf_counter() - t0
+        texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
+        result = {"kind": "pipeline-profile-hostpath", "label": "development only, never a score", "ref": REF,
+                  "commit": commit, "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
+                  "n_products": int(len(ds.catalogue)), "n_queries": len(texts), "build_s": build_s,
+                  "hostpath": hostpath_runs(index, texts)}
+        stop.set()
+        json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
+        say("DONE")
+        print(json.dumps(result, indent=1), flush=True)
+        return 0
     if FUSED:                                        # lexical only: no encoder, no ranker
         say(f"build (fused run): {len(ds.catalogue):,} products on cuda, lexical only")
         t0 = time.perf_counter()

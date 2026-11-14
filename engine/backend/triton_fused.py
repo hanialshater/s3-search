@@ -141,6 +141,21 @@ if triton is not None:
             tl.atomic_add(fc_ptr + fo + code, tl.full([TILE], 1, tl.int32), mask=match)
 
 
+def pack(parts, dtype, align):
+    """``parts`` one after another in one array, each starting at a multiple of ``align`` elements (16 bytes), and
+    their start offsets. Triton specialises a pointer argument on 16-byte alignment, so views at unaligned offsets
+    would compile the kernel again for each new alignment (a ~0.5 s stall a time: the L4 hostpath profile)."""
+    at, n = [], 0
+    for x in parts:
+        n += (-n) % align
+        at.append(n)
+        n += len(x)
+    out = np.zeros(n, dtype)
+    for a, x in zip(at, parts):
+        out[a:a + len(x)] = x
+    return out, at
+
+
 def _rows(part, terms):
     """Per query its term rows in order, as the kernel's flat arrays; ``None`` if a query has no rows."""
     ptr = part.host_term_ptr
@@ -178,33 +193,78 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     Q, N = len(terms), part.N
     F = int(part.tf.shape[1])
     row_start, row_len, row_term, q_lo, q_hi = _rows(part, terms)
-    t64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=dev)  # noqa: E731
-    w32 = b.asarray(np.asarray(w, np.float32), "float32")
-    bb32 = b.asarray(np.asarray(bb, np.float32), "float32")
-    omb = (1.0 - bb32).contiguous()                           # as the torch path: (1 - b) in float32 first
-    row_idf = (idf[t64(row_term)] if row_term else torch.zeros(0, dtype=torch.float32, device=dev)).contiguous()
+    nf = len(facet_codes)
+    sizes = [int(s) for s in facet_sizes]
+    offs = [int(x) for x in np.cumsum([0] + [Q * s for s in sizes])[:-1]] if nf else []
+    R = len(row_start)
+    # S6-24: every small per-call array in two host-to-device copies (one int64, one float32), not one per array
+    ints = [row_start or [0], row_len or [0], q_lo, q_hi, [int(m) for m in msm], offs or [0], sizes or [1],
+            row_term or [0]]
+    host_i, at = pack(ints, np.int64, 2)
+    w32 = np.asarray(w, np.float32)
+    bb32 = np.asarray(bb, np.float32)
+    floats = [w32, bb32, np.float32(1.0) - bb32,                          # (1 - b) in float32, as the torch path
+              np.asarray([float(x) for x in boost], np.float32)]
+    host_f, fat = pack(floats, np.float32, 4)
+    dev_i = torch.from_numpy(host_i).to(dev)
+    dev_f = torch.from_numpy(host_f).to(dev)
+    vi = [dev_i[a:a + len(x)] for a, x in zip(at, ints)]
+    vf = [dev_f[a:a + len(x)] for a, x in zip(fat, floats)]
+    return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
+
+
+def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs):
+    """The kernel on device inputs: ``vi`` the int64 views (row_start, row_len, q_lo, q_hi, msm, facet offsets, facet
+    sizes, row_term), ``vf`` the float32 views (w, b, 1 - b, boost)."""
+    import torch
+    dev = b.device
+    N = part.N
+    F = int(part.tf.shape[1])
+    rs, rl, qlo, qhi, msm_d, off_d, nv_d, rt = vi
+    w_d, bb_d, omb_d, boost_d = vf
+    nf = len(facet_codes)
+    row_idf = (idf[rt] if R else torch.zeros(1, dtype=torch.float32, device=dev)).contiguous()
     acc = torch.empty(Q * N, dtype=torch.float64, device=dev)
     cnt = torch.empty(Q * N, dtype=torch.int32, device=dev)
     out = torch.empty(Q * N, dtype=torch.float32, device=dev)
     total = torch.zeros(Q, dtype=torch.int32, device=dev)
-    nf = len(facet_codes)
-    sizes = [int(s) for s in facet_sizes]
-    offs = list(np.cumsum([0] + [Q * s for s in sizes])[:-1]) if nf else []
     fc = torch.zeros(max(1, sum(Q * s for s in sizes)), dtype=torch.int32, device=dev)
     codes = (torch.stack([c.to(torch.int32) for c in facet_codes], 0).contiguous() if nf
              else torch.zeros((1, 1), dtype=torch.int32, device=dev))
     c1 = float(np.float32(k1 + 1.0))
     c2 = float(np.float32(k1))
     grid = (Q, triton.cdiv(N, TILE))
-    _fused_kernel[grid](part.doc_ids.contiguous(), part.tf.contiguous(), part.rel_len.contiguous(), row_idf,
-                        t64(row_start or [0]), t64(row_len or [0]), t64(q_lo), t64(q_hi),
-                        torch.tensor([int(m) for m in msm], dtype=torch.int32, device=dev),
-                        torch.tensor([float(x) for x in boost], dtype=torch.float32, device=dev),
-                        live.contiguous().view(torch.uint8), w32, omb, bb32, codes,
-                        t64(offs or [0]), t64(sizes or [1]), acc, cnt, out, total, fc, N, c1, c2,
-                        F=F, NFACET=nf, TILE=TILE, BLOCK=BLOCK, enable_fp_fusion=False)
+    _fused_kernel[grid](part.doc_ids, part.tf, part.rel_len, row_idf, rs, rl, qlo, qhi, msm_d, boost_d,
+                        live.view(torch.uint8), w_d, omb_d, bb_d, codes, off_d, nv_d, acc, cnt, out, total, fc, N,
+                        c1, c2, F=F, NFACET=nf, TILE=TILE, BLOCK=BLOCK, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
     return out.view(Q, N), total.to(torch.int64), facets
+
+
+def run_prepared(b, part, k1, idf, chunk, host_i, host_f, dev_i, dev_f, live, facet_codes):
+    """One chunk of ``s3_hostpath.HostIndex.prepare``'s output. ``host_i`` and ``host_f`` are its int64 and float32
+    blocks as numpy arrays; ``dev_i`` and ``dev_f`` are the same blocks on the device, or None off the kernel path.
+    Gives ``run``'s outputs: the kernel reads the device views directly, and the reference rebuilds the terms from
+    the host blocks."""
+    F = int(part.tf.shape[1])
+    at, ln, fa = chunk["int_at"], chunk["int_len"], chunk["float_at"]
+    Q = len(chunk["positions"])
+    hi = [host_i[a:a + n] for a, n in zip(at, ln)]
+    qlo, qhi = hi[2], hi[3]
+    R = int(qhi[-1]) if Q else 0
+    sizes = [int(x) for x in hi[6]] if chunk["facets"] else []
+    offs = [int(x) for x in hi[5]] if chunk["facets"] else []
+    if mode(b) == "kernel":
+        vi = [dev_i[a:a + n] for a, n in zip(at, ln)]
+        vf = [dev_f[a:a + n] for a, n in zip(fa, (F, F, F, Q))]
+        return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
+    rt = hi[7]
+    terms = [[int(t) for t in rt[qlo[g]:qhi[g]]] for g in range(Q)]
+    w = host_f[fa[0]:fa[0] + F]
+    bb = host_f[fa[1]:fa[1] + F]
+    boost = host_f[fa[3]:fa[3] + Q]
+    return reference(b, part, terms, w, bb, k1, idf, [int(m) for m in hi[4]], [float(x) for x in boost], live,
+                     facet_codes, sizes)
 
 
 def reference(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes=(), facet_sizes=()):

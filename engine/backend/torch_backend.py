@@ -89,6 +89,11 @@ class TorchBackend:
     def copy(self, a):
         return a.clone()
 
+    def clamp_min(self, a, lo):
+        """``max(a, lo)`` elementwise, a device op with no host scalar (S6-24: ``where(idx >= 0, idx, 0)`` in the page
+        step waited 10.6 ms a call for the device on an L4, arch-prof27)."""
+        return torch.clamp(a, min=lo)
+
     # ---- elementwise and reductions
     def log1p(self, a):
         return torch.log1p(a)
