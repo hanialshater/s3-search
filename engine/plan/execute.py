@@ -97,9 +97,46 @@ class Timer:
 
 class FlushedColumns(dict):
     """Columnar hits whose float32 scores and float64 sort values have no subnormals left: the engine flushed them
-    once per batch (``flush_subnormals``), so ``serving.encode.flush_response`` returns such a response as it is
-    (plat-m35: the per-reply flush was the default path's one new host cost per reply). A plain dict otherwise."""
+    once per batch (``flush_subnormals``), so ``serving.encode.flush_response`` returns such a response as it is.
+    plat-m35: the per-reply flush was the default path's one new host cost per reply, 8 to 24 us after #46. Any
+    mutation drops the marker (``s3_flushed`` becomes False), so changed columns are flushed per reply again. A plain
+    dict otherwise."""
     s3_flushed = True
+
+    def _changed(self):
+        self.s3_flushed = False
+
+    def __setitem__(self, k, v):
+        self._changed()
+        super().__setitem__(k, v)
+
+    def __delitem__(self, k):
+        self._changed()
+        super().__delitem__(k)
+
+    def update(self, *a, **kw):
+        self._changed()
+        super().update(*a, **kw)
+
+    def setdefault(self, k, default=None):
+        self._changed()
+        return super().setdefault(k, default)
+
+    def pop(self, k, *default):
+        self._changed()
+        return super().pop(k, *default)
+
+    def popitem(self):
+        self._changed()
+        return super().popitem()
+
+    def clear(self):
+        self._changed()
+        super().clear()
+
+    def __ior__(self, other):
+        self._changed()
+        return super().__ior__(other)
 
 
 _F32 = (np.uint32, np.uint32(0x7FFFFFFF), np.uint32(1), np.uint32(0x007FFFFF), np.uint32(0x80000000))
