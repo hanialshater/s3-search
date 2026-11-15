@@ -76,8 +76,10 @@ def flush_response(obj):
         if isinstance(obj, dict) and isinstance(obj.get("responses"), list):
             return {**obj, "responses": [flush_response(x) for x in obj["responses"]]}
         return obj
-    nd = (_FLUSH or _flush_consts())["ndarray"]
     c = obj["hits"]["columns"]
+    if getattr(c, "s3_flushed", False):                 # the engine flushed these once per batch (FlushedColumns)
+        return obj
+    nd = (_FLUSH or _flush_consts())["ndarray"]
     sc = c.get("_score")
     new_sc = flush_subnormals(sc) if isinstance(sc, nd) else sc
     sort = c.get("sort")
