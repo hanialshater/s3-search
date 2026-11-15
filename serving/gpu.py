@@ -190,6 +190,13 @@ class _BinConn(_Conn):
             if msg is None:
                 return
             try:
+                if self.proto == 3:                             # S3B3: the batch's replies as one kind 4 frame
+                    from . import binproto
+                    data = binproto.batch4(msg[1] if msg[0] == "multi" else [msg])
+                    with self.lock:
+                        self.sock.sendall(data)
+                    _account("writer")
+                    continue
                 parts = msg[1] if self.proto == 2 and msg[0] == "multi" else [msg]
                 for m in parts:                                 # S3B2: one send per reply, as it is ready
                     data = self._bytes(m)
@@ -277,8 +284,8 @@ class GpuServer:
         first = _read_into(sock, 4)
         if first is None:
             return sock.close()
-        if bytes(first) in (b"S3B1", b"S3B2"):                  # a native front (serving/binproto.py)
-            return self._bin_reader(sock, 2 if bytes(first) == b"S3B2" else 1)
+        if bytes(first) in (b"S3B1", b"S3B2", b"S3B3"):         # a native front (serving/binproto.py)
+            return self._bin_reader(sock, {b"S3B1": 1, b"S3B2": 2, b"S3B3": 3}[bytes(first)])
         conn = _Conn(sock)
         pending = bytes(first)
         try:
