@@ -6,6 +6,7 @@ leaves on one field share one matmul. The rest of each tree is elementwise work 
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import defaultdict
 
@@ -773,6 +774,14 @@ class Executor:
                                                    extra=extra_cols, tiekey=st.first_offset_dev, collapse=group,
                                                    count=sx["hits_mask"])
                 ids_a = None
+            fc = sx.pop("fused_cols", None)
+            if want_columns and fc is not None and ids_bytes:  # S6-31: views of the batch's arrays, built once
+                t.lap("page")
+                resp = {"hits": {"total": total, "columns": fc}, **resp}
+                if sx["knn"]:
+                    resp["knn"] = sx["knn"]
+                out.append(self._took(resp, shared, shared_ms, t))
+                continue
             if want_columns:
                 cols = {"_id": st.ids_bytes()[ids_a] if ids_bytes else st.ids[ids_a].tolist(),
                         "_score": extra_a[:, 0].astype(np.float32),
@@ -1051,17 +1060,62 @@ class Executor:
             tots.append(b.astype(tot, "float64"))
             order += ch
         n = len(order)
+        # S6-34: the fused plans' terms aggregations ride on the same transfer (one sync for the batch, not one
+        # more per facet field and size): per (field, size) the top buckets of every fused row, as _fused_terms.
+        agg_groups = defaultdict(list)
+        for ch in by.values():
+            for i in ch:
+                for a in states[i]["plan"].aggs:
+                    agg_groups[(a.field, a.size)].append((i, a))
+        aggs_meta, at = [], sum(int(x.shape[0]) for x in tots + bufs)
+        for (field, size), items in agg_groups.items():
+            rows_by = defaultdict(list)
+            for i, a in items:
+                rows_by[id(states[i]["fused"][4])].append((i, a))
+            rows, its_order = [], []
+            for its in rows_by.values():
+                counts = states[its[0][0]]["fused"][3][field][0]
+                rows.append(counts[b.asarray([states[i]["fused"][1] for i, _ in its], "int64")])
+                its_order += its
+            cnt = b.concatenate(rows, 0) if len(rows) > 1 else rows[0]
+            buf, kk = ops.facets.top_buckets_device(b, cnt, size)
+            flat = buf.reshape(-1)
+            aggs_meta.append((field, its_order, kk, at, int(buf.shape[0]), int(buf.shape[1])))
+            at += int(flat.shape[0])
+            bufs.append(flat)
         host = b.to_numpy(b.concatenate(tots + bufs, 0))            # one transfer: every total, then every page
-        need = (len(host) - n) // (3 * n)
-        pg = host[n:].reshape(n, need, 3)
+        for field, its_order, kk, a0, rows_n, width in aggs_meta:
+            keys_of = states[its_order[0][0]]["fused"][3][field][1]
+            parsed = ops.facets.top_buckets_parse(host[a0:a0 + rows_n * width].reshape(rows_n, width), kk)
+            for (i, a), (top, with_value) in zip(its_order, parsed):
+                states[i].setdefault("fused_aggs", {})[a.name] = {
+                    "doc_count_error_upper_bound": 0, "sum_other_doc_count": with_value - sum(c for _, c in top),
+                    "buckets": [{"key": keys_of[c], "doc_count": c_n} for c, c_n in top]}
+        page_len = (aggs_meta[0][3] if aggs_meta else len(host)) - n
+        need = page_len // (3 * n)
+        pg = host[n:n + page_len].reshape(n, need, 3)
+        # S6-31: the columns of every fused page in one pass. The ids are gathered once, the scores are cast once,
+        # and the valid hits per row are counted once. Each plan then takes row views: the same values and dtypes as
+        # the per-plan arrays (the valid entries of a top-k row are a prefix: -1 pads only its tail).
+        idx_all = pg[:, :, 0].astype(np.int64)
+        valid_n = (idx_all >= 0).sum(axis=1)
+        ids_all = st.ids_bytes()[np.maximum(idx_all, 0)]
+        score32_all = pg[:, :, 1].astype(np.float32)
+        score64_all = np.ascontiguousarray(pg[:, :, 1])
+        fo_all = pg[:, :, 2].astype(np.int64)
         ms = (time.perf_counter() - t0) * 1000.0 / n
         for r, i in enumerate(order):
             p = states[i]["plan"]
             totals[i] = int(host[r])
-            h = pg[r, p.from_:p.from_ + p.size]
-            h = h[h[:, 0] >= 0]
-            pages[i] = (h[:, 0].astype("int64"), h[:, 1:2], h[:, 1:3])
+            f0 = p.from_
+            f1 = max(f0, min(int(valid_n[r]), f0 + p.size))
+            pages[i] = (idx_all[r, f0:f1], pg[r, f0:f1, 1:2], pg[r, f0:f1, 1:3])
             states[i]["page_ms"] = ms
+            if os.environ.get("S3_FUSED_ONEPASS", "1") == "0":   # the per-plan assembly, for comparison
+                continue
+            states[i]["fused_cols"] = {"_id": ids_all[r, f0:f1], "_score": score32_all[r, f0:f1],
+                                       "sort": [{"values": score64_all[r, f0:f1], "missing": None},
+                                                {"values": fo_all[r, f0:f1], "missing": None}]}
 
     def _fused_terms(self, states, out):
         """The fused plans' terms aggregations from the pass's counts: per field and size one ``top_buckets`` over
@@ -1070,6 +1124,10 @@ class Executor:
         groups = defaultdict(list)
         for i, sx in enumerate(states):
             if "fused" in sx:
+                done = sx.pop("fused_aggs", None)            # S6-34: already on the pages' transfer
+                if done is not None:
+                    out[i].update(done)
+                    continue
                 for a in sx["plan"].aggs:
                     groups[(a.field, a.size)].append((i, a))
         for (field, size), items in groups.items():
