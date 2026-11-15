@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import random
 from pathlib import Path
 
@@ -42,34 +43,41 @@ def _diff(a, b):
     return f"lengths {len(a)} vs {len(b)}; first difference at byte {i}: {a[i:i + 40]!r} vs {b[i:i + 40]!r}"
 
 
-def test_every_golden4_frame():
-    spec = importlib.util.spec_from_file_location("make_vectors", ROOT / "serving/native_front/tests/make_vectors.py")
-    mv = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mv)
-    seen = []
-    ref = binproto.batch4
+_GOLDEN4_CHECK = r"""
+import json, random, sys
+sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + "/serving/native_front/tests")
+from serving import binproto
+import make_vectors as mv
+import s3_hostpath
+seen, ref = [], binproto.batch4
+binproto.batch4 = lambda msgs: (seen.append((list(msgs), ref(msgs))), seen[-1][1])[1]
+rows = mv.golden4(random.Random(10))
+binproto.batch4 = ref
+print(json.dumps({"rows": rows, "rust_equal": [s3_hostpath.batch4(m) == f for m, f in seen],
+                  "rust_hex": [s3_hostpath.batch4(m)[4:].hex() for m, _ in seen],
+                  "fp_clean": mv._fp_mode_clean(), "torch_loaded": "torch" in sys.modules}))
+"""
 
-    def capture(msgs):
-        f = ref(msgs)
-        seen.append((list(msgs), f))
-        return f
-    binproto.batch4 = capture
-    try:
-        rows = mv.golden4(random.Random(10))
-    finally:
-        binproto.batch4 = ref
+
+def test_every_golden4_frame():
+    """golden4.txt (the platform's, PR #45; its environment in golden.env.json) is reproduced line for line by Python
+    and by Rust. This runs in a fresh process without torch, in a clean FP mode, as make_vectors requires: the
+    generator's own float64-to-float32 input casts depend on flush-to-zero (arch-hp17 at 9698585: line 33 differed
+    in a process with torch loaded)."""
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, "-c", _GOLDEN4_CHECK, str(ROOT)], capture_output=True, text=True,
+                       env={**os.environ, "S3_HOSTPATH_BATCH4": "1"})
+    assert r.returncode == 0, r.stderr[-3000:]
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["torch_loaded"] is False and got["fp_clean"] is True
     lines = (ROOT / "serving/native_front/tests/golden4.txt").read_text().splitlines()
-    assert len(seen) == len(rows) == len(lines) == 40
-    for (msgs, f), line in zip(seen, lines):
-        got = s3_hostpath.batch4(msgs)
-        assert got == f, _diff(got, f)                      # the Rust writer equals the Python one on every input
-    # golden4.txt (the platform's, PR #45) is written from flushed responses (serving.encode.flush_response), so the
-    # FP mode cannot change it: Python and Rust reproduce every line here (its environment: golden.env.json).
-    bad = [i for i, (row, line) in enumerate(zip(rows, lines)) if row != line]
-    assert not bad, f"lines {bad} differ from golden4.txt (numpy {np.__version__})"
-    for (msgs, f), line in zip(seen, lines):
-        assert s3_hostpath.batch4(msgs)[4:].hex() == line.split(" ")[0]
-    print(f"\ngolden4: python and rust reproduce all 40 lines here (numpy {np.__version__})")
+    assert len(got["rows"]) == len(lines) == 40
+    assert all(got["rust_equal"])                              # Rust equals Python on every input
+    bad = [i for i, (row, line) in enumerate(zip(got["rows"], lines)) if row != line]
+    assert not bad, f"lines {bad} differ from golden4.txt"
+    assert got["rust_hex"] == [line.split(" ")[0] for line in lines]
+    print("\ngolden4: python and rust reproduce all 40 lines (fresh process, no torch, clean FP mode)")
 
 
 def test_subnormals_pass_through_both_writers_alike():
