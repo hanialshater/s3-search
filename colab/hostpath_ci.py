@@ -75,7 +75,7 @@ def main():
                              "engine/tests/test_hostpath.py", "engine/tests/test_hostpath_analysis.py",
                              "engine/tests/test_hostpath_batch4.py"]),
         ("batch4 timing", [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider",
-                           "engine/tests/test_hostpath_batch4.py", "-k", "speed"]),
+                           "engine/tests/test_hostpath_batch4.py", "-k", "speed or golden4"]),
         ("referee fast", [sys.executable, "-m", "referee", "fast"]),
         ("engine tests", [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "engine/tests"]),
     ]:
