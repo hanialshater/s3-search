@@ -159,7 +159,9 @@ def fused_runs(index, texts):
             label = (f"{kind}_{'fused' if on == '1' else 'today'}" + (f"_{thr}" if thr else "")
                      + ("" if op is None else f"_onepass{op}"))
             res[label] = {"measure": measure(index, make, texts, label, kw)}
-            for pb in (32, 64):                            # device time per batch where serving's tail is (S6-29)
+            pbs = tuple(int(x) for x in next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--profile-batches=")),
+                                             "32,64").split(","))
+            for pb in pbs:                                 # device time per batch (S6-29; the device ceiling: S6-35)
                 key = "torch_profile" if pb == 64 else f"torch_profile_{pb}"
                 try:
                     res[label][key] = torch_profile(index, make, texts, f"{label}/{pb}", bs=pb, kw=kw)
