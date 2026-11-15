@@ -7,6 +7,7 @@
 //! bytes as the Python front. Every other route goes to GPU process 0 as a call and is answered with what it returns.
 //! TCP_NODELAY is set on every accepted connection.
 
+mod batch;
 mod encode;
 
 use bytes::Bytes;
@@ -42,10 +43,11 @@ async fn connect(path: &str) -> std::io::Result<Arc<Gpu>> {
     let mut s = UnixStream::connect(path).await?;
     // S3B2 is the default (the steward's ruling on plat-m28, lab 1c51721): the GPU process sends kind 3 replies, each
     // as soon as it is encoded. S3_SERVING_BINPROTO=1 opts out to S3B1 (kind 1, the batch's replies in one write).
-    let magic: &[u8; 4] = if std::env::var("S3_SERVING_BINPROTO").map(|v| v.trim() == "1").unwrap_or(false) {
-        b"S3B1"
-    } else {
-        b"S3B2"
+    // S3_SERVING_BINPROTO=3 (opt-in): S3B3, kind 4 batch frames as well as kinds 2 and 3.
+    let magic: &[u8; 4] = match std::env::var("S3_SERVING_BINPROTO").map(|v| v.trim().to_string()).as_deref() {
+        Ok("1") => b"S3B1",
+        Ok("3") => b"S3B3",
+        _ => b"S3B2",
     };
     s.write_all(magic).await?;
     let (mut rd, mut wr) = s.into_split();
@@ -70,6 +72,17 @@ async fn connect(path: &str) -> std::io::Result<Arc<Gpu>> {
                 break;
             }
             if payload.len() < 9 {
+                continue;
+            }
+            if payload[0] == 4 {                                // S3B3: one frame per batch, one payload per reply
+                if let Some(parts) = batch::split(&payload) {
+                    let mut pend = g.pending.lock().unwrap();
+                    for (id, q) in parts {
+                        if let Some(tx) = pend.remove(&id) {
+                            let _ = tx.send(q);
+                        }
+                    }
+                }
                 continue;
             }
             let id = u64::from_le_bytes(payload[1..9].try_into().unwrap());

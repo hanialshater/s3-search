@@ -24,6 +24,55 @@ def _is_columnar(resp: Any) -> bool:
     return isinstance(resp, dict) and isinstance(resp.get("hits"), dict) and "columns" in resp["hits"]
 
 
+def flush_subnormals(a):
+    """A float32 or float64 array with its subnormals as signed zero, by bit masks, so the result does not depend on
+    the process's floating-point mode. torch can set flush-to-zero; then numpy's float32 to float64 conversion and
+    comparisons treat subnormals as zero, and reply bytes would differ by process (the steward's ruling, lab 5f5454f).
+    Normal values, zeros, infinities and NaNs keep their bits. The array is returned unchanged (not copied) when it
+    has no subnormal. (The architect's helper, #44 0ec23be.)"""
+    import numpy as np
+    a = np.asarray(a)
+    if a.dtype == np.float32:
+        ut, exp, sign = np.uint32, 0x7F800000, 0x80000000
+    elif a.dtype == np.float64:
+        ut, exp, sign = np.uint64, 0x7FF0000000000000, 0x8000000000000000
+    else:
+        return a
+    u = np.ascontiguousarray(a).view(ut)
+    sub = ((u & ut(exp)) == 0) & ((u & ~ut(exp | sign)) != 0)
+    if not sub.any():
+        return a
+    u = u.copy()
+    u[sub] &= ut(sign)
+    return u.view(a.dtype)
+
+
+def flush_response(obj):
+    """The one place subnormal floats are flushed (the steward's ruling, lab f134183): a columnar search response's
+    ``_score`` and float sort columns with their subnormals as signed zero, before any writer sees them, so every reply
+    kind (S3B1, S3B2, S3B3, the Python front) writes the same bytes whatever the process's FP mode. Called on each
+    answer in the GPU process (serving/gpu.py ``_answer``) and on the single-process path (serving/app.py
+    ``_search_json``). A list (``_msearch``) is flushed item by item; anything not columnar is returned as it is.
+    Engine scores are sums of positive BM25F weights and are never subnormal in practice; a float64 sort value can be."""
+    import numpy as np
+    if isinstance(obj, list):
+        return [flush_response(x) for x in obj]
+    if not _is_columnar(obj):
+        if isinstance(obj, dict) and isinstance(obj.get("responses"), list):
+            return {**obj, "responses": [flush_response(x) for x in obj["responses"]]}
+        return obj
+    c = obj["hits"]["columns"]
+    sc = c.get("_score")
+    new_sc = flush_subnormals(sc) if isinstance(sc, np.ndarray) else sc
+    sort = c.get("sort") or []
+    new_sort = [({**col, "values": flush_subnormals(col["values"])}
+                 if isinstance(col, dict) and isinstance(col.get("values"), np.ndarray) and col["values"].dtype.kind == "f"
+                 else col) for col in sort]
+    if new_sc is sc and all(a is b or (isinstance(a, dict) and a.get("values") is b.get("values")) for a, b in zip(sort, new_sort)):
+        return obj
+    return {**obj, "hits": {**obj["hits"], "columns": {**c, "_score": new_sc, "sort": new_sort}}}
+
+
 def _floats(values) -> list[str]:
     """``json.dumps``'s text for each float: ``float.__repr__``, and NaN, Infinity, -Infinity as it writes them."""
     import numpy as np

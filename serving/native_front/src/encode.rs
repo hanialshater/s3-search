@@ -18,6 +18,13 @@ pub enum Col<'a> {
     SameAsScore,
     F64(&'a [u8]),              // h little-endian f64
     I64(&'a [u8]),              // h little-endian i64
+    F64M(&'a [u8], &'a [u8]),   // S3B3 (kind 4, split): f64 values and a missing bitmap (bit i set: hit i is null)
+    I64M(&'a [u8], &'a [u8]),
+}
+
+#[inline]
+fn missing(m: &[u8], i: usize) -> bool {
+    m[i / 8] >> (i % 8) & 1 == 1
 }
 
 #[inline]
@@ -72,6 +79,12 @@ pub fn parse_block(b: &[u8]) -> Option<Block<'_>> {
                 sort.push(Col::I64(b.get(o..o + 8 * h)?));
                 o += 8 * h;
             }
+            3 | 4 => {                                          // only in a kind 4 frame's split replies
+                let v = b.get(o..o + 8 * h)?;
+                let m = b.get(o + 8 * h..o + 8 * h + (h + 7) / 8)?;
+                o += 8 * h + (h + 7) / 8;
+                sort.push(if code == 3 { Col::F64M(v, m) } else { Col::I64M(v, m) });
+            }
             _ => return None,
         }
     }
@@ -107,6 +120,8 @@ pub fn encode_hits(blk: &Block, out: &mut Vec<u8>) {
                     let mut ib = itoa_buf(i64_at(v, i));
                     out.append(&mut ib);
                 }
+                Col::F64M(v, m) => if missing(m, i) { out.extend_from_slice(b"null") } else { push_pyrepr(out, f64_at(v, i), &mut fb) },
+                Col::I64M(v, m) => if missing(m, i) { out.extend_from_slice(b"null") } else { out.append(&mut itoa_buf(i64_at(v, i))) },
             }
         }
         out.extend_from_slice(b"]}");
@@ -274,6 +289,8 @@ pub fn encode_hits3(blk: &Block, out: &mut Vec<u8>) -> Option<()> {
                     let mut ib = itoa_buf(i64_at(v, i));
                     out.append(&mut ib);
                 }
+                Col::F64M(v, m) => if missing(m, i) { out.extend_from_slice(b"null") } else { push_pyrepr(out, f64_at(v, i), &mut fb) },
+                Col::I64M(v, m) => if missing(m, i) { out.extend_from_slice(b"null") } else { out.append(&mut itoa_buf(i64_at(v, i))) },
             }
         }
         out.extend_from_slice(b"]}");

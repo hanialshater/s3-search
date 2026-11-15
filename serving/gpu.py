@@ -47,6 +47,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from .errors import NotReady, Overloaded, classify, classify_entry
+from .encode import flush_response
 
 log = logging.getLogger("serving.gpu")
 MAX_BATCH = 64
@@ -190,6 +191,13 @@ class _BinConn(_Conn):
             if msg is None:
                 return
             try:
+                if self.proto == 3:                             # S3B3: the batch's replies as one kind 4 frame
+                    from . import binproto
+                    data = binproto.batch4(msg[1] if msg[0] == "multi" else [msg])
+                    with self.lock:
+                        self.sock.sendall(data)
+                    _account("writer")
+                    continue
                 parts = msg[1] if self.proto == 2 and msg[0] == "multi" else [msg]
                 for m in parts:                                 # S3B2: one send per reply, as it is ready
                     data = self._bytes(m)
@@ -277,8 +285,8 @@ class GpuServer:
         first = _read_into(sock, 4)
         if first is None:
             return sock.close()
-        if bytes(first) in (b"S3B1", b"S3B2"):                  # a native front (serving/binproto.py)
-            return self._bin_reader(sock, 2 if bytes(first) == b"S3B2" else 1)
+        if bytes(first) in (b"S3B1", b"S3B2", b"S3B3"):         # a native front (serving/binproto.py)
+            return self._bin_reader(sock, {b"S3B1": 1, b"S3B2": 2, b"S3B3": 3}[bytes(first)])
         conn = _Conn(sock)
         pending = bytes(first)
         try:
@@ -567,6 +575,7 @@ class GpuServer:
             status, body = classify_entry(resp["error"])
             mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="error")
             return self._reply(it, ("search", it.id, "error", status, body))
+        resp = flush_response(resp)        # the one flush of subnormal floats, before _source and any writer (lab f134183)
         src = it.request.get("_source") if isinstance(it.request, dict) else None   # planned: no _source
         if src not in (None, False):
             from .encode import expand_columns

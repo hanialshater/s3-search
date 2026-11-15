@@ -1,6 +1,7 @@
 """serving/binproto.py's kind-1 checks (S6-22s): the single-pass _plain_ids and _safe decide exactly as the numpy forms
 they replaced (kept here as the reference), on random and edge-case inputs; and a columnar reply still decodes to the
 bytes serving.encode writes."""
+import json
 import numpy as np
 import pytest
 
@@ -96,3 +97,84 @@ def test_kind3_still_sends_whole_what_it_cannot_carry():
         resp = {"took_ms": 1, "hits": {"total": 2, "columns": {"_id": ids, "_score": sc, "sort": sort}}}
         assert binproto.columnar3(1, resp, {}) is None
     assert binproto.columnar3(1, {"took_ms": 1, "hits": {"total": 0, "hits": []}}, {}) is None
+
+
+def _resp(ids, sc, sort, total=None, aggs=False):
+    r = {"took_ms": {"parse": 0.1}, "hits": {"total": total or len(ids), "columns": {"_id": ids, "_score": sc, "sort": sort}}}
+    if aggs:
+        r["aggregations"] = {"c": {"buckets": [{"key": "a\"b", "doc_count": 3}]}}
+    return r
+
+
+def test_batch4_records_decode_to_the_encoded_bytes_of_each_reply():
+    """S3B3 (kind 4): one frame for a batch's replies (columnar, field-sorted with missing values, ids S3B1 refuses,
+    a whole response, an error, a call); each record split out encodes to serving.encode's bytes for its reply."""
+    from serving.encode import encode
+    rng = np.random.default_rng(4)
+    a_ids = np.array([b"B001", b"B002", b"B003"], "S4")
+    a_sc = np.array([3.5, 2.0, 1.0], np.float32)
+    msgs = [
+        ("search", 11, "ok", _resp(a_ids, a_sc, [{"values": a_sc.astype(np.float64), "missing": None}]), ("seg", 1), 0.5, 4, 2.0),
+        ("search", 12, "ok", _resp(np.array(['x"y'.encode(), "é中".encode()], "S6"), np.array([np.nan, 1e-7], np.float32),
+                                   [{"values": np.array([1.5, -0.0]), "missing": [False, True]},
+                                    {"values": np.array([7, 2**62], np.int64), "missing": None}], aggs=True), ("seg", 1), 0.4, 4),
+        ("search", 13, "ok", _resp(np.array([b"q"], "S1"), np.array([9.0], np.float32),
+                                   [{"values": np.array([3], np.int64), "missing": None},
+                                    {"values": np.array([2.25]), "missing": None}]), ("seg", 1), 0.3, 4),
+        ("search", 14, "ok", _resp(np.array([b"a\x00b", b"c"], "S3"), np.array([1.0, 2.0], np.float32), []), ("seg", 1), 0.2, 4),
+        ("search", 15, "error", 400, {"error": {"type": "invalid_request", "path": "", "reason": "no"}}),
+        ("call", 16, 200, b'{"status":"ok"}', "application/json", {}),
+    ]
+    f = binproto.batch4(msgs)
+    assert f[4] == 4
+    recs = binproto.split_batch4(f[4:])
+    assert [r[0] for r in recs] == [11, 12, 13, 14, 15, 16]
+    for (id_, st, body, meta), msg in zip(recs, msgs):
+        if msg[0] == "search" and msg[2] == "ok":
+            assert st == 200 and body == encode(msg[3]), id_
+        elif msg[0] == "search":
+            assert st == 400 and json.loads(body) == msg[4]
+        else:
+            assert st == 200 and body == b'{"status":"ok"}' and meta == {"type": "application/json"}
+    assert "pre" in recs[0][3] and "pre" not in recs[3][3]          # an id with an interior NUL goes whole (rkind 2)
+
+
+def test_batch4_aligns_its_numeric_arrays():
+    import struct
+    msgs = [("search", 1, "ok", _resp(np.array([b"abc"], "S3"), np.array([1.0], np.float32),
+                                      [{"values": np.array([2.0]), "missing": None}]), ("s", 1), 0.0, 1)]
+    p = binproto.batch4(msgs)[4:]
+    n, w, ht = struct.unpack_from("<IHI", p, 9)
+    o = 19 + ht * w
+    o += -o % 8
+    assert o % 8 == 0 and p[19 + ht * w:o] == b"\x00" * (o - 19 - ht * w)
+    sc = np.frombuffer(p, "<f4", ht, o)
+    assert sc.tolist() == [1.0]
+
+
+def test_flush_response_subnormals_to_signed_zero_by_bits():
+    """The one flush (lab f134183): subnormal float32 scores and float sort values become signed zero by bits, normal
+    values, zeros, infinities and NaN keep their bits, non-float columns and non-columnar responses are untouched."""
+    import struct
+    from serving.encode import encode, flush_response
+    f32 = lambda bits: struct.unpack("<f", struct.pack("<I", bits))[0]
+    sc = np.array([f32(0x00000001), f32(0x80000001), f32(0x007FFFFF), 1.5, 0.0, -0.0, np.inf, np.nan], np.float32)
+    f8 = np.array([5e-324, -5e-324, 2.2250738585072014e-308, 1e-300, 0.0, -1.0, np.inf, np.nan])
+    i8 = np.arange(8, dtype=np.int64)
+    ids = np.array([b"a%d" % k for k in range(8)], "S2")
+    resp = {"hits": {"total": 8, "columns": {"_id": ids, "_score": sc,
+                                             "sort": [{"values": f8, "missing": None}, {"values": i8, "missing": None}]}}}
+    out = flush_response(resp)
+    s, v = out["hits"]["columns"]["_score"], out["hits"]["columns"]["sort"][0]["values"]
+    assert s.view(np.uint32).tolist()[:6] == [0, 0x80000000, 0, 0x3FC00000, 0, 0x80000000]
+    assert np.isinf(s[6]) and np.isnan(s[7])
+    assert v.view(np.uint64).tolist()[:2] == [0, 0x8000000000000000]
+    assert v[2] == 2.2250738585072014e-308 and v[3] == 1e-300                 # the smallest normal stays
+    assert out["hits"]["columns"]["sort"][1]["values"] is i8
+    assert resp["hits"]["columns"]["_score"] is sc and sc.view(np.uint32)[0] == 1   # the input is not changed
+    body = encode(out).decode()
+    assert '"_score":0.0,' in body and '"_score":-0.0,' in body and "e-45" not in body and "5e-324" not in body
+    clean = {"hits": {"total": 1, "columns": {"_id": ids[:1], "_score": np.array([1.0], np.float32), "sort": []}}}
+    assert flush_response(clean) is clean                                        # nothing subnormal: the same object
+    assert flush_response([clean, {"error": 1}])[1] == {"error": 1}
+    assert flush_response({"x": 1}) == {"x": 1}
