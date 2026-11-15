@@ -57,6 +57,20 @@ def _shape():
     return (int(os.environ.get("S3_TRITON_FUSED_TILE", TILE)), int(os.environ.get("S3_TRITON_FUSED_BLOCK", BLOCK)),
             int(os.environ.get("S3_TRITON_FUSED_WARPS", NUM_WARPS)))
 ENV = "S3_TRITON_FUSED_LEXICAL"
+HIST24_ENV = "S3_FUSED_HIST24"          # item 2 (opt-in): the top-k's first radix pass, histogrammed by the kernel
+
+
+def hist24_on() -> bool:
+    return os.environ.get(HIST24_ENV, "0") == "1"
+
+
+def hist24_of(scores):
+    """The first-digit histogram the kernel wrote for these score rows (``S3_FUSED_HIST24=1``), or None. It is taken
+    (removed): the radix select clears it as it uses it."""
+    h = getattr(scores, "_s3_hist24", None)               # set on the launch's own score-rows tensor
+    if h is not None:
+        del scores._s3_hist24
+    return h
 
 
 def mode(b) -> str | None:
@@ -75,9 +89,9 @@ if triton is not None:
     @triton.jit
     def _fused_kernel(docs_ptr, tf_ptr, norm_ptr, row_idf_ptr, row_start_ptr, row_len_ptr, q_row_lo_ptr, q_row_hi_ptr,
                       msm_ptr, boost_ptr, live_ptr, w_ptr, codes_ptr, fc_off_ptr, fc_nv_ptr,
-                      acc_ptr, cnt_ptr, out_ptr, total_ptr, fc_ptr, N, c1, c2, imp_ptr,
+                      acc_ptr, cnt_ptr, out_ptr, total_ptr, fc_ptr, N, c1, c2, imp_ptr, hist_ptr,
                       F: tl.constexpr, NFACET: tl.constexpr, TILE: tl.constexpr, BLOCK: tl.constexpr,
-                      IMPACT: tl.constexpr):
+                      IMPACT: tl.constexpr, HIST24: tl.constexpr):
         g = tl.program_id(0)
         tile = tl.program_id(1)
         d0 = tile * TILE
@@ -145,7 +159,21 @@ if triton is not None:
         boost = tl.load(boost_ptr + g)
         match = inb_t & (cnt >= msm) & (live != 0)
         s32 = acc.to(tl.float32)
-        tl.store(out_ptr + base + dd, tl.where(match, s32 * boost, float("-inf")), mask=inb_t)
+        val = tl.where(match, s32 * boost, float("-inf"))
+        tl.store(out_ptr + base + dd, val, mask=inb_t)
+        if HIST24:
+            # Item 2: triton_topk._hist_kernel's first pass (SHIFT 24) over this tile's stored values, so the top-k
+            # need not read the rows for it. The key is the order-preserving 32-bit pattern of val + 0.0 (-0.0 as
+            # +0.0, as triton_topk.topk does before its select). Only non-zero bins are added: the matched scores'
+            # top digits are a handful, and every unmatched -inf goes to bin 0.
+            bits = val.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+            bits = tl.where(bits == 0x80000000, 0, bits)
+            key = tl.where(bits >= 0x80000000, 0xFFFFFFFF - bits, bits + 0x80000000)
+            digit = (key >> 24).to(tl.int32)
+            hh = tl.histogram(tl.where(inb_t, digit, 0), 256)
+            bins = tl.arange(0, 256)
+            hh = hh - tl.where(bins == 0, tl.sum((inb_t == 0).to(tl.int32), axis=0), 0)
+            tl.atomic_add(hist_ptr + g * 256 + bins, hh, mask=hh != 0)
         tl.atomic_add(total_ptr + g, tl.sum(match.to(tl.int32), axis=0))
         for j in tl.static_range(NFACET):
             code = tl.load(codes_ptr + j * N + dd, mask=inb_t, other=0)
@@ -329,12 +357,17 @@ def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb, 
     tile, block, warps = _shape()
     grid = (Q, triton.cdiv(N, tile))
     imp = impacts(b, part, w, bb, k1, idf)                  # S6-33 (opt-in): the per-posting weights, or None
+    h24 = hist24_on()
+    hist = torch.zeros(Q * 256 if h24 else 1, dtype=torch.int32, device=dev)
     _fused_kernel[grid](docs32, part.tf.contiguous(), norm, row_idf, rs, rl, qlo, qhi, msm_d, boost_d,
                         live.contiguous().view(torch.uint8), w_d, codes, off_d, nv_d, acc, cnt, out, total, fc, N,
-                        c1, c2, imp if imp is not None else out, F=F, NFACET=nf, TILE=tile, BLOCK=block,
-                        IMPACT=imp is not None, num_warps=warps, enable_fp_fusion=False)
+                        c1, c2, imp if imp is not None else out, hist, F=F, NFACET=nf, TILE=tile, BLOCK=block,
+                        IMPACT=imp is not None, HIST24=h24, num_warps=warps, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
-    return out.view(Q, N), total.to(torch.int64), facets
+    rows = out.view(Q, N)
+    if h24:
+        rows._s3_hist24 = hist                              # hist24_of(rows) takes it; a derived tensor has none
+    return rows, total.to(torch.int64), facets
 
 
 def run_prepared(b, part, k1, idf, chunk, host_i, host_f, dev_i, dev_f, live, facet_codes):

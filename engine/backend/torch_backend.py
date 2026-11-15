@@ -223,7 +223,7 @@ class TorchBackend:
             out[:, s:s + chunk] = (a64 @ b[:, s:s + chunk].to(torch.float64)).to(torch.float32)
         return out
 
-    def topk(self, scores, k, valid=None):
+    def topk(self, scores, k, valid=None, hist24=None):
         s = scores.to(torch.float32)
         if valid is not None:
             s = torch.where(valid, s, torch.tensor(float("-inf"), dtype=torch.float32))  # a host scalar: no copy
@@ -234,7 +234,7 @@ class TorchBackend:
                     torch.full((Q, k), float("-inf"), device=self.device))
         from . import triton_topk as TT
         if TT.wanted(self, k, N):                         # S6-18: a float32 threshold and a Triton compaction
-            return TT.topk(s, k)
+            return TT.topk(s, k, hist24 if valid is None else None)   # item 2: the fused kernel's first pass
         # S6-14: one top-k over a unique int64 key, (the score's order-preserving bits, then N-1-index), so the
         # order is score descending, then index ascending, with no tie pass (the kth value, a cumsum over the row,
         # a nonzero and a sort before). -0.0 is made +0.0 first: they compare equal as floats.

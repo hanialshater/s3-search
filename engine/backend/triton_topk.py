@@ -120,27 +120,41 @@ if triton is not None:
         tl.store(hist_ptr + q * 256 + i, tl.zeros([256], tl.int32))
 
 
-def kth_value(s, k: int):
+def first_digit_hist(s):
+    """``int32[Q * 256]``: the first radix pass's histogram of the float32 ``s`` [Q, N] (as ``kth_value`` builds it),
+    for tests of the fused kernel's (item 2)."""
+    import torch
+    Q, N = s.shape
+    hist = torch.zeros(Q * 256, dtype=torch.int32, device=s.device)
+    prefix = torch.zeros(Q, dtype=torch.int64, device=s.device)
+    _hist_kernel[(Q, triton.cdiv(N, BLOCK))](s, prefix, hist, N, SHIFT=24, BLOCK=BLOCK)
+    return hist
+
+
+def kth_value(s, k: int, hist24=None):
     """``float32[Q]``: each row's k-th largest value of the float32 ``s`` [Q, N], multiplicity counted. It is the value
     ``torch.topk(s, k).values.min(dim=1)`` gives (S6-29). Four radix passes of 8 bits over the scores'
     order-preserving bits, each a block histogram (one atomic add per bin and block) then a per-row digit select.
-    Exact: integer counts on the bits, no float comparisons."""
+    Exact: integer counts on the bits, no float comparisons. ``hist24`` (item 2): the first pass's histogram, already
+    built (the fused kernel's, of these same rows); that pass then reads nothing."""
     import torch
     Q, N = s.shape
     dev = s.device
-    hist = torch.zeros(Q * 256, dtype=torch.int32, device=dev)
+    hist = (hist24.reshape(Q * 256).to(torch.int32).contiguous() if hist24 is not None
+            else torch.zeros(Q * 256, dtype=torch.int32, device=dev))
     prefix = torch.zeros(Q, dtype=torch.int64, device=dev)
     krem = torch.full((Q,), int(k), dtype=torch.int32, device=dev)
     nb = triton.cdiv(N, BLOCK)
     for shift in (24, 16, 8, 0):
-        _hist_kernel[(Q, nb)](s, prefix, hist, N, SHIFT=shift, BLOCK=BLOCK)
+        if not (shift == 24 and hist24 is not None):
+            _hist_kernel[(Q, nb)](s, prefix, hist, N, SHIFT=shift, BLOCK=BLOCK)
         _select_kernel[(Q,)](hist, prefix, krem, SHIFT=shift)
     bits = torch.where(prefix >= 0x80000000, prefix - 0x80000000, 0xFFFFFFFF - prefix)
     bits = torch.where(bits >= 0x80000000, bits - 0x100000000, bits)          # as a signed 32-bit pattern
     return bits.to(torch.int32).view(torch.float32).contiguous()
 
 
-def topk(scores, k: int):
+def topk(scores, k: int, hist24=None):
     """``(cols int32[Q, k], vals float32[Q, k])`` equal to ``TorchBackend.topk``'s key top-k of the float32 ``scores``
     (invalid entries already ``-inf``): score descending, then index ascending; ``-1`` where the value is ``-inf``."""
     import torch
@@ -149,7 +163,7 @@ def topk(scores, k: int):
     if os.environ.get("S3_TRITON_TOPK_THRESHOLD", "radix") == "torch":                # S6-29's comparison switch
         v = torch.topk(s, k, dim=1, sorted=False).values.min(dim=1).values.contiguous()
     else:
-        v = kth_value(s, k)                                 # each row's k-th value (S6-29: a radix select)
+        v = kth_value(s, k, hist24)                         # each row's k-th value (S6-29: a radix select)
     nb = triton.cdiv(N, BLOCK)
     gt = torch.empty((Q, nb), dtype=torch.int32, device=s.device)
     eq = torch.empty((Q, nb), dtype=torch.int32, device=s.device)

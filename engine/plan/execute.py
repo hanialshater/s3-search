@@ -1128,13 +1128,16 @@ class Executor:
         order, tots, bufs = [], [], []
         for ch in by.values():
             S, _, tot, _, _ = states[ch[0]]["fused"]
+            from ..backend import triton_fused as _TF
+            h24 = _TF.hist24_of(S)                        # item 2 (S3_FUSED_HIST24=1): the kernel's first pass
             rows_g = [states[i]["fused"][1] for i in ch]
             if rows_g != list(range(S.shape[0])):
                 sel = b.asarray(rows_g, "int64")
                 S, tot = S[sel], tot[sel]
+                h24 = h24.view(-1, 256)[sel] if h24 is not None else None
             G = len(ch)
             rows = b.arange(G).reshape(G, 1)
-            idx, _ = b.topk(S, k)
+            idx, _ = b.topk(S, k, hist24=h24) if h24 is not None else b.topk(S, k)
             idx = b.astype(idx, "int64")
             safe = b.clamp_min(idx, 0)                    # the same values as where(idx >= 0, idx, 0)
             bufs.append(b.stack([b.astype(idx, "float64"), b.astype(S[rows, safe], "float64"),
