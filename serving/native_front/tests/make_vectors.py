@@ -103,6 +103,20 @@ def golden(rng):
     return rows
 
 
+def _f32_exact(values):
+    """float32 scores from float64 values, each as exact float32 bits: one scalar IEEE conversion per value (struct's
+    C cast, round to nearest even; out of range is +-inf), never numpy's vectorised cast. On the Colab CPU numpy's
+    float64-to-float32 cast gave a different subnormal for one value (golden4 line 33, arch-hp17 and hp18), so the
+    subnormal inputs are now bit patterns made the same way everywhere (the steward, lab 706a7b9)."""
+    out = []
+    for x in values:
+        try:
+            out.append(struct.unpack("<I", struct.pack("<f", x))[0])
+        except OverflowError:                                   # beyond float32's range after rounding: +-inf
+            out.append(0x7F800000 | (0x80000000 if x < 0 else 0))
+    return np.array(out, np.uint32).view(np.float32)
+
+
 def golden4(rng):
     """Kind 4 frames (S3B3): random batches of replies (columnar with any ids and floats, field sorts with missing
     values, an id with an interior NUL, whole, error, call), each line ``hex(payload) id:status:hex(body) ...``."""
@@ -123,8 +137,7 @@ def golden4(rng):
                     ids[0] = "a\x00b"
                 w = max(len(s.encode("utf-8")) for s in ids)
                 idarr = np.array([s.encode("utf-8") for s in ids], f"S{w}")
-                with np.errstate(over="ignore"):
-                    sc = np.array([rng.choice(fl) for _ in range(h)], np.float64).astype(np.float32)
+                sc = _f32_exact([rng.choice(fl) for _ in range(h)])
                 sort = []
                 for c in rng.sample(["score", "f8", "i8", "f8m", "i8m"], rng.randint(0, 3)):
                     miss = None
