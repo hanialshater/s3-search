@@ -299,6 +299,55 @@ def hostpath_runs(index, texts):
     return res
 
 
+def hostpath_ab(index, texts):
+    """--hostpath=1 --hostpath-ab=1 (the steward's condition for a Rust-stack headline, plat-m34): every query text
+    answered twice.
+    - Off: ``search_batch``, as S3_HOSTPATH off serves.
+    - On: ``HostIndex.prepare``, then ``search_prepared`` for the served positions and ``search_batch`` for the
+      fallback ones, as the GPU process serves with S3_HOSTPATH=1.
+    Both run at depth 2,000 (columns) and faceted, in batches of 64, with S3_TRITON_FUSED_IMPACTS 0 and 1. Each
+    response is serving.encode.encode(flush_response(r)) with took_ms removed, compared position by position by its
+    sha256."""
+    import hashlib
+    from engine import hostpath
+    from serving.encode import encode, flush_response
+    os.environ["S3_TRITON_FUSED_LEXICAL"] = "1"
+    hi = hostpath.host_index(index._st)
+    facets = {"brand": {"terms": {"field": "product_brand.keyword", "size": 10}},
+              "color": {"terms": {"field": "product_color.keyword", "size": 10}}}
+    kinds = {"deep": (deep_request, {"hits": "columns", "ids": "bytes"}),
+             "faceted": (lambda q: {"query": lexical(q), "aggs": facets, "size": 10}, {"hits": "columns", "ids": "bytes"})}
+
+    def digest(r):
+        r = {k: v for k, v in flush_response(r).items() if k != "took_ms"}
+        return hashlib.sha256(encode(r)).digest()
+    res = {}
+    for imp in ("0", "1"):
+        os.environ["S3_TRITON_FUSED_IMPACTS"] = imp
+        for kind, (make, kw) in kinds.items():
+            reqs = [make(t) for t in texts]
+            bodies = [json.dumps(q).encode() for q in reqs]
+            off, on, served, fallback = [], [], 0, 0
+            for i in range(0, len(reqs), 64):
+                off += [digest(r) for r in index.search_batch(reqs[i:i + 64], **kw)]
+                prep = hi.prepare(bodies[i:i + 64])
+                got = dict(zip(prep["eligible"], index.search_prepared(prep, **kw)))
+                fb = list(prep["fallback"])
+                got.update(zip(fb, index.search_batch([reqs[i + p] for p in fb], **kw) if fb else []))
+                served += len(prep["eligible"])
+                fallback += len(fb)
+                on += [digest(got[p]) for p in range(len(bodies[i:i + 64]))]
+            bad = [j for j, (a, b) in enumerate(zip(off, on)) if a != b]
+            key = f"{kind}_impacts{imp}"
+            res[key] = {"of": len(off), "differ": len(bad), "first_differ": bad[:10], "served": served,
+                        "fallback": fallback, "sha256_off": hashlib.sha256(b"".join(off)).hexdigest(),
+                        "sha256_on": hashlib.sha256(b"".join(on)).hexdigest()}
+            say(f"hostpath A/B {key}: {len(bad)} of {len(off)} responses differ (served {served}, fallback {fallback})")
+    os.environ.pop("S3_TRITON_FUSED_IMPACTS", None)
+    os.environ.pop("S3_TRITON_FUSED_LEXICAL", None)
+    return res
+
+
 def torch_profile(index, make, texts, label, bs=64, kw=None):
     """One batch of ``bs`` under torch.profiler: the top CUDA kernels by device time, and launches and syncs per
     request."""
@@ -371,8 +420,12 @@ def main():
         texts = [str(t) for t in ds.test_queries["query"].iloc[:N_QUERIES]]
         result = {"kind": "pipeline-profile-hostpath", "label": "development only, never a score", "ref": REF,
                   "commit": commit, "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
-                  "n_products": int(len(ds.catalogue)), "n_queries": len(texts), "build_s": build_s,
-                  "hostpath": hostpath_runs(index, texts)}
+                  "n_products": int(len(ds.catalogue)), "n_queries": len(texts), "build_s": build_s}
+        if any(a == "--hostpath-ab=1" for a in sys.argv[1:]):
+            result["kind"] = "hostpath-ab"
+            result["ab"] = hostpath_ab(index, texts)
+        else:
+            result["hostpath"] = hostpath_runs(index, texts)
         stop.set()
         json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
         say("DONE")
