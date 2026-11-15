@@ -40,6 +40,7 @@ import pickle
 import queue
 import socket
 import struct
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -168,14 +169,20 @@ class _Conn:
 
 class _BinConn(_Conn):
     """A native front's connection (S6-22s, ``serving/binproto.py``): replies as binary frames, the hits as columns
-    the front encodes itself, anything else encoded here."""
+    the front encodes itself, anything else encoded here. ``proto`` 2 (an S3B2 connection, opt-in): the hits go as
+    kind 3, unchecked, the front escaping the ids and writing the floats as Python does; and each reply of a batch is
+    sent as soon as it is encoded, not with the whole batch (plat-m25: every reply waited for its batch's encode)."""
+
+    def __init__(self, sock, proto: int = 1):
+        self.proto = proto
+        super().__init__(sock)
 
     def _bytes(self, msg) -> bytes:
         from . import hostpath
         hp = _hostpath()
-        if hp is not None:                                      # S3_HOSTPATH: the module writes the frames
+        if hp is not None and self.proto == 1:                  # S3_HOSTPATH: the module writes the frames
             return hp.reply(msg[1] if msg[0] == "multi" else [msg])
-        return hostpath.reply_frame(msg)
+        return hostpath.reply_frame(msg, self.proto)
 
     def _writer(self) -> None:
         while True:
@@ -183,9 +190,11 @@ class _BinConn(_Conn):
             if msg is None:
                 return
             try:
-                data = self._bytes(msg)
-                with self.lock:
-                    self.sock.sendall(data)
+                parts = msg[1] if self.proto == 2 and msg[0] == "multi" else [msg]
+                for m in parts:                                 # S3B2: one send per reply, as it is ready
+                    data = self._bytes(m)
+                    with self.lock:
+                        self.sock.sendall(data)
             except OSError:
                 return
             _account("writer")
@@ -208,11 +217,12 @@ def binproto_search_body(raw):
 
 
 class _Item:
-    __slots__ = ("conn", "id", "name", "request", "t", "raw", "prep")
+    __slots__ = ("conn", "id", "name", "request", "t", "raw", "prep", "parse_ms")
 
     def __init__(self, conn, id_, name, request, raw=None):
         self.conn, self.id, self.name, self.request, self.raw = conn, id_, name, request, raw
         self.prep = None                                        # (Prepared, position) when s3_hostpath planned it
+        self.parse_ms = None                                    # the reader's parse of the frame (S6-22s timers)
         self.t = time.perf_counter()
 
 
@@ -267,8 +277,8 @@ class GpuServer:
         first = _read_into(sock, 4)
         if first is None:
             return sock.close()
-        if bytes(first) == b"S3B1":                              # a native front (serving/binproto.py)
-            return self._bin_reader(sock)
+        if bytes(first) in (b"S3B1", b"S3B2"):                  # a native front (serving/binproto.py)
+            return self._bin_reader(sock, 2 if bytes(first) == b"S3B2" else 1)
         conn = _Conn(sock)
         pending = bytes(first)
         try:
@@ -298,9 +308,9 @@ class GpuServer:
             except OSError:
                 pass
 
-    def _bin_reader(self, sock: socket.socket) -> None:
+    def _bin_reader(self, sock: socket.socket, proto: int = 1) -> None:
         from . import binproto
-        conn = _BinConn(sock)
+        conn = _BinConn(sock, proto)
         try:
             while True:
                 head = _read_into(sock, 4)
@@ -316,12 +326,16 @@ class GpuServer:
                     _account("reader")
                     self._publish_load()
                     continue
+                tp = time.perf_counter()
                 msg = binproto.parse_request(bytes(payload))
+                parse_ms = (time.perf_counter() - tp) * 1000.0
                 if msg[0] == "search" and isinstance(msg[3], Exception):   # not JSON: 400, as the Python front
                     status, body = classify(msg[3])
                     conn.put(("search", msg[1], "error", status, body))
                 elif msg[0] == "search":
-                    self.q.put(_Item(conn, msg[1], msg[2], msg[3]))
+                    item = _Item(conn, msg[1], msg[2], msg[3])
+                    item.parse_ms = parse_ms
+                    self.q.put(item)
                     _account("reader")
                     self._publish_load()
                 else:
@@ -479,7 +493,8 @@ class GpuServer:
         try:
             tb = time.perf_counter()
             out, per_request = _search_batch(index, [it.request for it in items])
-            self.busy_s += time.perf_counter() - tb
+            batch_ms = (time.perf_counter() - tb) * 1000.0          # X-S3-Batch-Ms: the call's wall time
+            self.busy_s += batch_ms / 1000.0
             self.n_batches += 1
             self.n_requests += len(items)
             if len(out) != len(items):
@@ -487,7 +502,7 @@ class GpuServer:
         except Exception as exc:  # noqa: BLE001 - not one request's failure: one at a time, capped
             return self._one_by_one(index, version, mi, items, waits, exc)
         for it, resp, w in zip(items, out, waits):
-            self._answer(it, resp, version, w, mi, len(items))
+            self._answer(it, resp, version, w, mi, len(items), batch_ms)
 
     def _run_prepared(self, index, version, mi, planned: list[_Item], size: int) -> list[_Item]:
         """``index.search_prepared`` (or hostpath.search_prepared_stub) for the planned items, answered here and matched
@@ -520,12 +535,13 @@ class GpuServer:
                 it.prep = None
                 it.request = hostpath.parse_body(binproto_search_body(it.raw))
             return planned
-        self.busy_s += time.perf_counter() - t0
+        batch_ms = (time.perf_counter() - t0) * 1000.0
+        self.busy_s += batch_ms / 1000.0
         self.n_batches += 1
         self.n_requests += len(planned)
         by_pos = dict(zip(order, out))
         for it in planned:
-            self._answer(it, by_pos[it.prep[1]], version, (t0 - it.t) * 1000.0, mi, size)
+            self._answer(it, by_pos[it.prep[1]], version, (t0 - it.t) * 1000.0, mi, size, batch_ms)
         return []
 
     def _one_by_one(self, index, version, mi, items, waits, exc) -> None:
@@ -534,16 +550,19 @@ class GpuServer:
             if failures >= RETRY_CAP:                           # it keeps failing: fail the rest, do not retry each
                 return self._fail(items[k:], exc)
             try:
+                tb = time.perf_counter()
                 resp = _search_batch(index, [it.request])[0][0]
+                one_ms = (time.perf_counter() - tb) * 1000.0
             except Exception as e:  # noqa: BLE001
                 self._fail([it], e)
                 if classify(e)[0] >= 500 or type(e).__name__ in ("OverBudget", "DeviceUnavailable"):
                     failures, exc = failures + 1, e             # not this request's own error
                 continue
             failures = 0
-            self._answer(it, resp, version, w, mi)
+            self._answer(it, resp, version, w, mi, 1, one_ms)
 
-    def _answer(self, it: _Item, resp: dict, version: tuple, wait_ms: float, mi, size: int = 1) -> None:
+    def _answer(self, it: _Item, resp: dict, version: tuple, wait_ms: float, mi, size: int = 1,
+                batch_ms: float | None = None) -> None:
         if isinstance(resp, dict) and set(resp) == {"error"}:
             status, body = classify_entry(resp["error"])
             mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="error")
@@ -557,7 +576,10 @@ class GpuServer:
             except Exception as exc:  # noqa: BLE001
                 return self._fail([it], exc)
         mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
-        self._reply(it, ("search", it.id, "ok", resp, version, wait_ms, size))
+        msg = ("search", it.id, "ok", resp, version, wait_ms, size)
+        # [7] batch_ms (X-S3-Batch-Ms), [8] the answer's perf_counter (the writer's wait from it: post_ms), [9] the
+        # reader's parse_ms: the front's share of a request split into its parts (S6-22s timers)
+        self._reply(it, msg + (batch_ms, time.perf_counter(), it.parse_ms))
 
     # -- what the process is doing, every 5 s in its log (and gauges): batches, queue, device memory
     def _stats(self, every: float = 5.0) -> None:
@@ -706,6 +728,10 @@ def gpu_main(cfg, sock_path: str, index: int) -> int:
     import signal
     from .app import create_app
     from .workers import mark_ready
+    sw = os.environ.get("S3_SERVING_GPU_SWITCH_INTERVAL_MS")    # S6-22s: the GIL switch interval (default Python's 5 ms)
+    if sw:                                                      # so the reader and writer threads wait less behind
+        sys.setswitchinterval(float(sw) / 1000.0)               # the batch thread
+        log.info("gpu process %d: GIL switch interval %.3f ms", index, sys.getswitchinterval() * 1000.0)
     frac = float(os.environ.get("S3_SERVING_GPU_MEMORY_FRACTION", "0") or 0)
     if frac > 0:                                                # cap torch's cache so K processes fit predictably
         try:

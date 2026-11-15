@@ -68,3 +68,31 @@ def test_a_columnar_reply_still_decodes_to_the_encoded_bytes():
     assert frame is not None
     id_, st, body, _ = binproto.decode_reply(frame[4:])
     assert (id_, st) == (5, 200) and body == encode(resp)
+
+
+def test_kind3_frames_carry_any_ids_and_floats_and_decode_to_the_encoded_bytes():
+    """S3B2: columnar3 sends ids and floats kind 1 refuses (quote, non-ASCII, NaN, inf, exponent floats) as kind 3,
+    and decode_reply (Python's encoder on the decoded columns) gives serving.encode's bytes; the native front's
+    render is held to the same bytes by its own tests (tests/golden3.txt)."""
+    from serving.encode import encode
+    ids = np.array(['B0"X'.encode(), "é中😀".encode(), b"x\\y", b"ok"], "S12")
+    sc = np.array([np.nan, np.inf, 1e-7, 3.0e17], np.float32)
+    sort = [{"values": sc.astype(np.float64), "missing": None},
+            {"values": np.array([-np.inf, 5e-324, -0.0, 1e16]), "missing": None},
+            {"values": np.array([1, -2, 3, 2**62], np.int64), "missing": None}]
+    resp = {"took_ms": {"parse": 0.1}, "hits": {"total": 4, "columns": {"_id": ids, "_score": sc, "sort": sort}}}
+    assert binproto.columnar(1, resp, {"version": "s:1", "queue_ms": 0.0, "batch": 1}) is None   # kind 1 refuses
+    f = binproto.columnar3(1, resp, {"version": "s:1", "queue_ms": 0.0, "batch": 1})
+    assert f is not None and f[4] == 3
+    id_, st, body, _ = binproto.decode_reply(f[4:])
+    assert (id_, st) == (1, 200) and body == encode(resp)
+
+
+def test_kind3_still_sends_whole_what_it_cannot_carry():
+    sc = np.array([1.0, 2.0], np.float32)
+    ids = np.array([b"a", b"b"], "S1")
+    for sort in ([{"values": np.array([1.0, 2.0]), "missing": [False, True]}],
+                 [{"values": np.array([1.0, 2.0], np.float32), "missing": None}]):
+        resp = {"took_ms": 1, "hits": {"total": 2, "columns": {"_id": ids, "_score": sc, "sort": sort}}}
+        assert binproto.columnar3(1, resp, {}) is None
+    assert binproto.columnar3(1, {"took_ms": 1, "hits": {"total": 0, "hits": []}}, {}) is None

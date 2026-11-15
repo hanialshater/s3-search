@@ -35,11 +35,19 @@ struct Front {
     gpus: Vec<Arc<Gpu>>,
     ids: AtomicU64,
     worker: String,
+    threads: usize,
 }
 
 async fn connect(path: &str) -> std::io::Result<Arc<Gpu>> {
     let mut s = UnixStream::connect(path).await?;
-    s.write_all(b"S3B1").await?;
+    // S3B2 is the default (the steward's ruling on plat-m28, lab 1c51721): the GPU process sends kind 3 replies, each
+    // as soon as it is encoded. S3_SERVING_BINPROTO=1 opts out to S3B1 (kind 1, the batch's replies in one write).
+    let magic: &[u8; 4] = if std::env::var("S3_SERVING_BINPROTO").map(|v| v.trim() == "1").unwrap_or(false) {
+        b"S3B1"
+    } else {
+        b"S3B2"
+    };
+    s.write_all(magic).await?;
     let (mut rd, mut wr) = s.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let gpu = Arc::new(Gpu { tx, pending: Mutex::new(HashMap::new()), inflight: AtomicUsize::new(0) });
@@ -154,9 +162,45 @@ fn render(payload: &[u8]) -> Option<(u16, Vec<u8>, serde_json::Value)> {
     let post = meta.get("post")?.as_str()?.as_bytes();
     let mut out = Vec::with_capacity(pre.len() + post.len() + blk.h * 64 + 2);
     out.extend_from_slice(pre);
-    encode::encode_hits(&blk, &mut out);
+    if kind == 3 {                                              // S3B2: unchecked ids and floats, written as Python does
+        encode::encode_hits3(&blk, &mut out)?;
+    } else {
+        encode::encode_hits(&blk, &mut out);
+    }
     out.extend_from_slice(post);
     Some((200, out, meta))
+}
+
+/// GET /readyz: every GPU process asked, as the Python front does (serving/front.py ``_readyz``): ready only when all
+/// are; the same keys in the same order (plat-m21: asking GPU process 0 alone let a routed warm-up reach a process
+/// still loading its index).
+async fn readyz(front: &Arc<Front>) -> Response<Full<Bytes>> {
+    let mut ready = 0usize;
+    let mut indexes = String::from("[]");
+    for g in &front.gpus {
+        let id = front.ids.fetch_add(1, Ordering::Relaxed);
+        let frame = Front::call_frame(id, b"GET", b"/readyz", b"");
+        if let Some(reply) = front.send(g, frame, id).await {
+            if let Some((st, body, _)) = render(&reply) {
+                if st == 200 {
+                    ready += 1;
+                }
+                if indexes == "[]" {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        if let Some(ix) = v.get("indexes") {
+                            indexes = ix.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ok = ready == front.gpus.len();
+    let worker = front.worker.parse::<i64>().map(|w| w.to_string()).unwrap_or_else(|_| format!("{:?}", front.worker));
+    let body = format!("{{\"ready\":{},\"draining\":false,\"indexes\":{},\"fronts\":{},\"gpu_processes\":{},\"gpu_ready\":{},\"worker\":{}}}",
+                       ok, indexes, front.threads, front.gpus.len(), ready, worker);
+    Response::builder().status(if ok { 200 } else { 503 }).header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body))).unwrap()
 }
 
 fn json(status: u16, body: &'static str) -> Response<Full<Bytes>> {
@@ -175,9 +219,13 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
         Ok(b) => b.to_bytes(),
         Err(_) => return Ok(json(400, "{\"error\":{\"type\":\"invalid_request\",\"path\":\"\",\"reason\":\"bad body\"}}")),
     };
+    let t_read = t0.elapsed();                                  // S6-22s timers: the request body read
     let rid = format!("{:016x}", front.ids.fetch_add(1, Ordering::Relaxed) ^ 0x9e3779b97f4a7c15);
     if bare == "/healthz" && method == "GET" {
         return Ok(json(200, "{\"status\":\"ok\"}"));
+    }
+    if bare == "/readyz" && method == "GET" {
+        return Ok(readyz(&front).await);
     }
     let id = front.ids.fetch_add(1, Ordering::Relaxed);
     let parts: Vec<&str> = bare.trim_start_matches('/').split('/').collect();
@@ -188,14 +236,17 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
     } else {
         Front::call_frame(id, method.as_bytes(), path.as_bytes(), &body)
     };
+    let t_sent = t0.elapsed();
     let reply = match front.send(&gpu, frame, id).await {
         Some(r) => r,
         None => return Ok(json(503, "{\"error\":{\"type\":\"not_ready\",\"path\":\"\",\"reason\":\"the GPU process did not answer\"}}")),
     };
+    let t_reply = t0.elapsed();                                 // the round trip to the GPU process ends
     let (status, out, meta) = match render(&reply) {
         Some(x) => x,
         None => return Ok(json(500, "{\"error\":{\"type\":\"internal_error\",\"path\":\"\",\"reason\":\"bad reply frame\"}}")),
     };
+    let t_render = t0.elapsed();
     let ctype = meta.get("type").and_then(|v| v.as_str()).unwrap_or("application/json").to_string();
     let mut rb = Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("Content-Type", ctype).header("X-Request-Id", rid).header("X-S3-Worker", front.worker.as_str());
@@ -206,6 +257,20 @@ async fn handle(front: Arc<Front>, req: Request<Incoming>) -> Result<Response<Fu
             .header("X-S3-Gpu-Process", gi.to_string())
             .header("X-S3-Index-Version", meta.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string())
             .header("X-S3-Batch-Size", meta.get("batch").map(|v| v.to_string()).unwrap_or_else(|| "1".into()));
+        if let Some(b) = meta.get("batch_ms").and_then(|v| v.as_f64()) {   // S6-22s: the GPU process's batch time
+            rb = rb.header("X-S3-Batch-Ms", format!("{:.3}", b));
+        }
+        // S6-22s timers: where the front's share goes. Read: arrival to body read; Build: frame built and queued;
+        // Rtt: frame sent to reply received; Render: the hits written as JSON. From the GPU process: Parse (its
+        // reader's parse of the frame) and Post (a reply's wait from its batch's end to the writer's encode).
+        let ms = |d: std::time::Duration| format!("{:.3}", d.as_secs_f64() * 1000.0);
+        rb = rb.header("X-S3-Front-Read-Ms", ms(t_read)).header("X-S3-Front-Build-Ms", ms(t_sent - t_read))
+            .header("X-S3-Front-Rtt-Ms", ms(t_reply - t_sent)).header("X-S3-Front-Render-Ms", ms(t_render - t_reply));
+        for (k, h) in [("parse_ms", "X-S3-Gpu-Parse-Ms"), ("post_ms", "X-S3-Gpu-Post-Ms")] {
+            if let Some(v) = meta.get(k).and_then(|v| v.as_f64()) {
+                rb = rb.header(h, format!("{:.3}", v));
+            }
+        }
     }
     Ok(rb.body(Full::new(Bytes::from(out))).unwrap())
 }
@@ -236,7 +301,7 @@ fn main() {
                 }
             }
         }
-        let front = Arc::new(Front { gpus, ids: AtomicU64::new(1), worker });
+        let front = Arc::new(Front { gpus, ids: AtomicU64::new(1), worker, threads });
         let listener = TcpListener::bind((host.as_str(), port)).await.expect("bind");
         eprintln!("s3-native-front on {}:{} ({} threads, {} GPU processes)", host, port, threads, sockets.len());
         loop {

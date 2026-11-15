@@ -67,14 +67,15 @@ def main():
     say(f"wheel {os.path.basename(whl)} sha256 {sha(whl)}; Cargo.lock sha256 {sha(lock)}")
     print("----- BEGIN Cargo.lock -----\n" + open(lock).read() + "----- END Cargo.lock -----", flush=True)
     sh([sys.executable, "-c", "from referee import loader; loader.fetch()"])     # esci-sample for the oracle test
+    os.environ["S3_ORACLE_FULL"] = "1"                       # R3a: the analyser oracle on ESCI-US's texts too
     ok = True
     for name, cmd in [
         ("hostpath oracle", [sys.executable, "-m", "pytest", "-v", "-p", "no:cacheprovider", "-rs",
-                             "engine/tests/test_hostpath.py"]),
+                             "engine/tests/test_hostpath.py", "engine/tests/test_hostpath_analysis.py"]),
         ("referee fast", [sys.executable, "-m", "referee", "fast"]),
         ("engine tests", [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "engine/tests"]),
     ]:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=700)
         out = (r.stdout + r.stderr)[-4000:]
         print(out, flush=True)
         if name == "hostpath oracle" and " SKIPPED" in out:

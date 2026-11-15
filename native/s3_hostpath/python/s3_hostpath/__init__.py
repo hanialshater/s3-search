@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import threading
 
-from ._native import HostIndex
+from ._native import HostIndex, analyze, stem, token, words_of
 
-__all__ = ["HostIndex", "prepare", "reply", "stats"]
+__all__ = ["HostIndex", "analyze", "prepare", "reply", "stats", "stem", "token", "words_of"]
 
 _lock = threading.Lock()
 _built: dict = {}            # id(IndexState) -> (state, HostIndex), the state kept so its id is not reused

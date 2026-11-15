@@ -17,6 +17,7 @@ def _any_gpu_class(monkeypatch):
     """Run the kernel on whatever GPU this is (the gate's list is what these tests decide), and count its calls, so a
     test cannot pass by falling back to the torch path."""
     monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "0")    # S6-26: this kernel's own path, not the fused pass's
     calls = []
     real = getattr(TT, "topk")
     monkeypatch.setattr(TT, "topk", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
@@ -38,7 +39,7 @@ def _cases(rng):
             else:
                 x = rng.random((Q, N)).astype(np.float32)
             valid = rng.random((Q, N)) < 0.6
-            for k in (TT.MIN_K, 1000, N // 2 + 1, N):
+            for k in (1, 10, TT.MIN_K, 1000, N // 2 + 1, N):        # S6-27: small k on wide rows too
                 if k <= N:
                     yield x, valid, k
 
@@ -77,5 +78,19 @@ def test_deep_responses_unchanged(monkeypatch, _any_gpu_class):
 def test_on_by_default_and_off_with_0(monkeypatch):
     monkeypatch.delenv("S3_TRITON_TOPK", raising=False)
     assert TT.wanted(get_backend("cuda"), 2000)                # S6-18c: on by default where the gate allows
+    assert TT.wanted(get_backend("cuda"), 10, TT.WIDE_N)          # S6-27: a small k on a wide row
+    assert not TT.wanted(get_backend("cuda"), 10, TT.WIDE_N - 1)
     monkeypatch.setenv("S3_TRITON_TOPK", "0")
     assert not TT.wanted(get_backend("cuda"), 2000)
+
+
+def test_radix_kth_value_equals_torch_topk(_any_gpu_class):
+    """S6-29: the radix select's k-th value is torch.topk's, bit for bit, on ties, negatives, -inf, zeros and -0.0."""
+    import torch
+    rng = np.random.default_rng(1)
+    for x, _, k in _cases(rng):
+        s = (torch.as_tensor(x, device="cuda") + 0.0).contiguous()
+        want = torch.topk(s, k, dim=1, sorted=False).values.min(dim=1).values
+        got = TT.kth_value(s, k)
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), (x.shape, k)
+    _any_gpu_class.append(1)          # this test calls the kernels directly, not through TT.topk

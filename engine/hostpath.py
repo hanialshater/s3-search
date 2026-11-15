@@ -40,12 +40,13 @@ def _words(st, extra_words=()):
     return list(words)
 
 
-def host_index(st, extra_words=()):
-    """The Rust ``HostIndex`` for ``st`` (one segment). Raises ImportError when the extension is not built."""
+def host_index(st, extra_words=(), rust_analysis=True):
+    """The Rust ``HostIndex`` for ``st`` (one segment). Raises ImportError when the extension is not built.
+    ``rust_analysis`` (R3a): Rust's own analyser (an empty word table); otherwise R1's table of Python tokens."""
     import s3_hostpath
     from .ops import lexical as L
     part = st.parts[0]
-    words = _words(st, extra_words)
+    words = [] if rust_analysis else _words(st, extra_words)
     return s3_hostpath.HostIndex(
         words, [_token(w) for w in words], list(part.vocab_list),
         np.ascontiguousarray(part.host_term_ptr, np.int64).tobytes(), list(st.text_fields),
@@ -183,7 +184,7 @@ def _shape_ok(body, table):
         text = body_q.get("query")
         if not _msm_ok(body_q.get("minimum_should_match")):
             return False
-    if not isinstance(text, str) or not text.isascii():
+    if not isinstance(text, str) or (table is not None and not text.isascii()):
         return False
     if table is not None and any(w not in table for w in _WORD.findall(text.lower())):
         return False

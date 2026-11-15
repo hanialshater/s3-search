@@ -13,6 +13,10 @@ GPU process → front:
 
     u8 kind = 1 (columnar hits, the front writes the hits)  u64 id  u32 len  meta JSON  hits block
     u8 kind = 2 (a whole response)                          u64 id  u32 len  meta JSON  u16 status  u32 len  body
+    u8 kind = 3 (S3B2 only: kind 1's block, unchecked)      u64 id  u32 len  meta JSON  hits block
+
+A connection that opens with ``S3B2`` (opt-in, S6-22s) gets kind 3 instead of kind 1: the same block, but the ids may
+be any UTF-8 and the floats any float64; the front escapes and formats them as Python's encoder does.
 
 meta is ``{"pre", "post", "version", "queue_ms", "batch", "type"}``. ``pre`` and ``post`` are the response JSON
 before and after the hits list (``json.dumps`` of the response with the hits left out, split where they go). With kind
@@ -37,6 +41,7 @@ import struct
 import numpy as np
 
 MAGIC = b"S3B1"
+MAGIC2 = b"S3B2"                     # opt-in: kind 3 replies (S6-22s)
 _U32 = struct.Struct("<I")
 _HDR = struct.Struct("<BQ")          # kind or type, id
 _PLACEHOLDER = "\x00s3-hits\x00"
@@ -116,17 +121,33 @@ def _safe(a) -> bool:
 
 def columnar(id_: int, resp: dict, meta: dict) -> bytes | None:
     """Kind 1 for a columnar response the front can encode exactly, else None (send it whole)."""
+    return _columnar(id_, resp, meta, kind=1)
+
+
+def columnar3(id_: int, resp: dict, meta: dict) -> bytes | None:
+    """Kind 3 (S3B2 connections, opt-in): the same block as kind 1 without the per-reply checks of the ids and the
+    floats (plat-m25: _plain_ids 29% and _safe about 8% of the GPU process's writer); the front escapes each id as
+    json.encoder.encode_basestring_ascii does and writes each float as float.__repr__ does (NaN, Infinity and -Infinity as
+    json.dumps writes them). Still None (send it whole) for anything else: not columnar, ids not one S<w> array,
+    missing sort values, or a sort column that is neither float64 nor an integer type."""
+    return _columnar(id_, resp, meta, kind=3)
+
+
+def _columnar(id_: int, resp: dict, meta: dict, kind: int) -> bytes | None:
     from .encode import _shell, _is_columnar
     if not _is_columnar(resp):
         return None
     c = resp["hits"]["columns"]
     ids = c["_id"]
-    if not _plain_ids(ids) or len(ids) == 0:
+    checked = kind == 1
+    if not (isinstance(ids, np.ndarray) and ids.dtype.kind == "S") or len(ids) == 0:
+        return None
+    if checked and not _plain_ids(ids):
         return None
     h, w = len(ids), ids.dtype.itemsize
     s32 = np.asarray(c["_score"], np.float32)
     s64 = s32.astype(np.float64)
-    if len(s32) != h or not _safe(s64):
+    if len(s32) != h or (checked and not _safe(s64)):
         return None
     cols = []
     for col in c.get("sort") or []:
@@ -135,7 +156,7 @@ def columnar(id_: int, resp: dict, meta: dict) -> bytes | None:
             return None
         if v.dtype == np.float64 and np.array_equal(v, s64):
             cols.append(b"\x00")
-        elif v.dtype == np.float64 and _safe(v):
+        elif v.dtype == np.float64 and (not checked or _safe(v)):
             cols.append(b"\x01" + v.astype("<f8").tobytes())
         elif v.dtype.kind in "iu":
             cols.append(b"\x02" + v.astype("<i8").tobytes())
@@ -151,7 +172,7 @@ def columnar(id_: int, resp: dict, meta: dict) -> bytes | None:
     m = {**meta, "pre": pre + '"hits":', "post": post}
     block = (_U32.pack(h) + struct.pack("<H", w) + ids.tobytes() + s32.astype("<f4").tobytes()
              + bytes([len(cols)]) + b"".join(cols))
-    return frame(_HDR.pack(1, id_) + _meta(m) + block)
+    return frame(_HDR.pack(kind, id_) + _meta(m) + block)
 
 
 def decode_reply(payload: bytes):

@@ -46,15 +46,24 @@ except Exception:  # noqa: BLE001
     triton = None
     tl = None
 
-TILE = 2048
-BLOCK = 256
+TILE = 1024        # S6-32: from the A100 sweep (arch-sweep1): 14% under (2048, 256, 4) at batch 64 without facets,
+BLOCK = 128        # 4% under with facets, 3% and 6% under at batch 32; every shape gave the same bits
+NUM_WARPS = 4
+
+
+def _shape():
+    """(TILE, BLOCK, num_warps), from S3_TRITON_FUSED_TILE, _BLOCK and _WARPS for tuning (S6-30). A tile is a doc
+    range one program owns, so its size never changes the order of any key's adds, nor the bits."""
+    return (int(os.environ.get("S3_TRITON_FUSED_TILE", TILE)), int(os.environ.get("S3_TRITON_FUSED_BLOCK", BLOCK)),
+            int(os.environ.get("S3_TRITON_FUSED_WARPS", NUM_WARPS)))
 ENV = "S3_TRITON_FUSED_LEXICAL"
 
 
 def mode(b) -> str | None:
     """``"kernel"`` (cuda, the gate passes, ``S3_TRITON_FUSED_LEXICAL=1``), ``"reference"``
-    (``S3_TRITON_FUSED_LEXICAL=reference``, any device, for tests), or None: today's path. Off by default."""
-    v = os.environ.get(ENV, "0")
+    (``S3_TRITON_FUSED_LEXICAL=reference``, any device, for tests), or None: the unfused path. On by default since
+    S6-26 (the founder's decision); ``S3_TRITON_FUSED_LEXICAL=0`` turns it off."""
+    v = os.environ.get(ENV, "1")
     if v == "reference":
         return "reference"
     if v == "1" and triton is not None and triton_gate.supported(b):
@@ -64,8 +73,8 @@ def mode(b) -> str | None:
 
 if triton is not None:
     @triton.jit
-    def _fused_kernel(docs_ptr, tf_ptr, rel_ptr, row_idf_ptr, row_start_ptr, row_len_ptr, q_row_lo_ptr, q_row_hi_ptr,
-                      msm_ptr, boost_ptr, live_ptr, w_ptr, omb_ptr, bb_ptr, codes_ptr, fc_off_ptr, fc_nv_ptr,
+    def _fused_kernel(docs_ptr, tf_ptr, norm_ptr, row_idf_ptr, row_start_ptr, row_len_ptr, q_row_lo_ptr, q_row_hi_ptr,
+                      msm_ptr, boost_ptr, live_ptr, w_ptr, codes_ptr, fc_off_ptr, fc_nv_ptr,
                       acc_ptr, cnt_ptr, out_ptr, total_ptr, fc_ptr, N, c1, c2,
                       F: tl.constexpr, NFACET: tl.constexpr, TILE: tl.constexpr, BLOCK: tl.constexpr):
         g = tl.program_id(0)
@@ -110,9 +119,7 @@ if triton is not None:
                 ptf = tl.zeros([BLOCK], tl.float32)
                 for f in tl.static_range(F):
                     tfv = tl.load(tf_ptr + e.to(tl.int64) * F + f, mask=ok, other=0).to(tl.float32)
-                    rel = tl.load(rel_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)
-                    norm = tl.load(omb_ptr + f) + tl.load(bb_ptr + f) * rel
-                    norm = tl.where(norm > 1e-6, norm, 1e-6)
+                    norm = tl.load(norm_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)   # S6-28: per index
                     x = tl.math.div_rn(tl.load(w_ptr + f) * tfv, norm)
                     if f == 0:
                         ptf = x
@@ -154,6 +161,29 @@ def pack(parts, dtype, align):
     for a, x in zip(at, parts):
         out[a:a + len(x)] = x
     return out, at
+
+
+def lean_inputs(b, part, bb):
+    """S6-28 (shortlist row 5), kept on the part and computed once per b vector:
+    - its doc ids as int32, half the bytes of the postings reads and binary searches;
+    - the per-(doc, field) BM25 norm table, the torch path's exact float32 operations done once per index rather than
+      per posting: norm = (1 - b) + b * rel_len (with 1 - b computed first), then the 1e-6 floor.
+    The same values reach the kernel, so the same bits."""
+    import torch
+    cache = part.__dict__.setdefault("_fused_lean", {})
+    dk = (part.doc_ids.data_ptr(), tuple(part.doc_ids.shape))          # a relayout gives new arrays: new entries
+    if cache.get("docs_key") != dk:
+        cache.clear()
+        cache["docs_key"] = dk
+        cache["docs32"] = part.doc_ids.to(torch.int32).contiguous()
+    key = (np.asarray(bb, np.float32).tobytes(), part.rel_len.data_ptr(), tuple(part.rel_len.shape))
+    got = cache.get(key)
+    if got is None:
+        bb32 = b.asarray(np.asarray(bb, np.float32), "float32")
+        norm = (1.0 - bb32) + bb32 * part.rel_len
+        norm = torch.where(norm > 1e-6, norm, torch.tensor(1e-6, dtype=torch.float32)).contiguous()
+        got = cache[key] = (cache["docs32"], norm)
+    return got
 
 
 def _rows(part, terms):
@@ -210,10 +240,10 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     dev_f = torch.from_numpy(host_f).to(dev)
     vi = [dev_i[a:a + len(x)] for a, x in zip(at, ints)]
     vf = [dev_f[a:a + len(x)] for a, x in zip(fat, floats)]
-    return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
+    return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb32)
 
 
-def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs):
+def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb):
     """The kernel on device inputs: ``vi`` the int64 views (row_start, row_len, q_lo, q_hi, msm, facet offsets, facet
     sizes, row_term), ``vf`` the float32 views (w, b, 1 - b, boost)."""
     import torch
@@ -224,6 +254,7 @@ def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs):
     w_d, bb_d, omb_d, boost_d = vf
     nf = len(facet_codes)
     row_idf = (idf[rt] if R else torch.zeros(1, dtype=torch.float32, device=dev)).contiguous()
+    docs32, norm = lean_inputs(b, part, bb)                 # S6-28: int32 doc ids, the per-index norm table
     acc = torch.empty(Q * N, dtype=torch.float64, device=dev)
     cnt = torch.empty(Q * N, dtype=torch.int32, device=dev)
     out = torch.empty(Q * N, dtype=torch.float32, device=dev)
@@ -233,10 +264,11 @@ def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs):
              else torch.zeros((1, 1), dtype=torch.int32, device=dev))
     c1 = float(np.float32(k1 + 1.0))
     c2 = float(np.float32(k1))
-    grid = (Q, triton.cdiv(N, TILE))
-    _fused_kernel[grid](part.doc_ids, part.tf, part.rel_len, row_idf, rs, rl, qlo, qhi, msm_d, boost_d,
-                        live.view(torch.uint8), w_d, omb_d, bb_d, codes, off_d, nv_d, acc, cnt, out, total, fc, N,
-                        c1, c2, F=F, NFACET=nf, TILE=TILE, BLOCK=BLOCK, enable_fp_fusion=False)
+    tile, block, warps = _shape()
+    grid = (Q, triton.cdiv(N, tile))
+    _fused_kernel[grid](docs32, part.tf.contiguous(), norm, row_idf, rs, rl, qlo, qhi, msm_d, boost_d,
+                        live.contiguous().view(torch.uint8), w_d, codes, off_d, nv_d, acc, cnt, out, total, fc, N,
+                        c1, c2, F=F, NFACET=nf, TILE=tile, BLOCK=block, num_warps=warps, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
     return out.view(Q, N), total.to(torch.int64), facets
 
@@ -257,7 +289,7 @@ def run_prepared(b, part, k1, idf, chunk, host_i, host_f, dev_i, dev_f, live, fa
     if mode(b) == "kernel":
         vi = [dev_i[a:a + n] for a, n in zip(at, ln)]
         vf = [dev_f[a:a + n] for a, n in zip(fa, (F, F, F, Q))]
-        return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs)
+        return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, host_f[fa[1]:fa[1] + F])
     rt = hi[7]
     terms = [[int(t) for t in rt[qlo[g]:qhi[g]]] for g in range(Q)]
     w = host_f[fa[0]:fa[0] + F]

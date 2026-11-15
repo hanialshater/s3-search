@@ -24,6 +24,8 @@
 //! The analysis table (word -> token, or none for a stopword) comes from engine/analysis.py at index load, so no
 //! tokeniser or stemmer logic is duplicated: the regex's words are found here, and their tokens are Python's own.
 
+mod analysis;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -229,18 +231,27 @@ impl HostIndex {
             "multi_match" => self.multi_match_body(body.as_object()?)?,
             _ => return None,
         };
-        if !text.is_ascii() {
-            return None;
-        }
-        let lower = text.to_ascii_lowercase();
         let mut terms: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for w in words(&lower) {
-            match self.word_token.get(w)? {
-                None => {}
-                Some(t) => {
-                    if seen.insert(t.clone()) {
-                        terms.push(t.clone());
+        if self.word_token.is_empty() {
+            // R3a: the analyser in Rust (analysis.rs), held to engine/analysis.py by the analyser oracle
+            for t in analysis::analyze(&text) {
+                if seen.insert(t.clone()) {
+                    terms.push(t);
+                }
+            }
+        } else {
+            if !text.is_ascii() {
+                return None;
+            }
+            let lower = text.to_ascii_lowercase();
+            for w in words(&lower) {
+                match self.word_token.get(w)? {
+                    None => {}
+                    Some(t) => {
+                        if seen.insert(t.clone()) {
+                            terms.push(t.clone());
+                        }
                     }
                 }
             }
@@ -546,8 +557,36 @@ impl HostIndex {
     }
 }
 
+/// R3a: engine/analysis.py's analyze, in Rust.
+#[pyfunction]
+fn analyze(text: &str) -> Vec<String> {
+    analysis::analyze(text)
+}
+
+/// R3a: the regex words of a text, as engine/analysis.py finds them.
+#[pyfunction]
+fn words_of(text: &str) -> Vec<String> {
+    analysis::words(text)
+}
+
+/// R3a: snowballstemmer's porter stem of a lowercase ASCII word.
+#[pyfunction]
+fn stem(word: &str) -> String {
+    analysis::stem(word)
+}
+
+/// R3a: engine/analysis.py's _token of one regex word.
+#[pyfunction]
+fn token(word: &str) -> Option<String> {
+    analysis::token(word)
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HostIndex>()?;
+    m.add_function(wrap_pyfunction!(analyze, m)?)?;
+    m.add_function(wrap_pyfunction!(words_of, m)?)?;
+    m.add_function(wrap_pyfunction!(stem, m)?)?;
+    m.add_function(wrap_pyfunction!(token, m)?)?;
     Ok(())
 }

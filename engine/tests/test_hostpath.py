@@ -43,8 +43,9 @@ def corpus(texts):
     return [json.dumps(r).encode() for r in out]
 
 
+@pytest.mark.parametrize("rust_analysis", [True, False])     # R3a's analyser, and R1's word table
 @pytest.mark.parametrize("name", ["toy", "esci-sample"])
-def test_rust_prepare_equals_the_python_planner(name):
+def test_rust_prepare_equals_the_python_planner(name, rust_analysis):
     pytest.importorskip("s3_hostpath")
     try:
         ds = loader.load_dataset(name)
@@ -52,8 +53,8 @@ def test_rust_prepare_equals_the_python_planner(name):
         pytest.skip(f"{name}: {e}")
     ix = api.build_index(ds.catalogue, ds.mapping)
     st = ix._st
-    hi = hostpath.host_index(st)
-    words = hostpath._words(st)
+    hi = hostpath.host_index(st, rust_analysis=rust_analysis)
+    words = None if rust_analysis else hostpath._words(st)
     texts = list(dict.fromkeys(list(ds.fit["query"]) + list(ds.test_queries["query"])))
     payloads = corpus([str(t) for t in texts])
     rust = hi.prepare(payloads)
@@ -61,7 +62,7 @@ def test_rust_prepare_equals_the_python_planner(name):
     served = sorted(p for c in rust["chunks"] for p in c["positions"])
     eligible = sorted(p for c in py["chunks"] for p in c["positions"])
     assert set(served) <= set(eligible), sorted(set(served) - set(eligible))[:10]   # never serves what Python wouldn't
-    assert len(served) >= 0.5 * len(eligible)                                       # and serves most of them
+    assert len(served) >= (0.99 if rust_analysis else 0.5) * len(eligible)          # and serves most of them
     sub = [payloads[p] for p in served]                                             # the same requests, both ways
     a, b = hi.prepare(sub), hostpath.prepare_reference(st, sub, words)
     assert a["fallback"] == b["fallback"] == []

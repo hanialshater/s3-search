@@ -190,7 +190,8 @@ class FrontApp:
             raise _Answered(msg[3], msg[4])
         resp, version, queue_ms = msg[3], msg[4], msg[5]
         return resp, version, {"cache": "miss", "queue_ms": queue_ms, "serve_ms": (time.perf_counter() - t0) * 1000.0,
-                               "gpu": getattr(fut, "gpu", 0), "batch": msg[6] if len(msg) > 6 else 1}
+                               "gpu": getattr(fut, "gpu", 0), "batch": msg[6] if len(msg) > 6 else 1,
+                               "batch_ms": msg[7] if len(msg) > 7 else None}
 
     def _search(self, name: str, body: bytes, headers: dict | None = None) -> Response:
         request = self._parse(body)
@@ -213,10 +214,12 @@ class FrontApp:
             return _json(a.status, a.body)
         if cacheable:
             self.cache.put((name, tuple(version), request_key(request)), resp)
-        return _search_json(resp, {"X-S3-Cache": info["cache"], "X-S3-Queue-Ms": f"{info['queue_ms']:.3f}",
-                                   "X-S3-Serve-Ms": f"{info['serve_ms']:.3f}", "X-S3-Gpu-Process": str(info["gpu"]),
-                                   "X-S3-Index-Version": f"{version[0]}:{version[1]}",
-                                   "X-S3-Batch-Size": str(info["batch"])})
+        hdr = {"X-S3-Cache": info["cache"], "X-S3-Queue-Ms": f"{info['queue_ms']:.3f}",
+               "X-S3-Serve-Ms": f"{info['serve_ms']:.3f}", "X-S3-Gpu-Process": str(info["gpu"]),
+               "X-S3-Index-Version": f"{version[0]}:{version[1]}", "X-S3-Batch-Size": str(info["batch"])}
+        if info.get("batch_ms") is not None:                    # S6-22s: the GPU process's search_batch wall time
+            hdr["X-S3-Batch-Ms"] = f"{info['batch_ms']:.3f}"
+        return _search_json(resp, hdr)
 
     def _msearch(self, name: str, body: bytes) -> Response:
         requests = self._parse(body)

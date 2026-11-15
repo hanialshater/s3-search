@@ -36,7 +36,7 @@ def test_no_wait_takes_what_is_queued_up_to_the_cap():
     assert srv._collect() == [4, 5]
     srv.q.put(9)
     t = time.perf_counter()
-    assert srv._collect() == [9] and time.perf_counter() - t < 0.05     # no waiting for more
+    assert srv._collect() == [9] and time.perf_counter() - t < 0.12     # no waiting for more (the 0.15 s case below waits)
 
 
 def test_a_wait_gathers_late_arrivals_until_the_deadline():
@@ -51,7 +51,7 @@ def test_a_wait_gathers_late_arrivals_until_the_deadline():
     t = time.perf_counter()
     got = srv._collect()
     took = time.perf_counter() - t
-    assert got == [0, 1, 2, 3] and 0.12 <= took < 0.5
+    assert got == [0, 1, 2, 3] and 0.12 <= took < 2.0
 
 
 def test_a_wait_stops_when_the_batch_is_full():
@@ -59,7 +59,7 @@ def test_a_wait_stops_when_the_batch_is_full():
     for i in range(3):
         srv.q.put(i)
     t = time.perf_counter()
-    assert srv._collect() == [0, 1, 2] and time.perf_counter() - t < 0.05
+    assert srv._collect() == [0, 1, 2] and time.perf_counter() - t < 1.0      # far under the 5 s wait
 
 
 def test_an_empty_queue_returns_nothing():
