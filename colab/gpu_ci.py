@@ -1,7 +1,11 @@
 #!/usr/bin/env -S colab run --gpu L4 --timeout 600
 """GPU CI: the referee's fast suite and the engine's tests on a Colab GPU. Development only, never a score.
 
-    colab run --gpu L4 --timeout 600 colab/gpu_ci.py [branch-or-commit]   (a branch, or a full or short sha)
+    colab run --gpu L4 --timeout 600 colab/gpu_ci.py [branch-or-commit] [--hostpath=1]   (a branch, or a full or short sha)
+
+--hostpath=1 (R1/R3c) first builds native/s3_hostpath (rustup stable and maturin on the VM) and installs it. Then
+the engine and serving suites run with the extension, and a "hostpath tests" suite runs its tests verbose. That suite
+fails if any of its tests is skipped.
 
 CI runs on CPU, so the cuda paths are exercised only here. A test silent for 120 s gets its stack dumped
 (faulthandler), each suite has a hard limit, and a heartbeat line every 60 s keeps the Colab CLI from timing out.
@@ -17,7 +21,11 @@ import time
 
 REPO_URL = "https://github.com/hanialshater/s3-search"
 REPO = "/content/s3-search"
-REF = sys.argv[1] if len(sys.argv) > 1 else "main"
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+REF = ARGS[0] if ARGS else "main"
+HOSTPATH = "--hostpath=1" in sys.argv[1:]
+HOSTPATH_TESTS = ["engine/tests/test_hostpath.py", "engine/tests/test_hostpath_analysis.py",
+                  "engine/tests/test_hostpath_batch4.py"]
 SUITES = [  # (name, pytest targets, hard limit in seconds)
     ("referee fast", None, 900),
     ("engine tests", ["engine/tests"], 1200),
@@ -46,7 +54,7 @@ def run_suite(name, targets, limit):
         cmd = [sys.executable, "-u", "-m", "referee", "fast", "-o", "faulthandler_timeout=120", "--durations=10"]
     elif isinstance(targets, str):
         cmd = [sys.executable, "-u", targets, "/content/triton-first-call.json"]
-    elif name == "triton tests":
+    elif name in ("triton tests", "hostpath tests"):
         cmd = [sys.executable, "-u", "-m", "pytest", "-v", "-p", "no:cacheprovider", "-o", "faulthandler_timeout=120",
                "-rfEs", *targets]
     else:
@@ -68,7 +76,29 @@ def run_suite(name, targets, limit):
     if name == "triton tests" and " SKIPPED" in text:
         print("[gpu-ci] triton tests: a kernel test was skipped, so this GPU class is not shown to pass", flush=True)
         return False, took
+    if name == "hostpath tests" and " SKIPPED" in text:
+        print("[gpu-ci] hostpath tests: a test was skipped", flush=True)
+        return False, took
     return rc == 0, took
+
+
+def build_hostpath():
+    """--hostpath=1: native/s3_hostpath built on the VM and installed (its wheel's and Cargo.lock's sha256 printed)."""
+    import hashlib
+    import shutil
+    cargo = os.path.expanduser("~/.cargo/bin")
+    if not os.path.exists(os.path.join(cargo, "cargo")):
+        sh(["sh", "-c", "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"])
+    os.environ["PATH"] = cargo + os.pathsep + os.environ["PATH"]
+    sh([sys.executable, "-m", "pip", "install", "-q", "maturin>=1.5,<2"])
+    out = "/content/hostpath-wheels"
+    shutil.rmtree(out, ignore_errors=True)
+    sh([sys.executable, "-m", "maturin", "build", "--release", "-m", "native/s3_hostpath/Cargo.toml", "-o", out])
+    whl = os.path.join(out, sorted(os.listdir(out))[-1])
+    sh([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "--no-deps", whl])
+    sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+    print(f"[gpu-ci] s3_hostpath {os.path.basename(whl)} sha256 {sha(whl)}; Cargo.lock sha256 "
+          f"{sha('native/s3_hostpath/Cargo.lock')}", flush=True)
 
 
 def main():
@@ -98,7 +128,12 @@ def main():
     if "cuda" not in devices:
         print("[gpu-ci] FAILED: cuda is not available, so this run would test nothing new", flush=True)
         return 1
-    results = [(name, *run_suite(name, targets, limit)) for name, targets, limit in SUITES]
+    suites = list(SUITES)
+    if HOSTPATH:
+        build_hostpath()
+        sh([sys.executable, "-c", "from referee import loader; loader.fetch()"])   # esci-sample for the oracle tests
+        suites.insert(1, ("hostpath tests", [t for t in HOSTPATH_TESTS if os.path.exists(t)], 900))
+    results = [(name, *run_suite(name, targets, limit)) for name, targets, limit in suites]
     for name, ok, took in results:
         print(f"[gpu-ci] {'PASSED' if ok else 'FAILED'} {name} ({took} s)", flush=True)
     ok = all(r[1] for r in results)

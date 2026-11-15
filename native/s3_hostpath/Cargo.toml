@@ -1,0 +1,21 @@
+[package]
+name = "s3_hostpath"
+version = "0.1.0"
+edition = "2021"
+description = "R1 (the founder's CPU-headroom plan): the fused lexical path's per-request host work in Rust: parse, plan and row arrays"
+license = "Proprietary"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+# Licences of the dependencies (checked 2026-11-14): pyo3 MIT OR Apache-2.0; serde_json MIT OR Apache-2.0.
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+serde_json = { version = "1", features = ["preserve_order"] }   # dict order, as json.loads
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

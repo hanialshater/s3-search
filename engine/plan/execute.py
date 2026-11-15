@@ -95,6 +95,22 @@ class Timer:
         return (time.perf_counter() - self.t0) * 1000.0
 
 
+class _LeanAgg:
+    """R3b: a prepared request's terms aggregation, all the fused route reads of one."""
+    __slots__ = ("name", "field", "size", "kind", "sub")
+
+    def __init__(self, name, field, size):
+        self.name, self.field, self.size, self.kind, self.sub = name, field, size, "terms", ()
+
+
+class _LeanPlan:
+    """R3b: a prepared request's from, size and aggregations, all the fused route's pages and facets read of a plan."""
+    __slots__ = ("from_", "size", "aggs")
+
+    def __init__(self, from_, size, aggs):
+        self.from_, self.size, self.aggs = from_, size, aggs
+
+
 class Executor:
     def __init__(self, st, rankers=None):
         self.st, self.b = st, st.b
@@ -691,12 +707,18 @@ class Executor:
     # kept the host from queueing the next plan's work); its took_ms stages are then host times. True: as before.
     SYNC_PLAN_TIMES = False
 
-    def run(self, plans: list[Plan], columns: bool = False, ids_bytes: bool = False) -> list[dict]:
+    def run(self, plans: list[Plan], columns: bool = False, ids_bytes: bool = False, prepared=None) -> list[dict]:
+        """``prepared`` (R1): ``s3_hostpath.HostIndex.prepare``'s output for these plans, which are then all fused, in
+        its chunks' order (``Index.search_prepared`` builds them)."""
         b, st = self.b, self.st
         timer = Timer(b)
         shared_t0 = time.perf_counter()
-        fused = self._fused_plans(plans)                   # S6-22: bare lexical plans scored by one fused pass
-        if fused:
+        fused = set(range(len(plans))) if prepared is not None else self._fused_plans(plans)
+        if prepared is not None:                           # R1: the kernel inputs come from the Rust host path
+            self._prefetch(plans, timer, skip={p.root for p in plans})   # nothing to score: the caches only
+            fused_out = self._fused_from_prepared(prepared)
+            timer.lap("retrieve")
+        elif fused:                                        # S6-22: bare lexical plans scored by one fused pass
             others = {n for k, p in enumerate(plans) if k not in fused
                       for r in [p.root] + ([p.post_filter] if p.post_filter is not None else []) for n in walk(r)}
             self._prefetch(plans, timer, skip={plans[k].root for k in fused} - others)
@@ -1028,6 +1050,66 @@ class Executor:
                 cid = object()
                 for g, k in enumerate(ch):
                     out[k] = (scores, g, totals, fac, cid)
+        return out
+
+    def run_prepared(self, prep, parse_ms: float = 0.0) -> list:
+        """R3b: a prepared batch's responses (hits as columns, ids as bytes) without per-request Plan, Timer or state
+        objects. It runs the fused kernel on the Rust host path's blocks (``_fused_from_prepared``), then the same
+        totals, pages, one-pass columns and facet buckets as ``run``'s fused route (``_fused_totals_and_pages``,
+        ``_fused_terms``), into the same response shape: hits first, then aggregations, then took_ms. Each response
+        equals ``run``'s for that request (took_ms aside)."""
+        t0 = time.perf_counter()
+        plans = [_LeanPlan(int(f), int(sz), tuple(_LeanAgg(n, fld, int(k)) for n, fld, k in aggs))
+                 for chunk in prep["chunks"] for f, sz, aggs in zip(chunk["from"], chunk["size"], chunk["aggs"])]
+        if not plans:
+            return []
+        fused_out = self._fused_from_prepared(prep)
+        t1 = time.perf_counter()
+        states = [{"plan": p, "fused": fused_out[k]} for k, p in enumerate(plans)]
+        totals, pages = {}, {}
+        self._fused_totals_and_pages(states, totals, pages)
+        aggs = defaultdict(dict)
+        if any(p.aggs for p in plans):
+            self._fused_terms(states, aggs)
+        t2 = time.perf_counter()
+        n = len(plans)
+        took = {"parse": round(parse_ms, 3), "retrieve": round((t1 - t0) * 1000.0 / n, 3),
+                "page": round((t2 - t1) * 1000.0 / n, 3)}
+        took["total"] = round(parse_ms + (t2 - t0) * 1000.0 / n, 3)
+        out = []
+        for i, (p, sx) in enumerate(zip(plans, states)):
+            resp = {"hits": {"total": totals[i], "columns": sx["fused_cols"]}}
+            if p.aggs:
+                done = aggs[i]
+                resp["aggregations"] = {a.name: done[a.name] for a in p.aggs}
+            resp["took_ms"] = dict(took)
+            out.append(resp)
+        return out
+
+    def _fused_from_prepared(self, prep) -> dict:
+        """``_fused_lexical``'s output from a prepared batch (R1): one copy of each block to the device, then one fused
+        call per chunk on views of it. The plans are in the chunks' order."""
+        from ..backend import triton_fused as TF
+        b, st = self.b, self.st
+        part = st.parts[0]
+        host_i = np.frombuffer(prep["ints"], "<i8")
+        host_f = np.frombuffer(prep["floats"], "<f4")
+        dev_i = dev_f = None
+        if TF.mode(b) == "kernel":
+            dev_i = b.asarray(host_i, "int64")
+            dev_f = b.asarray(host_f, "float32")
+        out, k = {}, 0
+        for chunk in prep["chunks"]:
+            f_i = chunk["idf_field"]
+            idf = part.idf_field[:, f_i] if f_i >= 0 else part.idf
+            codes = [self._facet_codes(f) for f in chunk["facets"]]
+            scores, totals, facets = TF.run_prepared(b, part, st.mapping.k1, idf, chunk, host_i, host_f, dev_i, dev_f,
+                                                     st.live, [c for c, _ in codes])
+            fac = {f: (counts, keys) for f, counts, (_, keys) in zip(chunk["facets"], facets, codes)}
+            cid = object()
+            for g in range(len(chunk["positions"])):
+                out[k] = (scores, g, totals, fac, cid)
+                k += 1
         return out
 
     def _fused_totals_and_pages(self, states, totals, pages):
