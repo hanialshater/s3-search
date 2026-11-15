@@ -848,7 +848,9 @@ def _role(p) -> str:
     for flag, name in (("--gpu-process", "gpu process"), ("--gpu-sockets", "front"), ("--worker-index", "worker")):
         if flag in a:
             i = a.index(flag)
-            j = a[i + 1] if flag != "--gpu-sockets" else a[a.index("--worker-index") + 1] if "--worker-index" in a else "?"
+            # the native front is one process (its threads are the fronts) with no --worker-index: it is front 0, so
+            # --profile finds it (plat-m35 had "front ?" and no front profile)
+            j = a[i + 1] if flag != "--gpu-sockets" else a[a.index("--worker-index") + 1] if "--worker-index" in a else "0"
             return f"{name} {j}"
     return "server" if "serving" in " ".join(a) else a[0] if a else "?"     # the supervisor, or a single process
 
