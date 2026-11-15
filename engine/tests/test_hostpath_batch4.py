@@ -75,18 +75,86 @@ def test_every_golden4_frame():
 
 
 def _has_subnormal(msgs):
+    """Any ok reply of the batch with a subnormal input that reaches the bytes (the steward's terms, lab f134183):
+    - a float32 score;
+    - a float64 sort value;
+    - except a value marked missing in a reply that goes whole, which is written as null whatever its bits. A reply
+      sent as columns writes every value's bits, missing or not."""
     for m in msgs:
-        if m[0] == "search" and m[2] == "ok":
+        if m[0] == "search" and m[2] == "ok" and isinstance(m[3], dict) and "columns" in m[3].get("hits", {}):
             c = m[3]["hits"]["columns"]
-            arrs = [np.asarray(c["_score"], np.float32)] + [col["values"] for col in c["sort"]
-                                                             if np.asarray(col["values"]).dtype.kind == "f"]
-            for a in arrs:
-                a = np.asarray(a)
-                tiny = np.finfo(a.dtype).tiny
+            as_columns = binproto._batch_columns(m[3]) is not None
+            arrs = [(np.asarray(c["_score"], np.float32), None)]
+            arrs += [(np.asarray(col["values"]), col.get("missing")) for col in c["sort"]
+                     if np.asarray(col["values"]).dtype == np.float64]
+            for a, miss in arrs:
                 with np.errstate(all="ignore"):
-                    if np.any((a != 0) & (np.abs(a) < tiny)):
-                        return True
+                    sub = (a != 0) & (np.abs(a) < np.finfo(a.dtype).tiny)
+                if miss is not None and not as_columns:
+                    sub &= ~np.asarray(miss, dtype=bool)
+                if sub.any():
+                    return True
     return False
+
+
+_PRE_FLUSH_CHECK = r"""
+import json, random, sys
+sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + "/serving/native_front/tests")
+import numpy as np
+from serving import binproto
+import make_vectors as mv
+from pathlib import Path
+seen, ref = [], binproto.batch4
+binproto.batch4 = lambda msgs: (seen.append(list(msgs)), ref(msgs))[1]
+mv.golden4(random.Random(10))
+binproto.batch4 = ref
+real_flush, real_cols = binproto.flush_subnormals, binproto.flush_columns
+def old_writer(msgs):                        # the pre-flush writer: batch4 with both flushes as the identity
+    binproto.flush_subnormals, binproto.flush_columns = (lambda a: np.asarray(a)), (lambda r: r)
+    try:
+        return ref(msgs)[4:].hex()
+    finally:
+        binproto.flush_subnormals, binproto.flush_columns = real_flush, real_cols
+def zeroed(msgs):                            # the same input with subnormals set to signed zero
+    return [(m[:3] + (binproto.flush_columns(m[3]),) + m[4:]) if m[0] == "search" and m[2] == "ok" else m for m in msgs]
+out = {"old_raw": [old_writer(m) for m in seen], "old_zeroed": [old_writer(zeroed(m)) for m in seen],
+       "torch_loaded": "torch" in sys.modules}
+print(json.dumps(out))
+"""
+
+
+def test_golden4_regeneration_on_the_stewards_terms():
+    """The steward's ruling (lab f134183) on regenerating golden4 after the flush:
+    - a line changed from golden4.pre-flush.txt has a subnormal input, and an unchanged line has none;
+    - each changed line equals the pre-flush writer's bytes on the same input with subnormals set to signed zero,
+      computed in a process without torch;
+    - in that process the pre-flush writer also reproduces golden4.pre-flush.txt."""
+    import subprocess
+    import sys
+    spec = importlib.util.spec_from_file_location("make_vectors", ROOT / "serving/native_front/tests/make_vectors.py")
+    mv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mv)
+    seen, ref = [], binproto.batch4
+    binproto.batch4 = lambda msgs: (seen.append(list(msgs)), ref(msgs))[1]
+    try:
+        mv.golden4(random.Random(10))
+    finally:
+        binproto.batch4 = ref
+    old = (ROOT / "serving/native_front/tests/golden4.pre-flush.txt").read_text().splitlines()
+    new = (ROOT / "serving/native_front/tests/golden4.txt").read_text().splitlines()
+    assert len(old) == len(new) == len(seen) == 40
+    changed = [o != n for o, n in zip(old, new)]
+    sub = [_has_subnormal(m) for m in seen]
+    assert changed == sub, [i for i in range(40) if changed[i] != sub[i]]
+    r = subprocess.run([sys.executable, "-c", _PRE_FLUSH_CHECK, str(ROOT)], capture_output=True, text=True, check=True)
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["torch_loaded"] is False
+    assert got["old_raw"] == [line.split(" ")[0] for line in old]
+    for i in range(40):
+        if changed[i]:
+            assert got["old_zeroed"][i] == new[i].split(" ")[0], i
+    print(f"\ngolden4: {sum(changed)} of 40 lines changed by the flush, each with a subnormal input; "
+          f"each equals the pre-flush writer on zeroed input (no torch)")
 
 
 def test_subnormals_are_flushed_by_both_writers():

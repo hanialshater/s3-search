@@ -221,8 +221,8 @@ def decode_reply(payload: bytes):
 #                   u32 meta_len  meta JSON (pre, post, version, queue_ms, batch, ... as kind 3)
 #         rkind 2:  u32 meta_len  meta JSON  u16 status  u32 len  body (a whole response, as kind 2)
 #
-# Subnormal float32 scores and float64 sort values are flushed to signed zero (by bits) before anything else, so a
-# frame does not depend on the process's FP mode (the steward's ruling, lab 5f5454f; s3_hostpath.batch4 does the same).
+# Subnormal float32 scores and float64 sort values are flushed to signed zero (by bits) before anything else, in
+# columns and in whole ok replies alike (flush_columns), so a frame does not depend on the process's FP mode (the steward's ruling, lab 5f5454f; s3_hostpath.batch4 does the same).
 # Rule (the architect's amendment 3): a reply whose ids include one with a NUL before its end, or that is not UTF-8,
 # goes as rkind 2 (encoded in Python). The front renders an rkind 3 record exactly as kind 3: ids escaped as
 # encode_basestring_ascii, floats as json.dumps, a missing value as null. took_ms stays in the meta's pre.
@@ -249,6 +249,29 @@ def flush_subnormals(a):
     u = u.copy()
     u[sub] &= ut(sign)
     return u.view(a.dtype)
+
+
+def flush_columns(resp):
+    """``resp`` with its columnar hits' float32 scores and float64 sort values passed through ``flush_subnormals``
+    (the response itself when it has no columns or nothing to flush). It is what a kind 4 frame carries for any ok
+    reply, whole or as columns."""
+    from .encode import _is_columnar
+    if not _is_columnar(resp):
+        return resp
+    c = resp["hits"]["columns"]
+    sc = c.get("_score")
+    s2 = flush_subnormals(np.asarray(sc, np.float32)) if isinstance(sc, np.ndarray) and sc.dtype == np.float32 else sc
+    sort = c.get("sort") or []
+    sort2 = [{**col, "values": flush_subnormals(col["values"])}
+             if isinstance(col, dict) and isinstance(col.get("values"), np.ndarray) and col["values"].dtype == np.float64
+             else col for col in sort]
+    if s2 is sc and all(a is b for a, b in zip(sort2, sort)) and all(
+            not isinstance(a, dict) or a.get("values") is b.get("values") for a, b in zip(sort2, sort)):
+        return resp
+    cols = {**c, "_score": s2}
+    if "sort" in c:
+        cols["sort"] = sort2
+    return {**resp, "hits": {**resp["hits"], "columns": cols}}
 
 
 def _ids_ok(ids) -> bool:
@@ -322,7 +345,7 @@ def batch4(msgs) -> bytes:
                 recs.append(("hits", id_, {**meta, "pre": pre + '"hits":', "post": post}, len(rows)))
                 rows.append(got)
             else:
-                recs.append(("whole", id_, meta, 200, encode(resp)))
+                recs.append(("whole", id_, meta, 200, encode(flush_columns(resp))))
         elif msg[0] == "search":
             recs.append(("whole", msg[1], {}, msg[3], json.dumps(msg[4], separators=(",", ":")).encode()))
         else:

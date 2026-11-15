@@ -93,11 +93,8 @@ def golden(rng):
 def _flushed(resp):
     """The response a kind 4 frame renders: binproto.batch4 flushes subnormal scores and float64 sort values to
     signed zero (by bits) before writing them."""
-    from serving.binproto import flush_subnormals
-    c = resp["hits"]["columns"]
-    sort = [{**col, "values": flush_subnormals(col["values"]) if col["values"].dtype == np.float64 else col["values"]}
-            for col in c["sort"]]
-    return {**resp, "hits": {**resp["hits"], "columns": {**c, "_score": flush_subnormals(c["_score"]), "sort": sort}}}
+    from serving.binproto import flush_columns
+    return flush_columns(resp)
 
 
 def golden4(rng):

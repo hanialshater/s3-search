@@ -2,7 +2,8 @@
 //!
 //! `batch4(msgs, ctx)` returns the same bytes as `binproto.batch4(msgs)`. The platform's golden4 frames and
 //! serving/tests hold it to them. `ctx` holds the Python objects it needs, passed in once by s3_hostpath:
-//! `(numpy.ndarray, dtype float32, dtype float64, numpy.asarray, dtype int64, serving.encode.encode, round)`.
+//! `(numpy.ndarray, dtype float32, dtype float64, numpy.asarray, dtype int64, serving.encode.encode, round,
+//! serving.binproto.flush_columns)`.
 //!
 //! The Python reference spends its time in `json.dumps` (the response shell and the record metas), in `_ids_ok`'s
 //! per-id loop and in many small numpy calls. Here:
@@ -68,6 +69,7 @@ struct Ctx<'py> {
     i64: Bound<'py, PyAny>,
     encode: Bound<'py, PyAny>,
     round: Bound<'py, PyAny>,
+    flush_columns: Bound<'py, PyAny>,
     int_repr: Bound<'py, PyAny>,
     bool_type: Bound<'py, PyAny>,
 }
@@ -753,7 +755,8 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
         }
     }
     meta.push(b'}');
-    let body = body_bytes(&ctx.encode.call1((resp,))?)?;
+    // a whole ok reply: encode() of the response with its subnormals flushed, as binproto.batch4
+    let body = body_bytes(&ctx.encode.call1((ctx.flush_columns.call1((resp,))?,))?)?;
     Ok(Rec::Whole { id, meta, status: 200, body })
 }
 
@@ -773,6 +776,7 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
         i64: ctx.get_item(4)?,
         encode: ctx.get_item(5)?,
         round: ctx.get_item(6)?,
+        flush_columns: ctx.get_item(7)?,
         int_repr: py.get_type_bound::<PyLong>().getattr("__repr__")?,
         bool_type: py.get_type_bound::<PyBool>().into_any(),
     };

@@ -861,6 +861,27 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     connection; `X-S3-Route-Gpu` honoured; the `X-S3-*` response headers as above, plus the front's timers
     (`X-S3-Front-Read-Ms`, `-Build-Ms`, `-Rtt-Ms`, `-Render-Ms`, `X-S3-Gpu-Parse-Ms`, `-Post-Ms`). `stdlib` (the
     default front) keeps serving's own fronts.
+  - **S3B3 and the Rust host line (opt-in; S6-22s, R1 and R3c).**
+    - `S3_SERVING_BINPROTO=3` opens S3B3 connections. A batch's replies to one front go as one kind 4 frame
+      (`binproto.batch4`), besides kinds 2 and 3.
+    - `S3_HOSTPATH=1` loads `native/s3_hostpath` (built on the VM with maturin; `colab/fair_bench.py --hostpath=1`
+      builds it). The GPU process then:
+      - parses and plans the fused-path requests in Rust;
+      - answers them through `Index.search_prepared`;
+      - writes kind 4 frames with `s3_hostpath.batch4`, the same bytes as `binproto.batch4`
+        (`S3_HOSTPATH_BATCH4=0` uses the Python writer).
+    - Every module exception falls back to Python and is counted. The GPU process logs `hostpath stats` every 2,000
+      batches.
+    - **Subnormals (user-visible, S3B3 only):** a kind 4 frame carries a subnormal float32 score or float64 sort value
+      as a signed zero (`binproto.flush_subnormals`, by bit masks, so independent of the process's FP mode; the
+      steward's rulings, labs 5f5454f and f134183). Such a value is returned as `0.0` or `-0.0`, in columns and in
+      whole replies alike. Normal values are unchanged bit for bit, and ranking is unaffected: the flush runs after
+      the top-k, on the returned hits only.
+    - Kind 3 (S3B2) and the Python front's `encode()` do not flush yet. There, a subnormal value is returned as is,
+      subject to the process's FP mode. Flushing once for every reply kind, before floats leave the GPU process, is
+      the proposal under discussion with the platform engineer.
+    - `golden4.txt` was regenerated after the flush. `golden4.pre-flush.txt` keeps the earlier file, and
+      `golden4.env.json` records where it was generated.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:
