@@ -188,6 +188,41 @@ def fused_runs(index, texts):
     return res
 
 
+def impacts_ab(index, texts):
+    """--impacts-ab=1 (the steward's ask for a quality claim on S6-33, lab 5f5454f): every query text through the
+    fused path with S3_TRITON_FUSED_IMPACTS=0 and =1, at depth 2,000 (columns) and faceted, in batches of 64. The
+    response bytes (serving.encode.encode, took_ms removed) are compared one by one, by their sha256."""
+    import hashlib
+    from serving.encode import encode
+    facets = {"brand": {"terms": {"field": "product_brand.keyword", "size": 10}},
+              "color": {"terms": {"field": "product_color.keyword", "size": 10}}}
+    kinds = {"deep": (deep_request, {"hits": "columns", "ids": "bytes"}),
+             "faceted": (lambda q: {"query": lexical(q), "aggs": facets, "size": 10}, {})}
+    os.environ["S3_TRITON_FUSED_LEXICAL"] = "1"
+    res = {}
+    for kind, (make, kw) in kinds.items():
+        digests = {}
+        texts_differ = []
+        for on in ("0", "1"):
+            os.environ["S3_TRITON_FUSED_IMPACTS"] = on
+            out = []
+            t0 = time.perf_counter()
+            for i in range(0, len(texts), 64):
+                for r in index.search_batch([make(t) for t in texts[i:i + 64]], **kw):
+                    r = {k: v for k, v in r.items() if k != "took_ms"}
+                    out.append(hashlib.sha256(encode(r)).digest())     # per response, so memory stays small
+            digests[on] = (out, time.perf_counter() - t0)
+        a, b = digests["0"][0], digests["1"][0]
+        texts_differ = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        res[kind] = {"of": len(a), "differ": len(texts_differ), "first_differ": texts_differ[:10],
+                     "sha256_off": hashlib.sha256(b"".join(a)).hexdigest(),
+                     "sha256_on": hashlib.sha256(b"".join(b)).hexdigest(),
+                     "seconds_off": round(digests["0"][1], 2), "seconds_on": round(digests["1"][1], 2)}
+        say(f"impacts A/B {kind}: {len(texts_differ)} of {len(a)} responses differ (bytes, took_ms removed)")
+    os.environ.pop("S3_TRITON_FUSED_IMPACTS", None)
+    return res
+
+
 def build_hostpath():
     cargo = os.path.expanduser("~/.cargo/bin")
     if not os.path.exists(os.path.join(cargo, "cargo")):
@@ -352,6 +387,16 @@ def main():
         part0 = index._st.parts[0]
         say(f"index: {part0.N:,} docs, {int(part0.doc_ids.shape[0]):,} postings, {int(part0.tf.shape[1])} text fields")
         from engine.backend import triton_gate
+        if any(a == "--impacts-ab=1" for a in sys.argv[1:]):
+            result = {"kind": "impacts-ab", "label": "development only, never a score", "ref": REF, "commit": commit,
+                      "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
+                      "postings": int(part0.doc_ids.shape[0]), "n_queries": len(texts), "build_s": build_s,
+                      "ab": impacts_ab(index, texts)}
+            stop.set()
+            json.dump(result, open("/content/pipeline-profile.json", "w"), indent=1)
+            say("DONE")
+            print(json.dumps(result, indent=1), flush=True)
+            return 0
         result = {"kind": "pipeline-profile-fused", "postings": int(part0.doc_ids.shape[0]), "label": "development only, never a score", "ref": REF,
                   "commit": commit, "plan_cache": os.environ.get("S3_PLAN_CACHE", "default"), "runtime": env,
                   "triton_effective": triton_gate.effective(index._st.b), "n_products": int(len(ds.catalogue)),

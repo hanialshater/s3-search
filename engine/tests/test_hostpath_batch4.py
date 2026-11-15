@@ -60,17 +60,53 @@ def test_every_golden4_frame():
         binproto.batch4 = ref
     lines = (ROOT / "serving/native_front/tests/golden4.txt").read_text().splitlines()
     assert len(seen) == len(rows) == len(lines) == 40
-    same_as_file = 0
-    for (msgs, f), row, line in zip(seen, rows, lines):
+    for (msgs, f), line in zip(seen, lines):
         got = s3_hostpath.batch4(msgs)
         assert got == f, _diff(got, f)                      # the Rust writer equals the Python one on every input
-        if row == line:                                     # and the file, wherever Python itself reproduces it here
-            same_as_file += 1
-            assert got[4:].hex() == line.split(" ")[0]
-    # The file was written on the platform's machine. Here a process that has loaded torch may flush float32
-    # subnormals to zero, so Python's own frames can differ from it; the count says how many it reproduced.
-    print(f"\ngolden4: python reproduces {same_as_file} of 40 lines here (numpy {np.__version__}); rust equals python on all 40")
-    assert same_as_file >= 30
+    # The file (its environment in golden4.env.json) is reproduced here line for line: batch4 flushes subnormals by
+    # bits, so the FP mode (torch may set flush-to-zero) cannot change a frame. A line that is not reproduced must
+    # at least have a subnormal input (the steward's tightening, lab 5f5454f); and there must be none.
+    bad = [i for i, (row, line) in enumerate(zip(rows, lines)) if row != line]
+    assert all(_has_subnormal(seen[i][0]) for i in bad), [i for i in bad if not _has_subnormal(seen[i][0])]
+    assert not bad, f"lines {bad} differ from golden4.txt (numpy {np.__version__})"
+    for (msgs, f), line in zip(seen, lines):
+        assert s3_hostpath.batch4(msgs)[4:].hex() == line.split(" ")[0]
+    print(f"\ngolden4: python and rust reproduce all 40 lines here (numpy {np.__version__})")
+
+
+def _has_subnormal(msgs):
+    for m in msgs:
+        if m[0] == "search" and m[2] == "ok":
+            c = m[3]["hits"]["columns"]
+            arrs = [np.asarray(c["_score"], np.float32)] + [col["values"] for col in c["sort"]
+                                                             if np.asarray(col["values"]).dtype.kind == "f"]
+            for a in arrs:
+                a = np.asarray(a)
+                tiny = np.finfo(a.dtype).tiny
+                with np.errstate(all="ignore"):
+                    if np.any((a != 0) & (np.abs(a) < tiny)):
+                        return True
+    return False
+
+
+def test_subnormals_are_flushed_by_both_writers():
+    """The steward's ruling (lab 5f5454f): subnormal scores and float64 sort values go as signed zeros, by bits."""
+    sub32 = np.array([1e-40, -1e-40, 1.0, 0.0, -0.0, np.float32(1.4e-45)], np.float32)
+    sub64 = np.array([5e-324, -2.2e-308, 3.5, 0.0, -0.0, 1e-310])
+    f = binproto.flush_subnormals(sub32)
+    assert f.view(np.uint32).tolist() == [0, 0x80000000, np.float32(1.0).view(np.uint32), 0, 0x80000000, 0]
+    assert binproto.flush_subnormals(sub64).tolist() == [0.0, -0.0, 3.5, 0.0, -0.0, 0.0]
+    assert np.signbit(binproto.flush_subnormals(sub64)).tolist() == [False, True, False, False, True, False]
+    normal = np.array([1.0, 2.5], np.float32)
+    assert binproto.flush_subnormals(normal) is normal                  # no copy when there is nothing to flush
+    ids = np.array([b"a", b"b", b"c", b"d", b"e", b"f"], "S1")
+    msgs = [("search", 1, "ok", _resp(ids, sub32, [{"values": sub64, "missing": None},
+                                                    {"values": sub32.astype(np.float64), "missing": None}]), ("s", 1), 0.0, 1)]
+    got = _same(msgs)
+    (rec,) = binproto.split_batch4(got[4:])
+    import re
+    assert re.findall(rb'"_score":([^,]*)', rec[2]) == [b"0.0", b"-0.0", b"1.0", b"0.0", b"-0.0", b"0.0"]
+    assert b"e-324" not in rec[2] and b"e-308" not in rec[2] and b"e-310" not in rec[2]   # float64 subnormals too
 
 
 def _resp(ids, sc, sort, total=None, aggs=False):
@@ -106,7 +142,7 @@ def test_the_platforms_unit_case():
     _same([])
 
 
-FLOATS = [0.0, -0.0, 1.0, -1.0, 0.1, 1e16, 1e15, 9999999999999998.0, 1e-4, 1e-5, 1.5e-7, 5e-324, 1.7976931348623157e308,
+FLOATS = [0.0, -0.0, 1.0, -1.0, 0.1, 1e16, 1e15, 9999999999999998.0, 1e-4, 1e-5, 1e-40, 5e-324, 1.7976931348623157e308,
           float("nan"), float("inf"), float("-inf"), 2.5, 123456.789, 1 / 3]
 
 

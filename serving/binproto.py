@@ -221,10 +221,34 @@ def decode_reply(payload: bytes):
 #                   u32 meta_len  meta JSON (pre, post, version, queue_ms, batch, ... as kind 3)
 #         rkind 2:  u32 meta_len  meta JSON  u16 status  u32 len  body (a whole response, as kind 2)
 #
+# Subnormal float32 scores and float64 sort values are flushed to signed zero (by bits) before anything else, so a
+# frame does not depend on the process's FP mode (the steward's ruling, lab 5f5454f; s3_hostpath.batch4 does the same).
 # Rule (the architect's amendment 3): a reply whose ids include one with a NUL before its end, or that is not UTF-8,
 # goes as rkind 2 (encoded in Python). The front renders an rkind 3 record exactly as kind 3: ids escaped as
 # encode_basestring_ascii, floats as json.dumps, a missing value as null. took_ms stays in the meta's pre.
 MAGIC3 = b"S3B3"                     # opt-in: kind 4 batch frames (S6-22s)
+
+
+def flush_subnormals(a):
+    """A float32 or float64 array with its subnormals as signed zero, by bit masks, so the result does not depend on
+    the process's floating-point mode. torch can set flush-to-zero; then numpy's float32 to float64 conversion and
+    comparisons treat subnormals as zero, and the frames would differ by process (the steward's ruling, lab 5f5454f).
+    Normal values, zeros, infinities and NaNs keep their bits. The array is returned unchanged (not copied) when it
+    has no subnormal."""
+    a = np.asarray(a)
+    if a.dtype == np.float32:
+        ut, exp, sign = np.uint32, 0x7F800000, 0x80000000
+    elif a.dtype == np.float64:
+        ut, exp, sign = np.uint64, 0x7FF0000000000000, 0x8000000000000000
+    else:
+        return a
+    u = np.ascontiguousarray(a).view(ut)
+    sub = ((u & ut(exp)) == 0) & ((u & ~ut(exp | sign)) != 0)
+    if not sub.any():
+        return a
+    u = u.copy()
+    u[sub] &= ut(sign)
+    return u.view(a.dtype)
 
 
 def _ids_ok(ids) -> bool:
@@ -250,7 +274,7 @@ def _batch_columns(resp):
     if not (isinstance(ids, np.ndarray) and ids.dtype.kind == "S") or len(ids) == 0 or not _ids_ok(ids):
         return None
     h = len(ids)
-    s32 = np.asarray(c["_score"], np.float32)
+    s32 = flush_subnormals(np.asarray(c["_score"], np.float32))     # subnormals as signed zero, whatever the FP mode
     if len(s32) != h:
         return None
     s64 = s32.astype(np.float64)
@@ -264,6 +288,8 @@ def _batch_columns(resp):
             return None
         if m is not None and not m.any():
             m = None
+        if v.dtype == np.float64:
+            v = flush_subnormals(v)
         if v.dtype == np.float64 and m is None and np.array_equal(v, s64):
             cols.append((0, None, None))
         elif v.dtype == np.float64:
