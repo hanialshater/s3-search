@@ -75,8 +75,9 @@ if triton is not None:
     @triton.jit
     def _fused_kernel(docs_ptr, tf_ptr, norm_ptr, row_idf_ptr, row_start_ptr, row_len_ptr, q_row_lo_ptr, q_row_hi_ptr,
                       msm_ptr, boost_ptr, live_ptr, w_ptr, codes_ptr, fc_off_ptr, fc_nv_ptr,
-                      acc_ptr, cnt_ptr, out_ptr, total_ptr, fc_ptr, N, c1, c2,
-                      F: tl.constexpr, NFACET: tl.constexpr, TILE: tl.constexpr, BLOCK: tl.constexpr):
+                      acc_ptr, cnt_ptr, out_ptr, total_ptr, fc_ptr, N, c1, c2, imp_ptr,
+                      F: tl.constexpr, NFACET: tl.constexpr, TILE: tl.constexpr, BLOCK: tl.constexpr,
+                      IMPACT: tl.constexpr):
         g = tl.program_id(0)
         tile = tl.program_id(1)
         d0 = tile * TILE
@@ -116,17 +117,21 @@ if triton is not None:
                 e = e0 + lanes
                 ok = e < e_end
                 d = tl.load(docs_ptr + e, mask=ok, other=0)
-                ptf = tl.zeros([BLOCK], tl.float32)
-                for f in tl.static_range(F):
-                    tfv = tl.load(tf_ptr + e.to(tl.int64) * F + f, mask=ok, other=0).to(tl.float32)
-                    norm = tl.load(norm_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)   # S6-28: per index
-                    x = tl.math.div_rn(tl.load(w_ptr + f) * tfv, norm)
-                    if f == 0:
-                        ptf = x
-                    else:
-                        ptf = ptf + x
-                imp = tl.math.div_rn(idf * ptf * c1, c2 + ptf)
-                h = (ptf > 0).to(tl.int32)
+                if IMPACT:                                  # S6-33: the posting's weight, computed once per w
+                    imp = tl.load(imp_ptr + e, mask=ok, other=0.0)
+                    h = (imp > 0).to(tl.int32)              # imp > 0 exactly where ptf > 0 (checked at build)
+                else:
+                    ptf = tl.zeros([BLOCK], tl.float32)
+                    for f in tl.static_range(F):
+                        tfv = tl.load(tf_ptr + e.to(tl.int64) * F + f, mask=ok, other=0).to(tl.float32)
+                        norm = tl.load(norm_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)   # S6-28: per index
+                        x = tl.math.div_rn(tl.load(w_ptr + f) * tfv, norm)
+                        if f == 0:
+                            ptf = x
+                        else:
+                            ptf = ptf + x
+                    imp = tl.math.div_rn(idf * ptf * c1, c2 + ptf)
+                    h = (ptf > 0).to(tl.int32)
                 off = base + d
                 cur = tl.load(acc_ptr + off, mask=ok, other=0.0)
                 tl.store(acc_ptr + off, cur + imp.to(tl.float64), mask=ok)
@@ -161,6 +166,62 @@ def pack(parts, dtype, align):
     for a, x in zip(at, parts):
         out[a:a + len(x)] = x
     return out, at
+
+
+if triton is not None:
+    @triton.jit
+    def _impact_kernel(docs_ptr, tf_ptr, norm_ptr, term_ptr, idf_ptr, w_ptr, imp_ptr, bad_ptr, P, c1, c2,
+                       F: tl.constexpr, BLOCK: tl.constexpr):
+        """Every posting's weight, with the fused kernel's own operations in its order; ``bad`` counts postings whose
+        weight is not > 0 where ptf > 0 (or the reverse), where the impact path's hit test would differ."""
+        e = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        ok = e < P
+        d = tl.load(docs_ptr + e, mask=ok, other=0)
+        t = tl.load(term_ptr + e, mask=ok, other=0)
+        idf = tl.load(idf_ptr + t, mask=ok, other=0.0)
+        ptf = tl.zeros([BLOCK], tl.float32)
+        for f in tl.static_range(F):
+            tfv = tl.load(tf_ptr + e.to(tl.int64) * F + f, mask=ok, other=0).to(tl.float32)
+            norm = tl.load(norm_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)
+            x = tl.math.div_rn(tl.load(w_ptr + f) * tfv, norm)
+            if f == 0:
+                ptf = x
+            else:
+                ptf = ptf + x
+        imp = tl.math.div_rn(idf * ptf * c1, c2 + ptf)
+        tl.store(imp_ptr + e, imp, mask=ok)
+        tl.atomic_add(bad_ptr, tl.sum((ok & ((imp > 0) != (ptf > 0))).to(tl.int32), axis=0))
+
+
+def impacts(b, part, w, bb, k1, idf):
+    """S6-33: the per-posting weights for one field-weight vector ``w`` (and b, k1, idf), float32 [P], kept on the part.
+    They are computed by ``_impact_kernel`` with the fused kernel's exact operations, so the fused kernel can load
+    them instead of recomputing: the same bits. None when the hit test would differ for some posting
+    (``imp > 0`` against ``ptf > 0``), or when ``S3_TRITON_FUSED_IMPACTS`` is not "1" (off by default). The cost is
+    4 bytes per posting per cached w."""
+    import torch
+    if os.environ.get("S3_TRITON_FUSED_IMPACTS", "0") != "1":
+        return None
+    docs32, norm = lean_inputs(b, part, bb)
+    cache = part.__dict__.setdefault("_fused_impacts", {})
+    key = (np.asarray(w, np.float32).tobytes(), np.asarray(bb, np.float32).tobytes(), float(k1), idf.data_ptr(),
+           part.doc_ids.data_ptr(), norm.data_ptr())
+    if key in cache:
+        return cache[key]
+    if "terms" not in cache or cache["terms"][0] != part.doc_ids.data_ptr():
+        cache.clear()
+        t = torch.as_tensor(np.asarray(part.term_of_posting, np.int32), device=b.device)
+        cache["terms"] = (part.doc_ids.data_ptr(), t)
+    P = int(part.doc_ids.shape[0])
+    imp = torch.empty(P, dtype=torch.float32, device=b.device)
+    bad = torch.zeros(1, dtype=torch.int32, device=b.device)
+    w32 = b.asarray(np.asarray(w, np.float32), "float32")
+    BLK = 1024
+    _impact_kernel[(triton.cdiv(P, BLK),)](docs32, part.tf.contiguous(), norm, cache["terms"][1], idf.contiguous(), w32,
+                                           imp, bad, P, float(np.float32(k1 + 1.0)), float(np.float32(k1)),
+                                           F=int(part.tf.shape[1]), BLOCK=BLK, enable_fp_fusion=False)
+    cache[key] = imp if int(bad.item()) == 0 else None
+    return cache[key]
 
 
 def lean_inputs(b, part, bb):
@@ -240,12 +301,13 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     dev_f = torch.from_numpy(host_f).to(dev)
     vi = [dev_i[a:a + len(x)] for a, x in zip(at, ints)]
     vf = [dev_f[a:a + len(x)] for a, x in zip(fat, floats)]
-    return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb32)
+    return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb32, w32)
 
 
-def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb):
+def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb, w):
     """The kernel on device inputs: ``vi`` the int64 views (row_start, row_len, q_lo, q_hi, msm, facet offsets, facet
-    sizes, row_term), ``vf`` the float32 views (w, b, 1 - b, boost)."""
+    sizes, row_term), ``vf`` the float32 views (w, b, 1 - b, boost); ``bb`` and ``w`` on the host (the norm table's
+    and the impacts' cache keys)."""
     import torch
     dev = b.device
     N = part.N
@@ -266,9 +328,11 @@ def _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, bb):
     c2 = float(np.float32(k1))
     tile, block, warps = _shape()
     grid = (Q, triton.cdiv(N, tile))
+    imp = impacts(b, part, w, bb, k1, idf)                  # S6-33 (opt-in): the per-posting weights, or None
     _fused_kernel[grid](docs32, part.tf.contiguous(), norm, row_idf, rs, rl, qlo, qhi, msm_d, boost_d,
                         live.contiguous().view(torch.uint8), w_d, codes, off_d, nv_d, acc, cnt, out, total, fc, N,
-                        c1, c2, F=F, NFACET=nf, TILE=tile, BLOCK=block, num_warps=warps, enable_fp_fusion=False)
+                        c1, c2, imp if imp is not None else out, F=F, NFACET=nf, TILE=tile, BLOCK=block,
+                        IMPACT=imp is not None, num_warps=warps, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
     return out.view(Q, N), total.to(torch.int64), facets
 
@@ -289,7 +353,8 @@ def run_prepared(b, part, k1, idf, chunk, host_i, host_f, dev_i, dev_f, live, fa
     if mode(b) == "kernel":
         vi = [dev_i[a:a + n] for a, n in zip(at, ln)]
         vf = [dev_f[a:a + n] for a, n in zip(fa, (F, F, F, Q))]
-        return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, host_f[fa[1]:fa[1] + F])
+        return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, host_f[fa[1]:fa[1] + F],
+                       host_f[fa[0]:fa[0] + F])
     rt = hi[7]
     terms = [[int(t) for t in rt[qlo[g]:qhi[g]]] for g in range(Q)]
     w = host_f[fa[0]:fa[0] + F]
