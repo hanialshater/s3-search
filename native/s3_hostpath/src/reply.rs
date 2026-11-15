@@ -7,15 +7,25 @@
 //! The Python reference spends its time in `json.dumps` (the response shell and the record metas), in `_ids_ok`'s
 //! per-id loop and in many small numpy calls. Here:
 //! - the shell and the metas are written by a JSON writer with `json.dumps`'s rules: `separators=(",", ":")`,
-//!   `ensure_ascii`, NaN as NaN, and float and big-int text from Python's own `float.__repr__` and `int.__repr__`;
-//! - the ids are checked on their raw bytes;
-//! - the columns are copied from each array's `tobytes()`.
+//!   `ensure_ascii`, NaN as NaN;
+//! - float text is `float.__repr__`'s, from ryu's shortest digits laid out by CPython's rule: `push_pyrepr`, the
+//!   platform's function from serving/native_front/src/encode.rs, which is held there to the pyrepr vectors. A big
+//!   int's text is Python's own `int.__repr__`;
+//! - `round(x, 3)` is the correctly rounded 3-decimal value. An exact tie, where Python rounds half to even, is left
+//!   to Python's round;
+//! - the ids are checked on their raw bytes, and the arrays are read through the buffer protocol. An array the fast
+//!   path does not take (not C-contiguous, a byte order or format outside it) goes through `tobytes()` and numpy as
+//!   before.
+//! Measured on a Colab CPU (arch-hp10, 96a8a2a), before these: about 1 us per Python call made from here. So the
+//! writer avoids them: tuple items, dict lookups with interned keys, and borrowed UTF-8 (no abi3).
 //!
 //! Anything the writer does not take (a type `json.dumps` would refuse, a string with a lone surrogate) raises, so the
 //! guarded caller falls back to the Python writer for that batch.
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::{ffi, intern};
+use std::ffi::CStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -85,22 +95,231 @@ fn esc(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
 }
 
-fn float_text(_ctx: &Ctx, out: &mut Vec<u8>, v: &Bound<PyAny>, f: f64) -> PyResult<()> {
-    if f.is_nan() {
-        out.extend_from_slice(b"NaN");
-    } else if f.is_infinite() {
-        out.extend_from_slice(if f > 0.0 { b"Infinity" as &[u8] } else { b"-Infinity" });
-    } else {
-        // float.__repr__, as json.dumps calls it (a float subclass's own repr is not used)
-        let py = v.py();
-        let r = if v.get_type().is(&py.get_type_bound::<PyFloat>()) {
-            v.repr()?
-        } else {
-            PyFloat::new_bound(py, f).repr()?
-        };
-        out.extend_from_slice(r.to_cow()?.as_bytes());
-    }
+fn float_text(_ctx: &Ctx, out: &mut Vec<u8>, _v: &Bound<PyAny>, f: f64) -> PyResult<()> {
+    // json.dumps calls float.__repr__ (a float subclass's own repr is not used), which depends on the value alone
+    push_pyrepr(out, f, &mut ryu::Buffer::new());
     Ok(())
+}
+
+/// `json.dumps(x)` for any float64, byte for byte: the platform's function (serving/native_front/src/encode.rs,
+/// S3B2), copied unchanged. Python's `float.__repr__`: the shortest round-trip digits (ryu's, the same digits as
+/// CPython's dtoa shortest mode), laid out by CPython's 'r' rule. Positional when the decimal point position decpt
+/// (x = 0.d1d2... x 10^decpt) has -4 < decpt <= 16, else d[.ddd]e+XX / e-XX (at least two exponent digits); and
+/// NaN, Infinity, -Infinity as json.dumps writes them.
+pub fn push_pyrepr(out: &mut Vec<u8>, x: f64, buf: &mut ryu::Buffer) {
+    let m = x.abs();
+    if x.is_finite() && x != 0.0 && m >= 1e-4 && m < 1e16 {
+        out.extend_from_slice(buf.format_finite(x).as_bytes());
+        return;
+    }
+    if x.is_nan() {
+        out.extend_from_slice(b"NaN");
+        return;
+    }
+    if x.is_infinite() {
+        out.extend_from_slice(if x > 0.0 { b"Infinity" } else { b"-Infinity" });
+        return;
+    }
+    if x == 0.0 {
+        out.extend_from_slice(if x.is_sign_negative() { b"-0.0" } else { b"0.0" });
+        return;
+    }
+    let s = buf.format_finite(x.abs());
+    let (mant, exp) = match s.find('e') {
+        Some(p) => (&s[..p], s[p + 1..].parse::<i32>().unwrap_or(0)),
+        None => (s, 0),
+    };
+    let (ip, fp) = match mant.find('.') {
+        Some(p) => (&mant[..p], &mant[p + 1..]),
+        None => (mant, ""),
+    };
+    let n = ip.len() + fp.len();
+    let mut dbuf = [0u8; 64];
+    let heap: Vec<u8>;
+    let digits: &[u8] = if n <= dbuf.len() {
+        dbuf[..ip.len()].copy_from_slice(ip.as_bytes());
+        dbuf[ip.len()..n].copy_from_slice(fp.as_bytes());
+        &dbuf[..n]
+    } else {
+        heap = [ip.as_bytes(), fp.as_bytes()].concat();
+        &heap
+    };
+    let z = digits.iter().take_while(|&&c| c == b'0').count();
+    let decpt = ip.len() as i32 - z as i32 + exp;
+    let mut d: &[u8] = &digits[z..];
+    while d.len() > 1 && d[d.len() - 1] == b'0' {
+        d = &d[..d.len() - 1];
+    }
+    if x < 0.0 {
+        out.push(b'-');
+    }
+    if decpt > -4 && decpt <= 16 {
+        if decpt <= 0 {
+            out.extend_from_slice(b"0.");
+            for _ in 0..(-decpt) {
+                out.push(b'0');
+            }
+            out.extend_from_slice(d);
+        } else if decpt as usize >= d.len() {
+            out.extend_from_slice(d);
+            for _ in 0..(decpt as usize - d.len()) {
+                out.push(b'0');
+            }
+            out.extend_from_slice(b".0");
+        } else {
+            out.extend_from_slice(&d[..decpt as usize]);
+            out.push(b'.');
+            out.extend_from_slice(&d[decpt as usize..]);
+        }
+    } else {
+        out.push(d[0]);
+        if d.len() > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&d[1..]);
+        }
+        let e = decpt - 1;
+        out.push(b'e');
+        out.push(if e < 0 { b'-' } else { b'+' });
+        let ea = e.unsigned_abs();
+        if ea < 10 {
+            out.push(b'0');
+        }
+        out.extend_from_slice(ea.to_string().as_bytes());
+    }
+}
+
+/// `round(x, 3)` for a float: the correctly rounded 3-decimal value (Rust's exact formatting, then a correctly
+/// rounded parse, as CPython's dtoa and strtod). A possible exact tie (x * 2000 an odd integer) goes to Python's round.
+fn round3(ctx: &Ctx, x: f64) -> PyResult<f64> {
+    if !x.is_finite() {
+        return Ok(x);
+    }
+    let y = x * 2000.0;
+    if y.is_finite() && y.fract() == 0.0 && (y.abs() >= 9.0e15 || (y as i64) % 2 != 0) {
+        return ctx.round.call1((x, 3))?.extract::<f64>();
+    }
+    format!("{:.3}", x).parse::<f64>().map_err(|_| PyValueError::new_err("round"))
+}
+
+/// `float(v)`: a float's value, a small int's, or Python's float() of anything else.
+fn as_float(v: &Bound<PyAny>) -> PyResult<f64> {
+    if let Ok(f) = v.downcast::<PyFloat>() {
+        return Ok(f.value());
+    }
+    if v.downcast::<PyLong>().is_ok() && v.downcast::<PyBool>().is_err() {
+        if let Ok(i) = v.extract::<i64>() {
+            if i.unsigned_abs() <= (1u64 << 53) {
+                return Ok(i as f64);
+            }
+        }
+    }
+    v.py().get_type_bound::<PyFloat>().call1((v,))?.downcast::<PyFloat>().map(|f| f.value()).map_err(Into::into)
+}
+
+/// `f"{v}"` for a str or a small int directly, else `v.__format__("")`.
+fn fmt_text(v: &Bound<PyAny>) -> PyResult<String> {
+    if v.get_type().is(&v.py().get_type_bound::<PyString>()) {
+        return Ok(v.downcast::<PyString>()?.to_cow()?.into_owned());
+    }
+    if v.get_type().is(&v.py().get_type_bound::<PyLong>()) {
+        if let Ok(i) = v.extract::<i64>() {
+            return Ok(i.to_string());
+        }
+    }
+    let r = v.call_method1(intern!(v.py(), "__format__"), ("",))?;
+    Ok(r.downcast::<PyString>()?.to_cow()?.into_owned())
+}
+
+/// A C-contiguous buffer view of an array (numpy's buffer protocol); released on drop.
+struct Buf {
+    view: ffi::Py_buffer,
+}
+
+impl Buf {
+    fn get(obj: &Bound<PyAny>) -> Option<Buf> {
+        let mut view = std::mem::MaybeUninit::<ffi::Py_buffer>::uninit();
+        let rc = unsafe { ffi::PyObject_GetBuffer(obj.as_ptr(), view.as_mut_ptr(), ffi::PyBUF_C_CONTIGUOUS | ffi::PyBUF_FORMAT) };
+        if rc != 0 {
+            unsafe { ffi::PyErr_Clear() };
+            return None;
+        }
+        let b = Buf { view: unsafe { view.assume_init() } };
+        if b.view.ndim != 1 || b.view.shape.is_null() || b.view.format.is_null() {
+            return None;
+        }
+        Some(b)
+    }
+    fn len(&self) -> usize {
+        unsafe { *self.view.shape as usize }
+    }
+    fn itemsize(&self) -> usize {
+        self.view.itemsize as usize
+    }
+    fn format(&self) -> &[u8] {
+        unsafe { CStr::from_ptr(self.view.format).to_bytes() }
+    }
+    fn bytes(&self) -> &[u8] {
+        if self.view.len == 0 || self.view.buf.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.view.buf as *const u8, self.view.len as usize) }
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        unsafe { ffi::PyBuffer_Release(&mut self.view) };
+    }
+}
+
+/// numpy's buffer format of a native-order integer array -> (itemsize, signed); None for anything else.
+fn int_format(f: &[u8], itemsize: usize) -> Option<(usize, bool)> {
+    if f.len() != 1 {
+        return None;
+    }
+    let signed = match f[0] {
+        b'b' | b'h' | b'i' | b'l' | b'q' | b'n' => true,
+        b'B' | b'H' | b'I' | b'L' | b'Q' | b'N' => false,
+        _ => return None,
+    };
+    if matches!(itemsize, 1 | 2 | 4 | 8) {
+        Some((itemsize, signed))
+    } else {
+        None
+    }
+}
+
+/// `values.astype(np.int64)` of a native integer array's bytes.
+fn ints_to_i64(b: &[u8], size: usize, signed: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len() / size * 8);
+    for c in b.chunks(size) {
+        let v: i64 = match (size, signed) {
+            (1, true) => c[0] as i8 as i64,
+            (1, false) => c[0] as i64,
+            (2, true) => i16::from_le_bytes([c[0], c[1]]) as i64,
+            (2, false) => u16::from_le_bytes([c[0], c[1]]) as i64,
+            (4, true) => i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64,
+            (4, false) => u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64,
+            (_, true) => i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]),
+            (_, false) => u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as i64,
+        };
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// The id bytes of an S array through the buffer protocol: (raw, itemsize, h); None to use the slow path.
+fn ids_buf(ids: &Bound<PyAny>) -> Option<(Vec<u8>, usize, usize)> {
+    let b = Buf::get(ids)?;
+    let f = b.format();
+    if f.is_empty() || f[f.len() - 1] != b's' || !f[..f.len() - 1].iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (h, w) = (b.len(), b.itemsize());
+    if b.bytes().len() != h * w {
+        return None;
+    }
+    Some((b.bytes().to_vec(), w, h))
 }
 
 fn int_text(ctx: &Ctx, out: &mut Vec<u8>, v: &Bound<PyAny>) -> PyResult<()> {
@@ -247,7 +466,7 @@ struct Row {
 }
 
 fn tobytes(a: &Bound<PyAny>) -> PyResult<Vec<u8>> {
-    let b = a.call_method0("tobytes")?;
+    let b = a.call_method0(intern!(a.py(), "tobytes"))?;
     Ok(b.downcast::<PyBytes>()?.as_bytes().to_vec())
 }
 
@@ -268,59 +487,85 @@ fn ids_ok(raw: &[u8], w: usize) -> bool {
 fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
     // encode._is_columnar
     let Ok(rd) = resp.downcast::<PyDict>() else { return Ok(None) };
-    let Some(hits) = rd.get_item("hits")? else { return Ok(None) };
+    let Some(hits) = rd.get_item(intern!(resp.py(), "hits"))? else { return Ok(None) };
     let Ok(hd) = hits.downcast::<PyDict>() else { return Ok(None) };
-    if !hd.contains("columns")? {
+    if !hd.contains(intern!(resp.py(), "columns"))? {
         return Ok(None);
     }
-    let c = hd.get_item("columns")?.ok_or_else(|| PyValueError::new_err("columns"))?;
-    let ids = c.get_item("_id")?;
+    let py = resp.py();
+    let c = hd.get_item(intern!(py, "columns"))?.ok_or_else(|| PyValueError::new_err("columns"))?;
+    let ids = c.get_item(intern!(py, "_id"))?;
     if !ids.is_instance(&ctx.ndarray)? {
         return Ok(None);
     }
-    let dt = ids.getattr("dtype")?;
-    if dt.getattr("kind")?.extract::<String>()? != "S" {
+    let (raw, w0, h) = match ids_buf(&ids) {
+        Some(x) => x,
+        None => {
+            let dt = ids.getattr(intern!(py, "dtype"))?;
+            if dt.getattr(intern!(py, "kind"))?.extract::<String>()? != "S" {
+                return Ok(None);
+            }
+            let h = ids.len()?;
+            if h == 0 {
+                return Ok(None);
+            }
+            if ids.getattr(intern!(py, "ndim"))?.extract::<usize>()? != 1 {
+                return Err(PyValueError::new_err("ids not 1-D"));
+            }
+            (tobytes(&ids)?, dt.getattr(intern!(py, "itemsize"))?.extract::<usize>()?, h)
+        }
+    };
+    if h == 0 || w0 == 0 || raw.len() != h * w0 || !ids_ok(&raw, w0) {
         return Ok(None);
     }
-    let h = ids.len()?;
-    if h == 0 {
+    let score = c.get_item(intern!(py, "_score"))?;
+    let fast = if score.is_instance(&ctx.ndarray)? {
+        Buf::get(&score).and_then(|b| if b.format() == b"f" { Some((b.len(), b.bytes().to_vec())) } else { None })
+    } else {
+        None
+    };
+    let (sh, s32) = match fast {
+        Some(x) => x,
+        None => {
+            let s = ctx.asarray.call1((score, ctx.f32.clone()))?;
+            (s.len()?, tobytes(&s)?)
+        }
+    };
+    if sh != h {
         return Ok(None);
     }
-    if ids.getattr("ndim")?.extract::<usize>()? != 1 {
-        return Err(PyValueError::new_err("ids not 1-D"));
-    }
-    let w0 = dt.getattr("itemsize")?.extract::<usize>()?;
-    let raw = tobytes(&ids)?;
-    if w0 == 0 || raw.len() != h * w0 || !ids_ok(&raw, w0) {
-        return Ok(None);
-    }
-    let s = ctx.asarray.call1((c.get_item("_score")?, ctx.f32.clone()))?;
-    if s.len()? != h {
-        return Ok(None);
-    }
-    let s32 = tobytes(&s)?;
     if s32.len() != 4 * h {
         return Err(PyValueError::new_err("scores not 1-D"));
     }
     let s64: Vec<f64> = s32.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect();
     let mut cols = Vec::new();
-    let sort = c.call_method1("get", ("sort",))?;
+    let sort = c.call_method1(intern!(py, "get"), (intern!(py, "sort").clone(),))?;
     if sort.is_truthy()? {
         for col in sort.iter()? {
             let col = col?;
-            let v = col.call_method1("get", ("values",))?;
-            let miss = col.call_method1("get", ("missing",))?;
+            let v = col.call_method1(intern!(py, "get"), (intern!(py, "values").clone(),))?;
+            let miss = col.call_method1(intern!(py, "get"), (intern!(py, "missing").clone(),))?;
             if !v.is_instance(&ctx.ndarray)? || v.len()? != h {
                 return Ok(None);
             }
             let m: Option<Vec<bool>> = if miss.is_none() {
                 None
             } else {
-                let ma = ctx.asarray.call1((miss, ctx.bool_type.clone()))?;
-                if ma.len()? != h {
+                let fastm = if miss.is_instance(&ctx.ndarray)? {
+                    Buf::get(&miss).and_then(|b| if b.format() == b"?" { Some((b.len(), b.bytes().to_vec())) } else { None })
+                } else {
+                    None
+                };
+                let (mh, mb) = match fastm {
+                    Some(x) => x,
+                    None => {
+                        let ma = ctx.asarray.call1((miss, ctx.bool_type.clone()))?;
+                        (ma.len()?, tobytes(&ma)?)
+                    }
+                };
+                if mh != h {
                     return Ok(None);
                 }
-                let mb = tobytes(&ma)?;
                 if mb.len() != h {
                     return Err(PyValueError::new_err("missing not 1-D"));
                 }
@@ -330,7 +575,33 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
                     None
                 }
             };
-            let vdt = v.getattr("dtype")?;
+            let vb = Buf::get(&v);
+            let vfmt: Option<(Vec<u8>, usize)> = vb.as_ref().map(|b| (b.format().to_vec(), b.itemsize()));
+            if let (Some(b), Some((f, isz))) = (vb.as_ref(), vfmt.as_ref()) {
+                if f.as_slice() == b"d" || int_format(f, *isz).is_some() {
+                    let vals = if f.as_slice() == b"d" {
+                        b.bytes().to_vec()
+                    } else {
+                        let (size, signed) = int_format(f, *isz).unwrap();
+                        ints_to_i64(b.bytes(), size, signed)
+                    };
+                    if vals.len() != 8 * h {
+                        return Err(PyValueError::new_err("values not 1-D"));
+                    }
+                    if f.as_slice() == b"d" {
+                        let same = m.is_none()
+                            && vals.chunks(8).zip(s64.iter()).all(|(b, &x)| {
+                                f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) == x
+                            });
+                        cols.push(if same { Col { kind: 0, vals: Vec::new(), miss: None } } else { Col { kind: 1, vals, miss: m } });
+                    } else {
+                        cols.push(Col { kind: 2, vals, miss: m });
+                    }
+                    continue;
+                }
+            }
+            drop(vb);
+            let vdt = v.getattr(intern!(py, "dtype"))?;
             if vdt.eq(&ctx.f64)? {
                 let vals = tobytes(&v)?;
                 if vals.len() != 8 * h {
@@ -346,9 +617,9 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
                     cols.push(Col { kind: 1, vals, miss: m });
                 }
             } else {
-                let k = vdt.getattr("kind")?.extract::<String>()?;
+                let k = vdt.getattr(intern!(py, "kind"))?.extract::<String>()?;
                 if k == "i" || k == "u" {
-                    let vals = tobytes(&v.call_method1("astype", (ctx.i64.clone(),))?)?;
+                    let vals = tobytes(&v.call_method1(intern!(py, "astype"), (ctx.i64.clone(),))?)?;
                     if vals.len() != 8 * h {
                         return Err(PyValueError::new_err("values not 1-D"));
                     }
@@ -384,7 +655,6 @@ fn s_eq(v: &Bound<PyAny>, s: &str) -> PyResult<bool> {
 }
 
 fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec> {
-    let py = msg.py();
     let mut t = Instant::now();
     let n = msg.len()?;
     if n < 6 {
@@ -395,15 +665,17 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
     let version = msg.get_item(4)?;
     let mut meta = Vec::with_capacity(256);
     // {"version": f"{v[0]}:{v[1]}", "queue_ms": round(float(q), 3), "batch": rest[0] or 1, ["batch_ms": ...]}
-    let v0 = version.get_item(0)?.call_method1("__format__", ("",))?;
-    let v1 = version.get_item(1)?.call_method1("__format__", ("",))?;
-    let vs = format!("{}:{}", v0.downcast::<PyString>()?.to_cow()?, v1.downcast::<PyString>()?.to_cow()?);
+    let (v0, v1) = match version.downcast::<PyTuple>() {
+        Ok(t) => (t.get_item(0)?, t.get_item(1)?),
+        Err(_) => (version.get_item(0)?, version.get_item(1)?),
+    };
+    let vs = format!("{}:{}", fmt_text(&v0)?, fmt_text(&v1)?);
     meta.extend_from_slice(b"{\"version\":");
     esc(&mut meta, &vs);
-    let float_t = py.get_type_bound::<PyFloat>();
-    let q = ctx.round.call1((float_t.call1((msg.get_item(5)?,))?, 3))?;
+    let mut fb = ryu::Buffer::new();
+    let q = round3(ctx, as_float(&msg.get_item(5)?)?)?;
     meta.extend_from_slice(b",\"queue_ms\":");
-    dump(ctx, &mut meta, &q, 1)?;
+    push_pyrepr(&mut meta, q, &mut fb);
     meta.extend_from_slice(b",\"batch\":");
     if n > 6 {
         dump(ctx, &mut meta, &msg.get_item(6)?, 1)?;
@@ -413,9 +685,9 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
     if n > 7 {
         let bm = msg.get_item(7)?;
         if !bm.is_none() {
-            let b = ctx.round.call1((float_t.call1((bm,))?, 3))?;
+            let b = round3(ctx, as_float(&bm)?)?;
             meta.extend_from_slice(b",\"batch_ms\":");
-            dump(ctx, &mut meta, &b, 1)?;
+            push_pyrepr(&mut meta, b, &mut fb);
         }
     }
     lap(0, &mut t);
@@ -423,7 +695,7 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
     lap(1, &mut t);
     if let Some(row) = got {
         let rd = resp.downcast::<PyDict>()?;
-        let hits = rd.get_item("hits")?.ok_or_else(|| PyValueError::new_err("hits"))?;
+        let hits = rd.get_item(intern!(rd.py(), "hits"))?.ok_or_else(|| PyValueError::new_err("hits"))?;
         let mut text = Vec::with_capacity(256);
         shell(ctx, &mut text, rd, hits.downcast::<PyDict>()?)?;
         lap(2, &mut t);

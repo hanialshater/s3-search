@@ -110,6 +110,9 @@ FLOATS = [0.0, -0.0, 1.0, -1.0, 0.1, 1e16, 1e15, 9999999999999998.0, 1e-4, 1e-5,
           float("nan"), float("inf"), float("-inf"), 2.5, 123456.789, 1 / 3]
 
 
+TIES = [0.0625, 0.0005, 0.0015, 1.0005, 2.675, 0.125, 0.3125, -0.0625, 1e-9, -1e-9, 4.5e12 + 0.0625, 123.4565]
+
+
 def _value(rng, depth=0):
     k = rng.random()
     if depth > 3 or k < 0.3:
@@ -133,24 +136,42 @@ def _value(rng, depth=0):
     return d
 
 
+def _layout(rng, a):
+    """The same values, sometimes as an array the buffer fast path does not take (strided, byte-swapped) or a list."""
+    r = rng.random()
+    if r < 0.1:
+        big = np.empty(2 * len(a), a.dtype)
+        big[::2] = a
+        return big[::2]                                     # not C-contiguous
+    if r < 0.2 and a.dtype.kind in "fiu" and a.dtype.itemsize > 1:
+        return a.astype(a.dtype.newbyteorder(">"))          # not native byte order
+    return a
+
+
 def _random_reply(rng, rid):
     h = rng.randint(1, 20)
     w = rng.randint(1, 12)
-    ids = np.array([bytes(rng.choice(b"ab0Z\"\\") for _ in range(rng.randint(1, w))) for _ in range(h)], f"S{w}")
+    ids = _layout(rng, np.array([bytes(rng.choice(b"ab0Z\"\\") for _ in range(rng.randint(1, w))) for _ in range(h)], f"S{w}"))
     with np.errstate(over="ignore"):
         sc = np.array([rng.choice(FLOATS[:13]) for _ in range(h)], np.float64).astype(np.float32)
     sort = []
-    for c in rng.sample(["score", "f8", "i8", "f8m", "i8m", "u4"], rng.randint(0, 3)):
+    for c in rng.sample(["score", "f8", "i8", "f8m", "i8m", "u4", "i1", "u8", "f4", "f2"], rng.randint(0, 3)):
         miss = [rng.random() < 0.3 for _ in range(h)] if c.endswith("m") else None
+        if miss is not None and rng.random() < 0.5:
+            miss = _layout(rng, np.array(miss))
         if c == "score":
-            sort.append({"values": sc.astype(np.float64), "missing": None})
+            sort.append({"values": _layout(rng, sc.astype(np.float64)), "missing": None})
         elif c.startswith("f8"):
-            sort.append({"values": np.array([rng.choice(FLOATS) for _ in range(h)]), "missing": miss})
-        elif c == "u4":
-            sort.append({"values": np.array([rng.randrange(2**32) for _ in range(h)], np.uint32), "missing": None})
+            sort.append({"values": _layout(rng, np.array([rng.choice(FLOATS) for _ in range(h)])), "missing": miss})
+        elif c in ("u4", "i1", "u8"):
+            dt, hi = {"u4": (np.uint32, 2**32), "i1": (np.int8, 128), "u8": (np.uint64, 2**64)}[c]
+            lo = -128 if c == "i1" else 0
+            sort.append({"values": _layout(rng, np.array([rng.randrange(lo, hi) for _ in range(h)], dt)), "missing": None})
+        elif c in ("f4", "f2"):                             # not float64: the reply goes whole
+            sort.append({"values": np.array([1.5] * h, c), "missing": None})
         else:
-            sort.append({"values": np.array([rng.randint(-2**62, 2**62) for _ in range(h)], np.int64),
-                         "missing": np.array(miss) if miss and rng.random() < 0.5 else miss})
+            sort.append({"values": _layout(rng, np.array([rng.randint(-2**62, 2**62) for _ in range(h)], np.int64)),
+                         "missing": miss})
     hits = {"total": _value(rng, 2), "columns": {"_id": ids, "_score": sc, "sort": sort}}
     if rng.random() < 0.3:
         hits = {"max_score": rng.choice(FLOATS), **hits}
@@ -161,8 +182,11 @@ def _random_reply(rng, rid):
         resp[rng.choice(["aggregations", "timed_out", 7, "é"])] = _value(rng)
     rest = [rng.choice([1, 64, True, None, 2.5])][:rng.randint(0, 1)]
     if rest and rng.random() < 0.5:
-        rest.append(rng.choice([None, 0.0005, 1.23456, 2.5e-4, 1e20]))
-    return ("search", rid, "ok", resp, (rng.choice(["seg", "é", 3]), rng.randint(0, 9)), rng.choice(FLOATS[:13] + [0.0125]), *rest)
+        rest.append(rng.choice([None, 0.0005, 1.23456, 2.5e-4, 1e20, *TIES]))
+    if rng.random() < 0.2:
+        hits["columns"]["_score"] = _layout(rng, sc) if rng.random() < 0.7 else sc.tolist()
+    q = rng.choice(FLOATS[:13] + TIES + [rng.random() * 10 ** rng.randint(-6, 6), 3, True, 2**70])
+    return ("search", rid, "ok", resp, (rng.choice(["seg", "é", 3, 2**70, 1.5]), rng.randint(0, 9)), q, *rest)
 
 
 def test_random_batches():
@@ -179,6 +203,19 @@ def test_random_batches():
                 msgs.append(("call", k * 100 + j, 200, rng.choice([b"", b"{}", bytes(range(256))]),
                              rng.choice(["application/json", "text/plain; charset=é"]), {}))
         _same(msgs)
+
+
+def test_float_text_on_the_platforms_repr_vectors():
+    """Every float of serving/native_front/tests/pyrepr_vectors.txt, written by the Rust JSON writer (an error body)."""
+    import struct
+    fl = [struct.unpack("<d", bytes.fromhex(line.split(" ")[0]))[0]
+          for line in (ROOT / "serving/native_front/tests/pyrepr_vectors.txt").read_text().splitlines() if line]
+    assert len(fl) > 1000
+    for k in range(0, len(fl), 500):
+        _same([("search", 1, "error", 400, {"x": fl[k:k + 500], "k": {str(i): f for i, f in enumerate(fl[k:k + 50])}})])
+    msgs = [("search", i, "ok", _resp(np.array([b"a"], "S1"), np.array([1.0], np.float32), []), ("s", 1), q, 1, q)
+            for i, q in enumerate(fl[:3000] + TIES)]
+    _same(msgs)
 
 
 def test_what_it_does_not_take_raises_and_the_guard_gives_the_python_bytes():
