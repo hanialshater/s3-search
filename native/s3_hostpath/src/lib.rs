@@ -176,19 +176,11 @@ fn parse_fields_entry(f: &str) -> Option<(String, Option<f64>)> {
     let wv = match w {
         None => None,
         Some(s) => {
+            // [0-9]*\.?[0-9]+ (fullmatch): digits with at most one dot, ending in a digit ("2", "1.5", ".5")
             let b = s.as_bytes();
-            let mut i = 0;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < b.len() && b[i] == b'.' {
-                i += 1;
-            }
-            let d = i;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i == d || i != b.len() {
+            let dots = b.iter().filter(|&&c| c == b'.').count();
+            if b.is_empty() || dots > 1 || !b.iter().all(|&c| c.is_ascii_digit() || c == b'.')
+                || !b[b.len() - 1].is_ascii_digit() {
                 return None;
             }
             Some(s.parse::<f64>().ok()?)
