@@ -84,8 +84,9 @@ def test_every_golden4_frame():
     - Rust equals Python on every input;
     - Rust equals the file on every line Python reproduces;
     - Python reproduces all 40 lines and Rust equals the file on all 40. (arch-hp17 and hp18 on the Colab CPU had line
-      33 differ: numpy's vectorised float64-to-float32 cast gave another subnormal there; make_vectors now builds the
-      float32 scores by exact scalar casts, the steward's ruling, lab 706a7b9.) A differing line is printed.
+      33 differ, and still did with exact casts in plat-r9: golden4's float pool used pow, log and exp, whose last bit
+      differs between macOS and glibc; make_vectors now draws golden4 from floats_exact, exact operations only, with
+      the float32 scores by exact scalar casts: the steward's ruling, lab 706a7b9.) A differing line is printed.
     """
     import subprocess
     import sys

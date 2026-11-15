@@ -12,7 +12,8 @@ golden3 and golden4 are written from responses passed through serving.encode.flu
 does before any writer (the steward's ruling, lab f134183): subnormal floats are signed zero in the frames and bodies.
 The inputs themselves are drawn with float arithmetic, so the generator runs only in a process with flush-to-zero and
 denormals-are-zero off (it refuses otherwise) and records where it ran in golden.env.json. The files before the flush
-are kept as golden3.pre-flush.txt and golden4.pre-flush.txt.
+are kept as golden3.pre-flush.txt and golden4.pre-flush.txt; golden4 before its libm-free pool (floats_exact) as
+golden4.pre-exact.txt.
 Deterministic (seeded); regenerate only when the protocol changes."""
 import json
 import random
@@ -50,6 +51,37 @@ def floats(rng):
     for _ in range(4000):                                    # float32 scores widened, as the engine sends them
         out.append(float(np.float32(rng.gammavariate(2, 2) * 10 ** rng.uniform(-6, 3))))
     for _ in range(2000):                                    # integral values
+        out.append(float(rng.randint(-10**17, 10**17)))
+    return out
+
+
+def floats_exact(rng):
+    """golden4's float pool, made with exact operations only (no libm): the same specials, powers of ten parsed from
+    text and their neighbours, random bit patterns, random magnitudes as a uniform times a power of two, float32-sized
+    scores the same way, explicit subnormal bit patterns of both widths, and integral values. ``floats`` uses ``**`` and
+    ``gammavariate`` (pow, log, exp), whose last bit differs between macOS and glibc: golden4 line 33 did not reproduce
+    on the Colab CPU (arch-hp17, hp18, plat-r9) even with exact casts (the steward, lab 706a7b9)."""
+    out = [0.0, -0.0, float("nan"), float("inf"), float("-inf"), 5e-324, -5e-324, 2.2250738585072014e-308,
+           2.225073858507201e-308, 1.7976931348623157e308, -1.7976931348623157e308, 1.0, -1.0, 0.5, 0.1, 0.2, 0.3]
+    for e in range(-330, 310, 3):                            # powers of ten (correctly rounded parses) and neighbours
+        for m in (1.0, 9.999999999999999, 1.5, 3.0):
+            try:
+                x = float(f"{m}e{e}")
+            except OverflowError:
+                continue
+            out += [x, -x, float(np.nextafter(x, np.inf)), float(np.nextafter(x, -np.inf))]
+    for _ in range(3000):                                    # random bit patterns (finite)
+        x = struct.unpack("<d", struct.pack("<Q", rng.getrandbits(64)))[0]
+        if x == x and abs(x) != float("inf"):
+            out.append(x)
+    for _ in range(3000):                                    # random magnitudes: a uniform times a power of two (exact)
+        out.append(rng.uniform(-1, 1) * 2.0 ** rng.randint(-100, 100))
+    for _ in range(3000):                                    # float32-sized scores, positive
+        out.append(rng.random() * 2.0 ** rng.randint(-20, 10))
+    for _ in range(300):                                     # subnormals by bits: float32-range and float64
+        out.append(struct.unpack("<f", struct.pack("<I", rng.getrandbits(23) | (rng.getrandbits(1) << 31)))[0])
+        out.append(struct.unpack("<d", struct.pack("<Q", rng.getrandbits(52) | (rng.getrandbits(1) << 63)))[0])
+    for _ in range(1000):                                    # integral values
         out.append(float(rng.randint(-10**17, 10**17)))
     return out
 
@@ -123,7 +155,7 @@ def golden4(rng):
     from serving import binproto
     from serving.encode import encode, flush_response
     strs = strings(random.Random(17))[1:200]
-    fl = floats(random.Random(18))
+    fl = floats_exact(random.Random(18))
     rows = []
     for k in range(40):
         msgs, want = [], []
