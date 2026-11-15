@@ -75,8 +75,9 @@ if triton is not None:
     @triton.jit
     def _fused_kernel(docs_ptr, tf_ptr, norm_ptr, row_idf_ptr, row_start_ptr, row_len_ptr, q_row_lo_ptr, q_row_hi_ptr,
                       msm_ptr, boost_ptr, live_ptr, w_ptr, codes_ptr, fc_off_ptr, fc_nv_ptr,
-                      acc_ptr, cnt_ptr, out_ptr, total_ptr, fc_ptr, N, c1, c2,
-                      F: tl.constexpr, NFACET: tl.constexpr, TILE: tl.constexpr, BLOCK: tl.constexpr):
+                      acc_ptr, cnt_ptr, out_ptr, total_ptr, fc_ptr, N, c1, c2, imp_ptr,
+                      F: tl.constexpr, NFACET: tl.constexpr, TILE: tl.constexpr, BLOCK: tl.constexpr,
+                      IMPACT: tl.constexpr):
         g = tl.program_id(0)
         tile = tl.program_id(1)
         d0 = tile * TILE
@@ -116,17 +117,21 @@ if triton is not None:
                 e = e0 + lanes
                 ok = e < e_end
                 d = tl.load(docs_ptr + e, mask=ok, other=0)
-                ptf = tl.zeros([BLOCK], tl.float32)
-                for f in tl.static_range(F):
-                    tfv = tl.load(tf_ptr + e.to(tl.int64) * F + f, mask=ok, other=0).to(tl.float32)
-                    norm = tl.load(norm_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)   # S6-28: per index
-                    x = tl.math.div_rn(tl.load(w_ptr + f) * tfv, norm)
-                    if f == 0:
-                        ptf = x
-                    else:
-                        ptf = ptf + x
-                imp = tl.math.div_rn(idf * ptf * c1, c2 + ptf)
-                h = (ptf > 0).to(tl.int32)
+                if IMPACT:                                  # S6-33: the posting's weight, computed once per w
+                    imp = tl.load(imp_ptr + e, mask=ok, other=0.0)
+                    h = (imp > 0).to(tl.int32)              # imp > 0 exactly where ptf > 0 (checked at build)
+                else:
+                    ptf = tl.zeros([BLOCK], tl.float32)
+                    for f in tl.static_range(F):
+                        tfv = tl.load(tf_ptr + e.to(tl.int64) * F + f, mask=ok, other=0).to(tl.float32)
+                        norm = tl.load(norm_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)   # S6-28: per index
+                        x = tl.math.div_rn(tl.load(w_ptr + f) * tfv, norm)
+                        if f == 0:
+                            ptf = x
+                        else:
+                            ptf = ptf + x
+                    imp = tl.math.div_rn(idf * ptf * c1, c2 + ptf)
+                    h = (ptf > 0).to(tl.int32)
                 off = base + d
                 cur = tl.load(acc_ptr + off, mask=ok, other=0.0)
                 tl.store(acc_ptr + off, cur + imp.to(tl.float64), mask=ok)
@@ -146,6 +151,62 @@ if triton is not None:
             code = tl.load(codes_ptr + j * N + dd, mask=inb_t, other=0)
             fo = tl.load(fc_off_ptr + j) + g.to(tl.int64) * tl.load(fc_nv_ptr + j)
             tl.atomic_add(fc_ptr + fo + code, tl.full([TILE], 1, tl.int32), mask=match)
+
+
+if triton is not None:
+    @triton.jit
+    def _impact_kernel(docs_ptr, tf_ptr, norm_ptr, term_ptr, idf_ptr, w_ptr, imp_ptr, bad_ptr, P, c1, c2,
+                       F: tl.constexpr, BLOCK: tl.constexpr):
+        """Every posting's weight, with the fused kernel's own operations in its order; ``bad`` counts postings whose
+        weight is not > 0 where ptf > 0 (or the reverse), where the impact path's hit test would differ."""
+        e = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        ok = e < P
+        d = tl.load(docs_ptr + e, mask=ok, other=0)
+        t = tl.load(term_ptr + e, mask=ok, other=0)
+        idf = tl.load(idf_ptr + t, mask=ok, other=0.0)
+        ptf = tl.zeros([BLOCK], tl.float32)
+        for f in tl.static_range(F):
+            tfv = tl.load(tf_ptr + e.to(tl.int64) * F + f, mask=ok, other=0).to(tl.float32)
+            norm = tl.load(norm_ptr + d.to(tl.int64) * F + f, mask=ok, other=1.0)
+            x = tl.math.div_rn(tl.load(w_ptr + f) * tfv, norm)
+            if f == 0:
+                ptf = x
+            else:
+                ptf = ptf + x
+        imp = tl.math.div_rn(idf * ptf * c1, c2 + ptf)
+        tl.store(imp_ptr + e, imp, mask=ok)
+        tl.atomic_add(bad_ptr, tl.sum((ok & ((imp > 0) != (ptf > 0))).to(tl.int32), axis=0))
+
+
+def impacts(b, part, w, bb, k1, idf):
+    """S6-33: the per-posting weights for one field-weight vector ``w`` (and b, k1, idf), float32 [P], kept on the part.
+    They are computed by ``_impact_kernel`` with the fused kernel's exact operations, so the fused kernel can load
+    them instead of recomputing: the same bits. None when the hit test would differ for some posting
+    (``imp > 0`` against ``ptf > 0``), or when ``S3_TRITON_FUSED_IMPACTS`` is not "1" (off by default). The cost is
+    4 bytes per posting per cached w."""
+    import torch
+    if os.environ.get("S3_TRITON_FUSED_IMPACTS", "0") != "1":
+        return None
+    docs32, norm = lean_inputs(b, part, bb)
+    cache = part.__dict__.setdefault("_fused_impacts", {})
+    key = (np.asarray(w, np.float32).tobytes(), np.asarray(bb, np.float32).tobytes(), float(k1), idf.data_ptr(),
+           part.doc_ids.data_ptr(), norm.data_ptr())
+    if key in cache:
+        return cache[key]
+    if "terms" not in cache or cache["terms"][0] != part.doc_ids.data_ptr():
+        cache.clear()
+        t = torch.as_tensor(np.asarray(part.term_of_posting, np.int32), device=b.device)
+        cache["terms"] = (part.doc_ids.data_ptr(), t)
+    P = int(part.doc_ids.shape[0])
+    imp = torch.empty(P, dtype=torch.float32, device=b.device)
+    bad = torch.zeros(1, dtype=torch.int32, device=b.device)
+    w32 = b.asarray(np.asarray(w, np.float32), "float32")
+    BLK = 1024
+    _impact_kernel[(triton.cdiv(P, BLK),)](docs32, part.tf.contiguous(), norm, cache["terms"][1], idf.contiguous(), w32,
+                                           imp, bad, P, float(np.float32(k1 + 1.0)), float(np.float32(k1)),
+                                           F=int(part.tf.shape[1]), BLOCK=BLK, enable_fp_fusion=False)
+    cache[key] = imp if int(bad.item()) == 0 else None
+    return cache[key]
 
 
 def lean_inputs(b, part, bb):
@@ -226,13 +287,15 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     c2 = float(np.float32(k1))
     tile, block, warps = _shape()
     grid = (Q, triton.cdiv(N, tile))
+    imp = impacts(b, part, w, bb, k1, idf)
     _fused_kernel[grid](docs32, part.tf.contiguous(), norm, row_idf,
                         t64(row_start or [0]), t64(row_len or [0]), t64(q_lo), t64(q_hi),
                         torch.tensor([int(m) for m in msm], dtype=torch.int32, device=dev),
                         torch.tensor([float(x) for x in boost], dtype=torch.float32, device=dev),
                         live.contiguous().view(torch.uint8), w32, codes,
                         t64(offs or [0]), t64(sizes or [1]), acc, cnt, out, total, fc, N, c1, c2,
-                        F=F, NFACET=nf, TILE=tile, BLOCK=block, num_warps=warps, enable_fp_fusion=False)
+                        imp if imp is not None else out, F=F, NFACET=nf, TILE=tile, BLOCK=block,
+                        IMPACT=imp is not None, num_warps=warps, enable_fp_fusion=False)
     facets = [fc[o:o + Q * s].view(Q, s).to(torch.int64) for o, s in zip(offs, sizes)]
     return out.view(Q, N), total.to(torch.int64), facets
 
