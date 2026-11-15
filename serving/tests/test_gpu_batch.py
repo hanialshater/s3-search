@@ -1,6 +1,5 @@
 """The GPU process's batch window (S6-22s, after plat-m20): S3_SERVING_GPU_BATCH_WAIT_MS and S3_SERVING_GPU_MAX_BATCH.
 The default (wait 0, max 64) takes exactly what is queued, as before."""
-import queue
 import threading
 import time
 
@@ -11,7 +10,7 @@ from serving import gpu
 
 def _server(mb, wait_s):
     srv = object.__new__(gpu.GpuServer)
-    srv.q = queue.Queue()
+    srv.q = gpu._BatchQueue()
     srv.batch_settings = (mb, wait_s)
     return srv
 
@@ -64,3 +63,29 @@ def test_a_wait_stops_when_the_batch_is_full():
 
 def test_an_empty_queue_returns_nothing():
     assert _server(64, 0.0)._collect() == []
+
+
+def test_the_batch_queue_under_concurrent_readers():
+    """R4a: four readers putting 2,000 items each while the batch loop takes batches: every item exactly once, each
+    reader's items in its own order, no batch over the cap."""
+    srv = _server(64, 0.0)
+    done = threading.Event()
+
+    def reader(r):
+        for i in range(2000):
+            srv.q.put((r, i))
+    ts = [threading.Thread(target=reader, args=(r,)) for r in range(4)]
+    for t in ts:
+        t.start()
+    got = []
+    while len(got) < 8000:
+        b = srv._collect()
+        assert len(b) <= 64
+        got += b
+    for t in ts:
+        t.join()
+    done.set()
+    assert sorted(got) == sorted((r, i) for r in range(4) for i in range(2000))
+    for r in range(4):
+        assert [i for rr, i in got if rr == r] == list(range(2000))
+    assert srv._collect() == []
