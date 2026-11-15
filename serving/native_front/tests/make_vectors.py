@@ -198,6 +198,13 @@ def golden4(rng):
     return rows
 
 
+# Where golden4.txt was checked to reproduce all 40 lines (Python and the Rust writer), recorded by hand after each check.
+GOLDEN4_REPRODUCED_ON = [
+    {"platform": "macOS-26.6.2-x86_64 (the generating host)", "python": "3.11.5", "numpy": "2.4.6", "check": "make_vectors.py, golden4 unchanged on regeneration"},
+    {"platform": "Colab CPU, Linux x86_64 (glibc)", "python": "3.13", "check": "plat-r10 at 640b9a3: engine/tests/test_hostpath_batch4.py 8 passed (all 40 lines, Python and Rust) and the native front's cargo test 5/5"},
+]
+
+
 def main():
     if not _fp_mode_clean():
         sys.exit("make_vectors: flush-to-zero or denormals-are-zero is on in this process (is torch loaded?); run it in a clean one")
@@ -214,7 +221,10 @@ def main():
     env = {"generated_by": "serving/native_front/tests/make_vectors.py", "python": platform.python_version(),
            "numpy": np.__version__, "platform": platform.platform(), "machine": platform.machine(),
            "torch_loaded": "torch" in sys.modules, "fp_mode_clean": bool(_fp_mode_clean()),
-           "note": "golden3 and golden4 come from responses passed through serving.encode.flush_response (lab f134183)"}
+           "note": "golden3 and golden4 come from responses passed through serving.encode.flush_response (lab f134183)",
+           "golden4_inputs": ("floats_exact(random.Random(18)): exact operations only (no pow, log or exp), float32 scores "
+                              "by exact scalar casts (lab 706a7b9)"),
+           "golden4_reproduced_on": GOLDEN4_REPRODUCED_ON}
     (HERE / "golden.env.json").write_text(json.dumps(env, indent=1) + "\n")
     print("written")
 
