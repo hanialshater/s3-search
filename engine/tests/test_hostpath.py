@@ -62,7 +62,8 @@ def test_rust_prepare_equals_the_python_planner(name, rust_analysis):
     served = sorted(p for c in rust["chunks"] for p in c["positions"])
     eligible = sorted(p for c in py["chunks"] for p in c["positions"])
     assert set(served) <= set(eligible), sorted(set(served) - set(eligible))[:10]   # never serves what Python wouldn't
-    assert len(served) >= (0.99 if rust_analysis else 0.5) * len(eligible)          # and serves most of them
+    missed = sorted(set(eligible) - set(served))
+    assert len(served) >= (0.99 if rust_analysis else 0.5) * len(eligible), [payloads[p][:160] for p in missed[:6]]
     sub = [payloads[p] for p in served]                                             # the same requests, both ways
     a, b = hi.prepare(sub), hostpath.prepare_reference(st, sub, words)
     assert a["fallback"] == b["fallback"] == []
