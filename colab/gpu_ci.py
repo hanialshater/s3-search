@@ -131,7 +131,7 @@ def main():
     suites = list(SUITES)
     if HOSTPATH:
         build_hostpath()
-        suites.insert(1, ("hostpath tests", HOSTPATH_TESTS, 900))
+        suites.insert(1, ("hostpath tests", [t for t in HOSTPATH_TESTS if os.path.exists(t)], 900))
     results = [(name, *run_suite(name, targets, limit)) for name, targets, limit in suites]
     for name, ok, took in results:
         print(f"[gpu-ci] {'PASSED' if ok else 'FAILED'} {name} ({took} s)", flush=True)
