@@ -47,6 +47,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from .errors import NotReady, Overloaded, classify, classify_entry
+from .encode import flush_response
 
 log = logging.getLogger("serving.gpu")
 MAX_BATCH = 64
@@ -574,6 +575,7 @@ class GpuServer:
             status, body = classify_entry(resp["error"])
             mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="error")
             return self._reply(it, ("search", it.id, "error", status, body))
+        resp = flush_response(resp)        # the one flush of subnormal floats, before _source and any writer (lab f134183)
         src = it.request.get("_source") if isinstance(it.request, dict) else None   # planned: no _source
         if src not in (None, False):
             from .encode import expand_columns

@@ -150,3 +150,31 @@ def test_batch4_aligns_its_numeric_arrays():
     assert o % 8 == 0 and p[19 + ht * w:o] == b"\x00" * (o - 19 - ht * w)
     sc = np.frombuffer(p, "<f4", ht, o)
     assert sc.tolist() == [1.0]
+
+
+def test_flush_response_subnormals_to_signed_zero_by_bits():
+    """The one flush (lab f134183): subnormal float32 scores and float sort values become signed zero by bits, normal
+    values, zeros, infinities and NaN keep their bits, non-float columns and non-columnar responses are untouched."""
+    import struct
+    from serving.encode import encode, flush_response
+    f32 = lambda bits: struct.unpack("<f", struct.pack("<I", bits))[0]
+    sc = np.array([f32(0x00000001), f32(0x80000001), f32(0x007FFFFF), 1.5, 0.0, -0.0, np.inf, np.nan], np.float32)
+    f8 = np.array([5e-324, -5e-324, 2.2250738585072014e-308, 1e-300, 0.0, -1.0, np.inf, np.nan])
+    i8 = np.arange(8, dtype=np.int64)
+    ids = np.array([b"a%d" % k for k in range(8)], "S2")
+    resp = {"hits": {"total": 8, "columns": {"_id": ids, "_score": sc,
+                                             "sort": [{"values": f8, "missing": None}, {"values": i8, "missing": None}]}}}
+    out = flush_response(resp)
+    s, v = out["hits"]["columns"]["_score"], out["hits"]["columns"]["sort"][0]["values"]
+    assert s.view(np.uint32).tolist()[:6] == [0, 0x80000000, 0, 0x3FC00000, 0, 0x80000000]
+    assert np.isinf(s[6]) and np.isnan(s[7])
+    assert v.view(np.uint64).tolist()[:2] == [0, 0x8000000000000000]
+    assert v[2] == 2.2250738585072014e-308 and v[3] == 1e-300                 # the smallest normal stays
+    assert out["hits"]["columns"]["sort"][1]["values"] is i8
+    assert resp["hits"]["columns"]["_score"] is sc and sc.view(np.uint32)[0] == 1   # the input is not changed
+    body = encode(out).decode()
+    assert '"_score":0.0,' in body and '"_score":-0.0,' in body and "e-45" not in body and "5e-324" not in body
+    clean = {"hits": {"total": 1, "columns": {"_id": ids[:1], "_score": np.array([1.0], np.float32), "sort": []}}}
+    assert flush_response(clean) is clean                                        # nothing subnormal: the same object
+    assert flush_response([clean, {"error": 1}])[1] == {"error": 1}
+    assert flush_response({"x": 1}) == {"x": 1}
