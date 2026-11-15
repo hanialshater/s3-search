@@ -131,6 +131,7 @@ def main():
     suites = list(SUITES)
     if HOSTPATH:
         build_hostpath()
+        sh([sys.executable, "-c", "from referee import loader; loader.fetch()"])   # esci-sample for the oracle tests
         suites.insert(1, ("hostpath tests", [t for t in HOSTPATH_TESTS if os.path.exists(t)], 900))
     results = [(name, *run_suite(name, targets, limit)) for name, targets, limit in suites]
     for name, ok, took in results:
