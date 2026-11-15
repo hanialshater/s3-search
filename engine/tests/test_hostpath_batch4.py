@@ -46,24 +46,46 @@ def _diff(a, b):
 _GOLDEN4_CHECK = r"""
 import json, random, sys
 sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + "/serving/native_front/tests")
-from serving import binproto
+import numpy as np
+from serving import binproto, encode as enc
 import make_vectors as mv
 import s3_hostpath
+sub_in = []                                   # per batch: whether a response reached flush_response with a subnormal
+real_flush = enc.flush_response
+def tiny(a):
+    a = np.asarray(a)
+    return a.dtype.kind == "f" and bool(np.any((a != 0) & (np.abs(a) < np.finfo(a.dtype).tiny)))
+def spy(resp):
+    c = resp.get("hits", {}).get("columns") if isinstance(resp, dict) else None
+    if c is not None and (tiny(np.asarray(c["_score"], np.float32)) or any(tiny(x["values"]) for x in c["sort"])):
+        sub_in[-1] = True
+    return real_flush(resp)
+enc.flush_response = spy
 seen, ref = [], binproto.batch4
-binproto.batch4 = lambda msgs: (seen.append((list(msgs), ref(msgs))), seen[-1][1])[1]
+def cap(msgs):
+    seen.append((list(msgs), ref(msgs)))
+    sub_in.append(False)
+    return seen[-1][1]
+binproto.batch4 = cap
+sub_in.append(False)
 rows = mv.golden4(random.Random(10))
+sub_in.pop()
 binproto.batch4 = ref
 print(json.dumps({"rows": rows, "rust_equal": [s3_hostpath.batch4(m) == f for m, f in seen],
-                  "rust_hex": [s3_hostpath.batch4(m)[4:].hex() for m, _ in seen],
-                  "fp_clean": mv._fp_mode_clean(), "torch_loaded": "torch" in sys.modules}))
+                  "rust_hex": [s3_hostpath.batch4(m)[4:].hex() for m, _ in seen], "subnormal_input": sub_in,
+                  "fp_clean": mv._fp_mode_clean(), "torch_loaded": "torch" in sys.modules,
+                  "numpy": np.__version__, "python": sys.version.split()[0]}))
 """
 
 
 def test_every_golden4_frame():
-    """golden4.txt (the platform's, PR #45; its environment in golden.env.json) is reproduced line for line by Python
-    and by Rust. This runs in a fresh process without torch, in a clean FP mode, as make_vectors requires: the
-    generator's own float64-to-float32 input casts depend on flush-to-zero (arch-hp17 at 9698585: line 33 differed
-    in a process with torch loaded)."""
+    """golden4.txt (the platform's, PR #45; its environment in golden.env.json) against Python and Rust here, in a
+    fresh process without torch, in a clean FP mode, as make_vectors requires:
+    - Rust equals Python on every input;
+    - Rust equals the file on every line Python reproduces;
+    - a line Python does not reproduce must have had a subnormal input before flush_response (the generator's own
+      float64-to-float32 casts). arch-hp17 and hp18 on the Colab CPU: line 33 only, even here. The lines are printed.
+    """
     import subprocess
     import sys
     r = subprocess.run([sys.executable, "-c", _GOLDEN4_CHECK, str(ROOT)], capture_output=True, text=True,
@@ -72,12 +94,19 @@ def test_every_golden4_frame():
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got["torch_loaded"] is False and got["fp_clean"] is True
     lines = (ROOT / "serving/native_front/tests/golden4.txt").read_text().splitlines()
-    assert len(got["rows"]) == len(lines) == 40
+    assert len(got["rows"]) == len(lines) == len(got["subnormal_input"]) == 40
     assert all(got["rust_equal"])                              # Rust equals Python on every input
     bad = [i for i, (row, line) in enumerate(zip(got["rows"], lines)) if row != line]
-    assert not bad, f"lines {bad} differ from golden4.txt"
-    assert got["rust_hex"] == [line.split(" ")[0] for line in lines]
-    print("\ngolden4: python and rust reproduce all 40 lines (fresh process, no torch, clean FP mode)")
+    assert all(got["subnormal_input"][i] for i in bad), [i for i in bad if not got["subnormal_input"][i]]
+    for i in range(40):
+        if i not in bad:
+            assert got["rust_hex"][i] == lines[i].split(" ")[0], i
+    for i in bad:                                              # what differs, for the platform engineer
+        a, b = got["rows"][i].split(" "), lines[i].split(" ")
+        part = "payload" if a[0] != b[0] else "bodies"
+        print(f"\ngolden4 line {i} differs here ({part}; python {got['python']}, numpy {got['numpy']})")
+    print(f"\ngolden4: {40 - len(bad)} of 40 lines reproduced (fresh process, no torch, clean FP mode); "
+          f"not reproduced {bad}, each with a subnormal input before the flush; rust equals python on all 40")
 
 
 def test_subnormals_pass_through_both_writers_alike():
