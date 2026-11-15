@@ -140,18 +140,24 @@ def fused_runs(index, texts):
     res = {}
     variants = [("0", None), ("1", None)]
     if any(a == "--threshold=1" for a in sys.argv[1:]):     # S6-29: the fused path with each top-k threshold
-        variants = [("0", None), ("1", "torch"), ("1", "radix")]
-    impacts = any(a == "--impacts=1" for a in sys.argv[1:])    # S6-33: the fused path without and with impacts
-    if impacts:
-        variants = [("0", None), ("1", "imp0"), ("1", "imp1")]
+        variants = [("0", None, None), ("1", "torch", None), ("1", "radix", None)]
+    elif any(a == "--onepass=1" for a in sys.argv[1:]):     # S6-31: the fused path with each host assembly
+        variants = [("0", None, None), ("1", None, "0"), ("1", None, "1")]
+    elif any(a == "--impacts=1" for a in sys.argv[1:]):     # S6-33: the fused path without and with impacts
+        variants = [("0", None, None), ("1", "imp0", None), ("1", "imp1", None)]
+    else:
+        variants = [(on, None, None) for on, _ in variants]
     for kind, (make, kw) in kinds.items():
-        for on, thr in variants:
+        for on, thr, op in variants:
             os.environ["S3_TRITON_FUSED_LEXICAL"] = on
             if thr in ("imp0", "imp1"):
                 os.environ["S3_TRITON_FUSED_IMPACTS"] = thr[-1]
             elif thr:
                 os.environ["S3_TRITON_TOPK_THRESHOLD"] = thr
-            label = f"{kind}_{'fused' if on == '1' else 'today'}" + (f"_{thr}" if thr else "")
+            if op is not None:
+                os.environ["S3_FUSED_ONEPASS"] = op
+            label = (f"{kind}_{'fused' if on == '1' else 'today'}" + (f"_{thr}" if thr else "")
+                     + ("" if op is None else f"_onepass{op}"))
             res[label] = {"measure": measure(index, make, texts, label, kw)}
             for pb in (32, 64):                            # device time per batch where serving's tail is (S6-29)
                 key = "torch_profile" if pb == 64 else f"torch_profile_{pb}"
