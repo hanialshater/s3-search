@@ -84,10 +84,8 @@ _CTX: list = []
 def _ctx():
     if not _CTX:
         import numpy as np
-        from serving.binproto import flush_columns
         from serving.encode import encode
-        _CTX.append((np.ndarray, np.dtype(np.float32), np.dtype(np.float64), np.asarray, np.dtype(np.int64), encode, round,
-                     flush_columns))
+        _CTX.append((np.ndarray, np.dtype(np.float32), np.dtype(np.float64), np.asarray, np.dtype(np.int64), encode, round))
     return _CTX[0]
 
 

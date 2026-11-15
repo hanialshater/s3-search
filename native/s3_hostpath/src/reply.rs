@@ -2,8 +2,7 @@
 //!
 //! `batch4(msgs, ctx)` returns the same bytes as `binproto.batch4(msgs)`. The platform's golden4 frames and
 //! serving/tests hold it to them. `ctx` holds the Python objects it needs, passed in once by s3_hostpath:
-//! `(numpy.ndarray, dtype float32, dtype float64, numpy.asarray, dtype int64, serving.encode.encode, round,
-//! serving.binproto.flush_columns)`.
+//! `(numpy.ndarray, dtype float32, dtype float64, numpy.asarray, dtype int64, serving.encode.encode, round)`.
 //!
 //! The Python reference spends its time in `json.dumps` (the response shell and the record metas), in `_ids_ok`'s
 //! per-id loop and in many small numpy calls. Here:
@@ -17,8 +16,8 @@
 //! - the ids are checked on their raw bytes, and the arrays are read through the buffer protocol. An array the fast
 //!   path does not take (not C-contiguous, a byte order or format outside it) goes through `tobytes()` and numpy as
 //!   before.
-//! - subnormal float32 scores and float64 sort values become signed zeros (by bits) before anything else, as
-//!   binproto.batch4 does, so a frame does not depend on the process's FP mode (torch may set flush-to-zero).
+//! - no flush here: the GPU process flushes subnormals once, upstream of every writer (serving.encode.flush_response
+//!   in gpu.py's _answer, PR #45, lab f134183), so the writers see none.
 //! Measured on a Colab CPU (arch-hp10, 96a8a2a), before these: about 1 us per Python call made from here. So the
 //! writer avoids them: tuple items, dict lookups with interned keys, and borrowed UTF-8 (no abi3).
 //!
@@ -69,7 +68,6 @@ struct Ctx<'py> {
     i64: Bound<'py, PyAny>,
     encode: Bound<'py, PyAny>,
     round: Bound<'py, PyAny>,
-    flush_columns: Bound<'py, PyAny>,
     int_repr: Bound<'py, PyAny>,
     bool_type: Bound<'py, PyAny>,
 }
@@ -469,27 +467,6 @@ struct Row {
     cols: Vec<Col>,
 }
 
-/// binproto.flush_subnormals on float32 bytes: a subnormal becomes a signed zero (bits), so nothing depends on the
-/// process's FP mode (the steward's ruling, lab 5f5454f).
-fn flush32(b: &mut [u8]) {
-    for c in b.chunks_mut(4) {
-        let u = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        if u & 0x7F80_0000 == 0 && u & 0x007F_FFFF != 0 {
-            c.copy_from_slice(&(u & 0x8000_0000).to_le_bytes());
-        }
-    }
-}
-
-/// The same on float64 bytes.
-fn flush64(b: &mut [u8]) {
-    for c in b.chunks_mut(8) {
-        let u = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
-        if u & 0x7FF0_0000_0000_0000 == 0 && u & 0x000F_FFFF_FFFF_FFFF != 0 {
-            c.copy_from_slice(&(u & 0x8000_0000_0000_0000).to_le_bytes());
-        }
-    }
-}
-
 fn tobytes(a: &Bound<PyAny>) -> PyResult<Vec<u8>> {
     let b = a.call_method0(intern!(a.py(), "tobytes"))?;
     Ok(b.downcast::<PyBytes>()?.as_bytes().to_vec())
@@ -562,8 +539,6 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
     if s32.len() != 4 * h {
         return Err(PyValueError::new_err("scores not 1-D"));
     }
-    let mut s32 = s32;
-    flush32(&mut s32);
     let s64: Vec<f64> = s32.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect();
     let mut cols = Vec::new();
     let sort = c.call_method1(intern!(py, "get"), (intern!(py, "sort").clone(),))?;
@@ -607,9 +582,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
             if let (Some(b), Some((f, isz))) = (vb.as_ref(), vfmt.as_ref()) {
                 if f.as_slice() == b"d" || int_format(f, *isz).is_some() {
                     let vals = if f.as_slice() == b"d" {
-                        let mut v = b.bytes().to_vec();
-                        flush64(&mut v);
-                        v
+                        b.bytes().to_vec()
                     } else {
                         let (size, signed) = int_format(f, *isz).unwrap();
                         ints_to_i64(b.bytes(), size, signed)
@@ -632,8 +605,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
             drop(vb);
             let vdt = v.getattr(intern!(py, "dtype"))?;
             if vdt.eq(&ctx.f64)? {
-                let mut vals = tobytes(&v)?;
-                flush64(&mut vals);
+                let vals = tobytes(&v)?;
                 if vals.len() != 8 * h {
                     return Err(PyValueError::new_err("values not 1-D"));
                 }
@@ -755,8 +727,7 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
         }
     }
     meta.push(b'}');
-    // a whole ok reply: encode() of the response with its subnormals flushed, as binproto.batch4
-    let body = body_bytes(&ctx.encode.call1((ctx.flush_columns.call1((resp,))?,))?)?;
+    let body = body_bytes(&ctx.encode.call1((resp,))?)?;
     Ok(Rec::Whole { id, meta, status: 200, body })
 }
 
@@ -776,7 +747,6 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
         i64: ctx.get_item(4)?,
         encode: ctx.get_item(5)?,
         round: ctx.get_item(6)?,
-        flush_columns: ctx.get_item(7)?,
         int_repr: py.get_type_bound::<PyLong>().getattr("__repr__")?,
         bool_type: py.get_type_bound::<PyBool>().into_any(),
     };

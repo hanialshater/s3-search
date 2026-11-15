@@ -872,16 +872,12 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
         (`S3_HOSTPATH_BATCH4=0` uses the Python writer).
     - Every module exception falls back to Python and is counted. The GPU process logs `hostpath stats` every 2,000
       batches.
-    - **Subnormals (user-visible, S3B3 only):** a kind 4 frame carries a subnormal float32 score or float64 sort value
-      as a signed zero (`binproto.flush_subnormals`, by bit masks, so independent of the process's FP mode; the
-      steward's rulings, labs 5f5454f and f134183). Such a value is returned as `0.0` or `-0.0`, in columns and in
-      whole replies alike. Normal values are unchanged bit for bit, and ranking is unaffected: the flush runs after
-      the top-k, on the returned hits only.
-    - Kind 3 (S3B2) and the Python front's `encode()` do not flush yet. There, a subnormal value is returned as is,
-      subject to the process's FP mode. Flushing once for every reply kind, before floats leave the GPU process, is
-      the proposal under discussion with the platform engineer.
-    - `golden4.txt` was regenerated after the flush. `golden4.pre-flush.txt` keeps the earlier file, and
-      `golden4.env.json` records where it was generated.
+    - **Subnormals (user-visible; PR #45, the steward's ruling, lab f134183):** the GPU process flushes subnormal
+      float32 scores and float64 sort values to signed zero once, before `_source` and any writer
+      (`serving.encode.flush_response` in `gpu.py`'s `_answer`, and in `app.py`'s single-process path; by bit masks,
+      so independent of the process's FP mode). Such a value is returned as `0.0` or `-0.0` on every reply kind and
+      protocol. Normal values are unchanged bit for bit, and ranking is unaffected: the flush runs on the returned
+      hits after the top-k. The writers, `binproto.batch4` and `s3_hostpath.batch4`, do no flushing of their own.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:

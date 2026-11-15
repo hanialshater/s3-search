@@ -63,118 +63,25 @@ def test_every_golden4_frame():
     for (msgs, f), line in zip(seen, lines):
         got = s3_hostpath.batch4(msgs)
         assert got == f, _diff(got, f)                      # the Rust writer equals the Python one on every input
-    # The file (its environment in golden4.env.json) is reproduced here line for line: batch4 flushes subnormals by
-    # bits, so the FP mode (torch may set flush-to-zero) cannot change a frame. A line that is not reproduced must
-    # at least have a subnormal input (the steward's tightening, lab 5f5454f); and there must be none.
+    # golden4.txt (the platform's, PR #45) is written from flushed responses (serving.encode.flush_response), so the
+    # FP mode cannot change it: Python and Rust reproduce every line here (its environment: golden.env.json).
     bad = [i for i, (row, line) in enumerate(zip(rows, lines)) if row != line]
-    assert all(_has_subnormal(seen[i][0]) for i in bad), [i for i in bad if not _has_subnormal(seen[i][0])]
     assert not bad, f"lines {bad} differ from golden4.txt (numpy {np.__version__})"
     for (msgs, f), line in zip(seen, lines):
         assert s3_hostpath.batch4(msgs)[4:].hex() == line.split(" ")[0]
     print(f"\ngolden4: python and rust reproduce all 40 lines here (numpy {np.__version__})")
 
 
-def _has_subnormal(msgs):
-    """Any ok reply of the batch with a subnormal input that reaches the bytes (the steward's terms, lab f134183):
-    - a float32 score;
-    - a float64 sort value;
-    - except a value marked missing in a reply that goes whole, which is written as null whatever its bits. A reply
-      sent as columns writes every value's bits, missing or not."""
-    for m in msgs:
-        if m[0] == "search" and m[2] == "ok" and isinstance(m[3], dict) and "columns" in m[3].get("hits", {}):
-            c = m[3]["hits"]["columns"]
-            as_columns = binproto._batch_columns(m[3]) is not None
-            arrs = [(np.asarray(c["_score"], np.float32), None)]
-            arrs += [(np.asarray(col["values"]), col.get("missing")) for col in c["sort"]
-                     if np.asarray(col["values"]).dtype == np.float64]
-            for a, miss in arrs:
-                with np.errstate(all="ignore"):
-                    sub = (a != 0) & (np.abs(a) < np.finfo(a.dtype).tiny)
-                if miss is not None and not as_columns:
-                    sub &= ~np.asarray(miss, dtype=bool)
-                if sub.any():
-                    return True
-    return False
-
-
-_PRE_FLUSH_CHECK = r"""
-import json, random, sys
-sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + "/serving/native_front/tests")
-import numpy as np
-from serving import binproto
-import make_vectors as mv
-from pathlib import Path
-seen, ref = [], binproto.batch4
-binproto.batch4 = lambda msgs: (seen.append(list(msgs)), ref(msgs))[1]
-mv.golden4(random.Random(10))
-binproto.batch4 = ref
-real_flush, real_cols = binproto.flush_subnormals, binproto.flush_columns
-def old_writer(msgs):                        # the pre-flush writer: batch4 with both flushes as the identity
-    binproto.flush_subnormals, binproto.flush_columns = (lambda a: np.asarray(a)), (lambda r: r)
-    try:
-        return ref(msgs)[4:].hex()
-    finally:
-        binproto.flush_subnormals, binproto.flush_columns = real_flush, real_cols
-def zeroed(msgs):                            # the same input with subnormals set to signed zero
-    return [(m[:3] + (binproto.flush_columns(m[3]),) + m[4:]) if m[0] == "search" and m[2] == "ok" else m for m in msgs]
-out = {"old_raw": [old_writer(m) for m in seen], "old_zeroed": [old_writer(zeroed(m)) for m in seen],
-       "torch_loaded": "torch" in sys.modules}
-print(json.dumps(out))
-"""
-
-
-def test_golden4_regeneration_on_the_stewards_terms():
-    """The steward's ruling (lab f134183) on regenerating golden4 after the flush:
-    - a line changed from golden4.pre-flush.txt has a subnormal input, and an unchanged line has none;
-    - each changed line equals the pre-flush writer's bytes on the same input with subnormals set to signed zero,
-      computed in a process without torch;
-    - in that process the pre-flush writer also reproduces golden4.pre-flush.txt."""
-    import subprocess
-    import sys
-    spec = importlib.util.spec_from_file_location("make_vectors", ROOT / "serving/native_front/tests/make_vectors.py")
-    mv = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mv)
-    seen, ref = [], binproto.batch4
-    binproto.batch4 = lambda msgs: (seen.append(list(msgs)), ref(msgs))[1]
-    try:
-        mv.golden4(random.Random(10))
-    finally:
-        binproto.batch4 = ref
-    old = (ROOT / "serving/native_front/tests/golden4.pre-flush.txt").read_text().splitlines()
-    new = (ROOT / "serving/native_front/tests/golden4.txt").read_text().splitlines()
-    assert len(old) == len(new) == len(seen) == 40
-    changed = [o != n for o, n in zip(old, new)]
-    sub = [_has_subnormal(m) for m in seen]
-    assert changed == sub, [i for i in range(40) if changed[i] != sub[i]]
-    r = subprocess.run([sys.executable, "-c", _PRE_FLUSH_CHECK, str(ROOT)], capture_output=True, text=True, check=True)
-    got = json.loads(r.stdout.strip().splitlines()[-1])
-    assert got["torch_loaded"] is False
-    assert got["old_raw"] == [line.split(" ")[0] for line in old]
-    for i in range(40):
-        if changed[i]:
-            assert got["old_zeroed"][i] == new[i].split(" ")[0], i
-    print(f"\ngolden4: {sum(changed)} of 40 lines changed by the flush, each with a subnormal input; "
-          f"each equals the pre-flush writer on zeroed input (no torch)")
-
-
-def test_subnormals_are_flushed_by_both_writers():
-    """The steward's ruling (lab 5f5454f): subnormal scores and float64 sort values go as signed zeros, by bits."""
+def test_subnormals_pass_through_both_writers_alike():
+    """The writers do not flush (the GPU process does, once, before them: PR #45); given subnormals, Rust writes
+    exactly what Python writes."""
     sub32 = np.array([1e-40, -1e-40, 1.0, 0.0, -0.0, np.float32(1.4e-45)], np.float32)
     sub64 = np.array([5e-324, -2.2e-308, 3.5, 0.0, -0.0, 1e-310])
-    f = binproto.flush_subnormals(sub32)
-    assert f.view(np.uint32).tolist() == [0, 0x80000000, np.float32(1.0).view(np.uint32), 0, 0x80000000, 0]
-    assert binproto.flush_subnormals(sub64).tolist() == [0.0, -0.0, 3.5, 0.0, -0.0, 0.0]
-    assert np.signbit(binproto.flush_subnormals(sub64)).tolist() == [False, True, False, False, True, False]
-    normal = np.array([1.0, 2.5], np.float32)
-    assert binproto.flush_subnormals(normal) is normal                  # no copy when there is nothing to flush
     ids = np.array([b"a", b"b", b"c", b"d", b"e", b"f"], "S1")
-    msgs = [("search", 1, "ok", _resp(ids, sub32, [{"values": sub64, "missing": None},
-                                                    {"values": sub32.astype(np.float64), "missing": None}]), ("s", 1), 0.0, 1)]
-    got = _same(msgs)
-    (rec,) = binproto.split_batch4(got[4:])
-    import re
-    assert re.findall(rb'"_score":([^,]*)', rec[2]) == [b"0.0", b"-0.0", b"1.0", b"0.0", b"-0.0", b"0.0"]
-    assert b"e-324" not in rec[2] and b"e-308" not in rec[2] and b"e-310" not in rec[2]   # float64 subnormals too
+    _same([("search", 1, "ok", _resp(ids, sub32, [{"values": sub64, "missing": None},
+                                                   {"values": sub32.astype(np.float64), "missing": None}]), ("s", 1), 0.0, 1),
+           ("search", 2, "ok", _resp(np.array([b"a\x00b"], "S3"), sub32[:1], [{"values": sub64[:1], "missing": [True]}]),
+            ("s", 1), 0.0, 1)])
 
 
 def _resp(ids, sc, sort, total=None, aggs=False):
