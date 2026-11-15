@@ -582,5 +582,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stem, m)?)?;
     m.add_function(wrap_pyfunction!(token, m)?)?;
     m.add_function(wrap_pyfunction!(reply::batch4, m)?)?;
+    m.add_function(wrap_pyfunction!(reply::batch4_profile, m)?)?;
     Ok(())
 }

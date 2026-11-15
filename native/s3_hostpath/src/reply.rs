@@ -16,11 +16,34 @@
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyList, PyLong, PyString, PyTuple};
 
 const PLACEHOLDER: &str = "\u{0}s3-hits\u{0}";
 const MARKER: &[u8] = b"\"hits\":\"\\u0000s3-hits\\u0000\"";
 const MAX_DEPTH: usize = 512;
+
+// Development timing (batch4_profile): nanoseconds spent per phase, summed over calls.
+// The phases are: meta, columns, shell, frame, and the whole call.
+static PROF: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn lap(i: usize, t: &mut Instant) {
+    let now = Instant::now();
+    PROF[i].fetch_add((now - *t).as_nanos() as u64, Ordering::Relaxed);
+    *t = now;
+}
+
+/// The phase totals in seconds since the last call, as {meta, columns, shell, frame, total}; resets them.
+#[pyfunction]
+pub fn batch4_profile() -> Vec<(String, f64)> {
+    ["meta", "columns", "shell", "frame", "total"]
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.to_string(), PROF[i].swap(0, Ordering::Relaxed) as f64 * 1e-9))
+        .collect()
+}
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("batch4 copies the host's bytes as little-endian");
@@ -362,6 +385,7 @@ fn s_eq(v: &Bound<PyAny>, s: &str) -> PyResult<bool> {
 
 fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec> {
     let py = msg.py();
+    let mut t = Instant::now();
     let n = msg.len()?;
     if n < 6 {
         return Err(PyValueError::new_err("a search reply needs 6 items"));
@@ -394,16 +418,20 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
             dump(ctx, &mut meta, &b, 1)?;
         }
     }
-    if let Some(row) = columns(ctx, &resp)? {
+    lap(0, &mut t);
+    let got = columns(ctx, &resp)?;
+    lap(1, &mut t);
+    if let Some(row) = got {
         let rd = resp.downcast::<PyDict>()?;
         let hits = rd.get_item("hits")?.ok_or_else(|| PyValueError::new_err("hits"))?;
         let mut text = Vec::with_capacity(256);
         shell(ctx, &mut text, rd, hits.downcast::<PyDict>()?)?;
+        lap(2, &mut t);
         let mut count = 0;
         let mut at = 0;
         let mut i = 0;
         while i + MARKER.len() <= text.len() {
-            if &text[i..i + MARKER.len()] == MARKER {
+            if text[i] == b'"' && text[i + 1] == b'h' && &text[i..i + MARKER.len()] == MARKER {
                 count += 1;
                 at = i;
                 i += MARKER.len();
@@ -420,6 +448,7 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
             esc(&mut meta, post);
             meta.push(b'}');
             rows.push(row);
+            lap(0, &mut t);
             return Ok(Rec::Hits { id, meta, row: rows.len() - 1 });
         }
     }
@@ -447,6 +476,7 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
         int_repr: py.get_type_bound::<PyLong>().getattr("__repr__")?,
         bool_type: py.get_type_bound::<PyBool>().into_any(),
     };
+    let t_all = Instant::now();
     let mut recs: Vec<Rec> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     for msg in msgs.iter()? {
@@ -478,6 +508,7 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
             });
         }
     }
+    let mut t = Instant::now();
     let w = rows.iter().map(|r| r.w0).max().unwrap_or(1).max(1);
     if w > u16::MAX as usize {
         return Err(PyValueError::new_err("ids too wide"));
@@ -580,5 +611,8 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
     let mut framed = Vec::with_capacity(out.len() + 4);
     framed.extend_from_slice(&(out.len() as u32).to_le_bytes());
     framed.extend_from_slice(&out);
-    Ok(PyBytes::new_bound(py, &framed))
+    let r = PyBytes::new_bound(py, &framed);
+    lap(3, &mut t);
+    PROF[4].fetch_add((Instant::now() - t_all).as_nanos() as u64, Ordering::Relaxed);
+    Ok(r)
 }
