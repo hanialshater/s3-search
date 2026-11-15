@@ -4,7 +4,7 @@
     colab run --gpu A100 --timeout 1200 colab/fair_bench.py [branch-or-commit] [--qps=250,500,1000,2000,4000] [--k=2000]
         [--duration=60] [--engines=engine,opensearch] [--workers=1] [--columns=1] [--mps=0]
         [--fronts=0 --gpu-processes=1] [--gpu-memory-fraction=0] [--log=/content/serving.log] [--sample-every=97] [--sample-bodies=260,...] [--blocking-sync=0|1]
-        [--server-env=K=V,...] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--warm-rung=1 --warm-duration=S] [--extra-headers=X-S3-Front-Rtt-Ms,...] [--loadgen-bin=PATH --loadgen-sha256=HEX] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
+        [--server-env=K=V,...] [--hostpath=0|1] [--engine-bm25=JSON|FILE] [--engine-request=FILE] [--front-server=stdlib|native] [--gpu-batch-wait-ms=0 --gpu-max-batch=64] [--client=aiohttp|native] [--clients=aiohttp,native,...] [--warm-rung=1 --warm-duration=S] [--extra-headers=X-S3-Front-Rtt-Ms,...] [--loadgen-bin=PATH --loadgen-sha256=HEX] [--ab-dump=FILE --ab-n=1000]   (extra environment for the engine's server, e.g. S3_TRITON_BM25=1,S3_PLAN_CACHE=0)
         [--profile=RATE,...]   (py-spy on GPU process 0 and front 0 for 20 s at these rates)
         --engines=zvec [--zvec-index-fields=f,...] [--zvec-fields=f^w,...] [--zvec-fusion=weighted|rrf] [--zvec-workers=N] [--zvec-query-threads=T]
 
@@ -710,6 +710,31 @@ def zvec_target(ds, server_cpus):
 
 
 
+def build_hostpath() -> dict:
+    """--hostpath=1 (R1/R3c): build native/s3_hostpath on the VM (maturin, Rust stable by rustup when cargo is
+    missing), install the wheel, and serve with S3_HOSTPATH=1. The GPU processes then parse and plan through Rust,
+    answer through search_prepared and, on S3B3 connections (--server-env=S3_SERVING_BINPROTO=3), write kind 4 frames
+    with s3_hostpath.batch4. The serving log prints the guard's counts every 2,000 batches ("hostpath stats")."""
+    import hashlib
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    if not (shutil.which("cargo") or os.path.exists(os.path.join(cargo_bin, "cargo"))):
+        subprocess.run("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable",
+                       shell=True, check=True)
+    os.environ["PATH"] = cargo_bin + os.pathsep + os.environ["PATH"]
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "maturin>=1.5,<2"], check=True)
+    out = "/content/hostpath-wheels"
+    shutil.rmtree(out, ignore_errors=True)
+    subprocess.run([sys.executable, "-m", "maturin", "build", "--release", "-m", "native/s3_hostpath/Cargo.toml",
+                    "-o", out], check=True)
+    whl = os.path.join(out, sorted(os.listdir(out))[-1])
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "--no-deps", whl], check=True)
+    info = {"wheel": os.path.basename(whl), "wheel_sha256": hashlib.sha256(open(whl, "rb").read()).hexdigest(),
+            "cargo_lock_sha256": hashlib.sha256(open("native/s3_hostpath/Cargo.lock", "rb").read()).hexdigest(),
+            "cargo": subprocess.run(["cargo", "--version"], capture_output=True, text=True).stdout.strip()}
+    say(f"engine: s3_hostpath built {info}")
+    return info
+
+
 def build_native_front() -> dict:
     """--front-server=native (S6-22s): build serving/native_front on the VM (Rust stable by rustup when cargo is
     missing) and record the toolchain and the binary's sha256. The fronts' threads: --server-env=
@@ -736,6 +761,7 @@ def engine_target(ds, server_cpus):
     runs). A different --engine-bm25 builds its own index (its own serve dir)."""
     global SERVE_DIR
     native = build_native_front() if opt("front-server", "stdlib") == "native" else None
+    hostpath = build_hostpath() if opt("hostpath", "0") == "1" else None
     spec =opt("engine-bm25", "referee/requests/bm25f-tuned.bm25.json")
     bm25 = json.loads(spec) if spec.strip().startswith("{") else json.loads(Path(spec).read_text())
     if spec != "referee/requests/bm25f-tuned.bm25.json":
@@ -767,13 +793,16 @@ def engine_target(ds, server_cpus):
            "S3_CUDA_BLOCKING_SYNC": opt("blocking-sync", "0"),
            "S3_SERVING_FRONT_SERVER": opt("front-server", "stdlib"),
            **({"S3_NATIVE_FRONT_BIN": native["binary"]} if native else {}),
+           **({"S3_HOSTPATH": "1"} if hostpath else {}),
            **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
     COMPETITOR.setdefault("engine", {})["server_env"] = {      # provenance: what the server ran with (the steward's ask)
         k: v for k, v in env.items() if k.startswith(("S3_SERVING_", "S3_SEARCH_", "S3_TRITON", "S3_PLAN_CACHE",
-                                                      "S3_CUDA_"))}
+                                                      "S3_CUDA_", "S3_HOSTPATH"))}
     COMPETITOR["engine"]["server_env_arg"] = opt("server-env", "")
     if native:
         COMPETITOR["engine"]["native_front"] = native
+    if hostpath:
+        COMPETITOR["engine"]["hostpath"] = hostpath
     if MPS:                                                  # CUDA MPS: the workers' kernels share the GPU at once
         import atexit
         subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)

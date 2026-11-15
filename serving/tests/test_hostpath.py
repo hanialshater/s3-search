@@ -197,3 +197,29 @@ def test_run_answers_planned_positions_by_search_prepared_and_the_rest_by_search
     else:                                                             # search_prepared raised: search_batch, counted
         assert got[100] == {"n": 1} and got[103] == {"n": 4}
         assert index.calls == [("prepared", 2), ("batch", 3)] and gpu._HOSTPATH[0].fallbacks == 1
+
+
+def test_batch4_through_the_guard():
+    """R3c: the guard's kind 4 writer is the module's when it has one, binproto.batch4 when it has none or raises."""
+    from serving import binproto
+    from serving.hostpath import PyStub, _Guarded
+    msgs = [("call", 1, 200, b"{}", "application/json", {}),
+            ("search", 2, "error", 400, {"error": {"type": "invalid_request", "path": "", "reason": "x"}})]
+    want = binproto.batch4(msgs)
+    assert _Guarded(PyStub(), "stub").batch4(msgs) == want
+
+    class NoWriter:
+        pass
+
+    class Raises:
+        def batch4(self, msgs):
+            raise RuntimeError("boom")
+
+    class Own:
+        def batch4(self, msgs):
+            return b"own"
+    assert _Guarded(NoWriter(), "x").batch4(msgs) == want
+    g = _Guarded(Raises(), "x")
+    assert g.batch4(msgs) == want and g.fallbacks == 1
+    assert g.summary() == {"module": "x", "fallbacks": 1, "batch4_frames": 1, "batch4_fallbacks": 1, "stats": None}
+    assert _Guarded(Own(), "x").batch4(msgs) == b"own"

@@ -193,7 +193,9 @@ class _BinConn(_Conn):
             try:
                 if self.proto == 3:                             # S3B3: the batch's replies as one kind 4 frame
                     from . import binproto
-                    data = binproto.batch4(msg[1] if msg[0] == "multi" else [msg])
+                    msgs = msg[1] if msg[0] == "multi" else [msg]
+                    hp = _hostpath()                            # R3c: s3_hostpath's Rust writer, guarded
+                    data = hp.batch4(msgs) if hp is not None else binproto.batch4(msgs)
                     with self.lock:
                         self.sock.sendall(data)
                     _account("writer")
@@ -464,6 +466,9 @@ class GpuServer:
                         refused[id(it)] = (it, classify(exc))
         for it, (st, body) in refused.values():
             self._reply(it, ("search", it.id, "error", st, body))
+        self.hp_batches = getattr(self, "hp_batches", 0) + 1
+        if self.hp_batches % 2000 == 1 and hasattr(hp, "summary"):  # the serving log shows the Rust line's coverage
+            log.warning("hostpath stats after %d batches: %s", self.hp_batches, json.dumps(hp.summary()))
         return [it for it in batch if id(it) not in refused]
 
     def _fail(self, items: list[_Item], exc: BaseException) -> None:

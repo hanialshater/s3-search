@@ -10,9 +10,13 @@ publish = false
 name = "_native"
 crate-type = ["cdylib"]
 
-# Licences of the dependencies (checked 2026-11-14): pyo3 MIT OR Apache-2.0; serde_json MIT OR Apache-2.0.
+# Licences of the dependencies (checked 2026-11-14; ryu 2026-11-15): pyo3 MIT OR Apache-2.0; serde_json MIT OR Apache-2.0;
+# ryu Apache-2.0 OR BSL-1.0 (the native front's float digits, for push_pyrepr).
+# No abi3 (R3c): the full API borrows a str's UTF-8 and reads numpy arrays through the buffer protocol. The wheel is
+# built on the VM for its own Python.
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+ryu = "1.0"
 serde_json = { version = "1", features = ["preserve_order"] }   # dict order, as json.loads
 
 [profile.release]

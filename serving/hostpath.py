@@ -124,12 +124,22 @@ class PyStub:
     def reply(self, msgs) -> bytes:
         return b"".join(reply_frame(m) for m in msgs)
 
+    def batch4(self, msgs) -> bytes:
+        return binproto.batch4(msgs)
+
 
 class _Guarded:
     """Wraps a module: its exceptions fall back to Python and are counted."""
 
     def __init__(self, impl, name):
         self.impl, self.name, self.fallbacks, self._py = impl, name, 0, PyStub()
+        self.batch4_fallbacks, self.batch4_frames = 0, 0
+
+    def summary(self) -> dict:
+        """What the serving log prints (S6-22s/R3c): the guard's fallbacks and the module's own counts."""
+        st = getattr(self.impl, "stats", None)
+        return {"module": self.name, "fallbacks": self.fallbacks, "batch4_frames": self.batch4_frames,
+                "batch4_fallbacks": self.batch4_fallbacks, "stats": dict(st) if isinstance(st, dict) else None}
 
     def prepare(self, payloads, index=None, out=None) -> Prepared:
         try:
@@ -144,6 +154,19 @@ class _Guarded:
         except Exception:  # noqa: BLE001
             self.fallbacks += 1
             return self._py.reply(msgs)
+
+    def batch4(self, msgs) -> bytes:
+        """An S3B3 connection's kind 4 frame (R3c): the module's writer when it has one, else binproto.batch4."""
+        self.batch4_frames += 1
+        fn = getattr(self.impl, "batch4", None)
+        if fn is None:
+            return binproto.batch4(msgs)
+        try:
+            return fn(msgs)
+        except Exception:  # noqa: BLE001
+            self.fallbacks += 1
+            self.batch4_fallbacks += 1
+            return binproto.batch4(msgs)
 
 
 def search_prepared_stub(index, prep: Prepared, **kw) -> list:

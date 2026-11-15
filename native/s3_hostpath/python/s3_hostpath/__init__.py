@@ -10,16 +10,19 @@
     classifies empty or non-JSON bodies itself).
   - The HostIndex for an index state is built in a background thread the first time it is asked for. Until it is
     ready, every position falls back.
-  - ``reply`` writes the frames with the Python encoder for now. A Rust reply, held to the golden frames, comes after
-    the prepare side is measured.
+  - ``reply`` writes the kind 2 and 3 frames with the Python encoder.
+- ``batch4(msgs)`` (R3c) writes an S3B3 connection's kind 4 frame for one batch's replies in Rust: the same bytes as
+  ``serving.binproto.batch4``, held to the platform's golden4 frames. ``S3_HOSTPATH_BATCH4=0`` uses the Python writer.
 """
 from __future__ import annotations
 
+import os
 import threading
 
 from ._native import HostIndex, analyze, stem, token, words_of
+from ._native import batch4 as _batch4
 
-__all__ = ["HostIndex", "analyze", "prepare", "reply", "stats", "stem", "token", "words_of"]
+__all__ = ["HostIndex", "analyze", "batch4", "prepare", "reply", "stats", "stem", "token", "words_of"]
 
 _lock = threading.Lock()
 _built: dict = {}            # id(IndexState) -> (state, HostIndex), the state kept so its id is not reused
@@ -73,3 +76,22 @@ def prepare(payloads, index, out=None):
 def reply(msgs) -> bytes:
     from serving.hostpath import reply_frame
     return b"".join(reply_frame(m) for m in msgs)
+
+
+_CTX: list = []
+
+
+def _ctx():
+    if not _CTX:
+        import numpy as np
+        from serving.encode import encode
+        _CTX.append((np.ndarray, np.dtype(np.float32), np.dtype(np.float64), np.asarray, np.dtype(np.int64), encode, round))
+    return _CTX[0]
+
+
+def batch4(msgs) -> bytes:
+    """``serving.binproto.batch4(msgs)``'s bytes, written in Rust (``S3_HOSTPATH_BATCH4=0``: the Python writer)."""
+    if os.environ.get("S3_HOSTPATH_BATCH4", "1") == "0":
+        from serving import binproto
+        return binproto.batch4(msgs)
+    return _batch4(list(msgs), _ctx())
