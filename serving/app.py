@@ -187,6 +187,7 @@ class App:
             mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="error")
             raise
         mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
+        resp = encode_mod.flush_response(resp)            # subnormals as signed zero, before _source (lab f134183)
         if src not in (None, False):
             resp = encode_mod.expand_columns(resp)        # a new dict: the cached response is not changed
             mi.attach_source(resp, src)
@@ -203,6 +204,7 @@ class App:
             mi.metrics.inc("s3_search_requests_total", len(requests), index=mi.name, outcome="error")
             raise
         mi.metrics.inc("s3_search_requests_total", len(requests), index=mi.name, outcome="ok")
+        out = encode_mod.flush_response(out)              # subnormals as signed zero, before _source (lab f134183)
         for i, r in enumerate(requests):
             if r.get("_source") not in (None, False):
                 out[i] = encode_mod.expand_columns(out[i])

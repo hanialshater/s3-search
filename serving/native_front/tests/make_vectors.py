@@ -7,6 +7,12 @@
 - escape_vectors.txt: ``hex(utf8) hex(json)`` per line, json being ``encode_basestring_ascii`` of the decoded string:
   quotes, backslashes, every control character, 0x7F, the BMP, astral characters, interior NULs.
 - golden3.txt: ``hex(kind 3 frame payload) hex(body)`` per line: whole replies, body being serving.encode.encode.
+- golden4.txt: kind 4 frames (S3B3) and their bodies.
+golden3 and golden4 are written from responses passed through serving.encode.flush_response first, as the GPU process
+does before any writer (the steward's ruling, lab f134183): subnormal floats are signed zero in the frames and bodies.
+The inputs themselves are drawn with float arithmetic, so the generator runs only in a process with flush-to-zero and
+denormals-are-zero off (it refuses otherwise) and records where it ran in golden.env.json. The files before the flush
+are kept as golden3.pre-flush.txt and golden4.pre-flush.txt.
 Deterministic (seeded); regenerate only when the protocol changes."""
 import json
 import random
@@ -61,9 +67,15 @@ def strings(rng):
     return [s for s in out if not s.endswith("\x00")]       # S<w> ids never end in NUL (numpy strips them)
 
 
+def _fp_mode_clean() -> bool:
+    """Whether subnormals survive a float32 widening and a multiply here (no flush-to-zero, no denormals-are-zero)."""
+    b = np.frombuffer(struct.pack("<I", 1), np.float32)
+    return bool(float(b.astype(np.float64)[0]) != 0.0 and (b * np.float32(1.0)).view(np.uint32)[0] == 1)
+
+
 def golden(rng):
     from serving import binproto
-    from serving.encode import encode
+    from serving.encode import encode, flush_response
     rows = []
     strs = strings(random.Random(7))[1:200]
     fl = floats(random.Random(8))
@@ -84,24 +96,18 @@ def golden(rng):
         resp = {"took_ms": {"parse": 0.1}, "hits": {"total": h + k, "columns": {"_id": idarr, "_score": sc, "sort": sort}}}
         if k % 5 == 0:
             resp["aggregations"] = {"c": {"buckets": [{"key": "a\"b", "doc_count": 3}]}}
+        resp = flush_response(resp)
         f = binproto.columnar3(k, resp, {"version": "seg:1", "queue_ms": 0.5, "batch": 3})
         assert f is not None and f[4] == 3
         rows.append(f"{f[4:].hex()} {encode(resp).hex()}")
     return rows
 
 
-def _flushed(resp):
-    """The response a kind 4 frame renders: binproto.batch4 flushes subnormal scores and float64 sort values to
-    signed zero (by bits) before writing them."""
-    from serving.binproto import flush_columns
-    return flush_columns(resp)
-
-
 def golden4(rng):
     """Kind 4 frames (S3B3): random batches of replies (columnar with any ids and floats, field sorts with missing
     values, an id with an interior NUL, whole, error, call), each line ``hex(payload) id:status:hex(body) ...``."""
     from serving import binproto
-    from serving.encode import encode
+    from serving.encode import encode, flush_response
     strs = strings(random.Random(17))[1:200]
     fl = floats(random.Random(18))
     rows = []
@@ -131,8 +137,9 @@ def golden4(rng):
                     else:
                         sort.append({"values": np.array([rng.randint(-2**62, 2**62) for _ in range(h)], np.int64), "missing": miss})
                 resp = {"took_ms": {"parse": 0.1}, "hits": {"total": h + j, "columns": {"_id": idarr, "_score": sc, "sort": sort}}}
+                resp = flush_response(resp)
                 msgs.append(("search", rid, "ok", resp, ("seg", 1), 0.5, 3, 1.25))
-                want.append((rid, 200, encode(_flushed(resp))))
+                want.append((rid, 200, encode(resp)))
             elif kind < 0.9:
                 body = {"error": {"type": "invalid_request", "path": "", "reason": "x"}}
                 msgs.append(("search", rid, "error", 400, body))
@@ -146,19 +153,9 @@ def golden4(rng):
     return rows
 
 
-def write_env4():
-    """golden4.env.json: where golden4.txt was generated (the steward's ask, lab 5f5454f)."""
-    import platform
-    env = {"generated_by": "serving/native_front/tests/make_vectors.py (golden4, random.Random(10))",
-           "python": platform.python_version(), "numpy": np.__version__, "platform": platform.platform(),
-           "machine": platform.machine(), "torch_loaded": "torch" in sys.modules,
-           "fp_mode_note": "binproto.batch4 flushes subnormal float32 scores and float64 sort values to signed zero by "
-                           "bits, so the frames do not depend on flush-to-zero; the expected bodies are "
-                           "serving.encode.encode of the flushed response"}
-    (HERE / "golden4.env.json").write_text(json.dumps(env, indent=1) + "\n")
-
-
 def main():
+    if not _fp_mode_clean():
+        sys.exit("make_vectors: flush-to-zero or denormals-are-zero is on in this process (is torch loaded?); run it in a clean one")
     rng = random.Random(22)
     with open(HERE / "pyrepr_vectors.txt", "w") as f:
         for x in floats(rng):
@@ -168,7 +165,12 @@ def main():
             f.write(f"{s.encode('utf-8').hex()} {esc(s).encode().hex()}\n")
     (HERE / "golden3.txt").write_text("\n".join(golden(random.Random(9))) + "\n")
     (HERE / "golden4.txt").write_text("\n".join(golden4(random.Random(10))) + "\n")
-    write_env4()
+    import platform
+    env = {"generated_by": "serving/native_front/tests/make_vectors.py", "python": platform.python_version(),
+           "numpy": np.__version__, "platform": platform.platform(), "machine": platform.machine(),
+           "torch_loaded": "torch" in sys.modules, "fp_mode_clean": bool(_fp_mode_clean()),
+           "note": "golden3 and golden4 come from responses passed through serving.encode.flush_response (lab f134183)"}
+    (HERE / "golden.env.json").write_text(json.dumps(env, indent=1) + "\n")
     print("written")
 
 
