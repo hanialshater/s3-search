@@ -70,3 +70,14 @@ def test_numpy_count_nonzero_is_a_numpy_integer(monkeypatch):
     b = NumpyBackend()
     n = b.count_nonzero(np.array([True, False, True]))
     assert n == 2 and b.astype(n, "float64").reshape(1)[0] == 2.0
+
+
+def test_clamp_min_equals_the_where_it_replaced():
+    """S6-36: clamp_min(idx, 0) gives where(idx >= 0, idx, 0) on every device (the page step's safe indices)."""
+    import numpy as np
+    from engine.backend import available_devices, get_backend
+    x = np.array([[-1, 0, 5, -1, 7], [3, -1, -1, 0, 1]], np.int64)
+    for dev in available_devices():
+        b = get_backend(dev)
+        a = b.asarray(x, "int64")
+        assert np.array_equal(b.to_numpy(b.clamp_min(a, 0)), b.to_numpy(b.where(a >= 0, a, 0))), dev
