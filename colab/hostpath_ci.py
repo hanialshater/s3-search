@@ -6,6 +6,7 @@
 It installs a minimal Rust toolchain (rustup, stable) and maturin on the VM, builds the wheel (release), installs it,
 and runs:
 - engine/tests/test_hostpath.py: the Rust prepare against the Python planner, on toy and esci-sample;
+- engine/tests/test_hostpath_batch4.py (R3c): the Rust kind 4 writer against binproto.batch4 and golden4, and its timing;
 - the referee's fast suite and the engine tests, to show nothing else changed.
 
 It prints the wheel's and Cargo.lock's sha256, and copies Cargo.lock to /content/hostpath-Cargo.lock to be committed.
@@ -71,7 +72,10 @@ def main():
     ok = True
     for name, cmd in [
         ("hostpath oracle", [sys.executable, "-m", "pytest", "-v", "-p", "no:cacheprovider", "-rs",
-                             "engine/tests/test_hostpath.py", "engine/tests/test_hostpath_analysis.py"]),
+                             "engine/tests/test_hostpath.py", "engine/tests/test_hostpath_analysis.py",
+                             "engine/tests/test_hostpath_batch4.py"]),
+        ("batch4 timing", [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider",
+                           "engine/tests/test_hostpath_batch4.py", "-k", "speed"]),
         ("referee fast", [sys.executable, "-m", "referee", "fast"]),
         ("engine tests", [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "engine/tests"]),
     ]:

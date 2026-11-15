@@ -25,6 +25,7 @@
 //! tokeniser or stemmer logic is duplicated: the regex's words are found here, and their tokens are Python's own.
 
 mod analysis;
+mod reply;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -580,5 +581,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(words_of, m)?)?;
     m.add_function(wrap_pyfunction!(stem, m)?)?;
     m.add_function(wrap_pyfunction!(token, m)?)?;
+    m.add_function(wrap_pyfunction!(reply::batch4, m)?)?;
     Ok(())
 }

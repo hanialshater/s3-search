@@ -1,0 +1,223 @@
+"""R3c: s3_hostpath.batch4 (Rust) writes the bytes serving.binproto.batch4 (the platform's Python reference) writes.
+
+The checks:
+- every golden4 frame (serving/native_front/tests/golden4.txt), rebuilt from make_vectors' own messages;
+- the platform's unit case, which includes NaN, Unicode, an interior NUL, a whole reply, an error and a call;
+- random shells, with every float edge, big ints, astral and control characters, non-str keys, tuples and nesting,
+  and random columns, with ids of mixed widths and field sorts with and without missing values;
+- what the writer does not take raises, and the seam's guard then gives the Python bytes.
+
+They skip without the built extension, which only Colab has (colab/hostpath_ci.py)."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+s3_hostpath = pytest.importorskip("s3_hostpath")
+from serving import binproto  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[2]
+BATCH4_ENV = "S3_HOSTPATH_BATCH4"
+
+
+@pytest.fixture(autouse=True)
+def _rust(monkeypatch):
+    monkeypatch.setenv(BATCH4_ENV, "1")
+
+
+def _same(msgs):
+    want = binproto.batch4(msgs)
+    got = s3_hostpath.batch4(msgs)
+    assert got == want, _diff(got, want)
+    return got
+
+
+def _diff(a, b):
+    i = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
+    return f"lengths {len(a)} vs {len(b)}; first difference at byte {i}: {a[i:i + 40]!r} vs {b[i:i + 40]!r}"
+
+
+def test_every_golden4_frame():
+    spec = importlib.util.spec_from_file_location("make_vectors", ROOT / "serving/native_front/tests/make_vectors.py")
+    mv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mv)
+    seen = []
+    ref = binproto.batch4
+
+    def capture(msgs):
+        f = ref(msgs)
+        seen.append((list(msgs), f))
+        return f
+    binproto.batch4 = capture
+    try:
+        rows = mv.golden4(random.Random(10))
+    finally:
+        binproto.batch4 = ref
+    lines = (ROOT / "serving/native_front/tests/golden4.txt").read_text().splitlines()
+    assert rows == lines and len(seen) == len(lines) == 40
+    for (msgs, f), line in zip(seen, lines):
+        got = s3_hostpath.batch4(msgs)
+        assert got == f, _diff(got, f)
+        assert got[4:].hex() == line.split(" ")[0]
+
+
+def _resp(ids, sc, sort, total=None, aggs=False):
+    r = {"took_ms": {"parse": 0.1}, "hits": {"total": total or len(ids), "columns": {"_id": ids, "_score": sc, "sort": sort}}}
+    if aggs:
+        r["aggregations"] = {"c": {"buckets": [{"key": "a\"b", "doc_count": 3}]}}
+    return r
+
+
+def test_the_platforms_unit_case():
+    a_ids = np.array([b"B001", b"B002", b"B003"], "S4")
+    a_sc = np.array([3.5, 2.0, 1.0], np.float32)
+    msgs = [
+        ("search", 11, "ok", _resp(a_ids, a_sc, [{"values": a_sc.astype(np.float64), "missing": None}]), ("seg", 1), 0.5, 4, 2.0),
+        ("search", 12, "ok", _resp(np.array(['x"y'.encode(), "é中".encode()], "S6"), np.array([np.nan, 1e-7], np.float32),
+                                   [{"values": np.array([1.5, -0.0]), "missing": [False, True]},
+                                    {"values": np.array([7, 2**62], np.int64), "missing": None}], aggs=True), ("seg", 1), 0.4, 4),
+        ("search", 13, "ok", _resp(np.array([b"q"], "S1"), np.array([9.0], np.float32),
+                                   [{"values": np.array([3], np.int64), "missing": None},
+                                    {"values": np.array([2.25]), "missing": None}]), ("seg", 1), 0.3, 4),
+        ("search", 14, "ok", _resp(np.array([b"a\x00b", b"c"], "S3"), np.array([1.0, 2.0], np.float32), []), ("seg", 1), 0.2, 4),
+        ("search", 15, "error", 400, {"error": {"type": "invalid_request", "path": "", "reason": "no"}}),
+        ("call", 16, 200, b'{"status":"ok"}', "application/json", {}),
+        ("search", 17, "ok", {"took_ms": 1, "hits": {"total": 0, "hits": []}}, ("seg", 2), 0.1),
+        ("search", 18, "ok", _resp(np.array([], "S1"), np.array([], np.float32), []), ("seg", 2), 0.1, 2, None),
+        ("search", 20, "ok", _resp(np.array([b"u"], "S1"), np.array([1.0], np.float32),
+                                   [{"values": np.array(["k"], object), "missing": None}]), ("seg", 2), 0.1, 2),
+        ("search", 21, "ok", _resp(np.array([b"v"], "S1"), [0.25], [{"values": np.array([5], np.uint32), "missing": [True]}]),
+         ("seg", 2), 1 / 3, 2, 2 / 3),
+    ]
+    _same(msgs)
+    _same(msgs[:1])
+    _same([])
+
+
+FLOATS = [0.0, -0.0, 1.0, -1.0, 0.1, 1e16, 1e15, 9999999999999998.0, 1e-4, 1e-5, 1.5e-7, 5e-324, 1.7976931348623157e308,
+          float("nan"), float("inf"), float("-inf"), 2.5, 123456.789, 1 / 3]
+
+
+def _value(rng, depth=0):
+    k = rng.random()
+    if depth > 3 or k < 0.3:
+        c = rng.randrange(8)
+        if c == 0:
+            return rng.choice(FLOATS + [rng.uniform(-1e6, 1e6), rng.random() * 10 ** rng.randint(-30, 30)])
+        if c == 1:
+            return rng.choice([0, -1, 2**63 - 1, -2**63, 2**64, -2**100, 10**30, rng.randint(-10**6, 10**6)])
+        if c == 2:
+            return rng.choice([True, False, None])
+        return "".join(rng.choice(['a', '"', '\\', '\n', '\t', '\x00', '\x01', '\x1f', '\x7f', 'é', '中', '\U0001f600', ' ',
+                                   '/', ' ', '\x08', '\x0c', '\r'])
+                       for _ in range(rng.randint(0, 8)))
+    if k < 0.6:
+        seq = [_value(rng, depth + 1) for _ in range(rng.randint(0, 4))]
+        return tuple(seq) if rng.random() < 0.3 else seq
+    d = {}
+    for _ in range(rng.randint(0, 4)):
+        key = rng.choice(["k", "hits", "é", "a\"b", 1, 2.5, True, None, -0.0, "columns", "\U0001f600"])
+        d[key] = _value(rng, depth + 1)
+    return d
+
+
+def _random_reply(rng, rid):
+    h = rng.randint(1, 20)
+    w = rng.randint(1, 12)
+    ids = np.array([bytes(rng.choice(b"ab0Z\"\\") for _ in range(rng.randint(1, w))) for _ in range(h)], f"S{w}")
+    with np.errstate(over="ignore"):
+        sc = np.array([rng.choice(FLOATS[:13]) for _ in range(h)], np.float64).astype(np.float32)
+    sort = []
+    for c in rng.sample(["score", "f8", "i8", "f8m", "i8m", "u4"], rng.randint(0, 3)):
+        miss = [rng.random() < 0.3 for _ in range(h)] if c.endswith("m") else None
+        if c == "score":
+            sort.append({"values": sc.astype(np.float64), "missing": None})
+        elif c.startswith("f8"):
+            sort.append({"values": np.array([rng.choice(FLOATS) for _ in range(h)]), "missing": miss})
+        elif c == "u4":
+            sort.append({"values": np.array([rng.randrange(2**32) for _ in range(h)], np.uint32), "missing": None})
+        else:
+            sort.append({"values": np.array([rng.randint(-2**62, 2**62) for _ in range(h)], np.int64),
+                         "missing": np.array(miss) if miss and rng.random() < 0.5 else miss})
+    hits = {"total": _value(rng, 2), "columns": {"_id": ids, "_score": sc, "sort": sort}}
+    if rng.random() < 0.3:
+        hits = {"max_score": rng.choice(FLOATS), **hits}
+    if rng.random() < 0.1:
+        hits["hits"] = "old"
+    resp = {"took_ms": {"parse": rng.random(), "search": rng.choice(FLOATS)}, "hits": hits}
+    for _ in range(rng.randint(0, 3)):
+        resp[rng.choice(["aggregations", "timed_out", 7, "é"])] = _value(rng)
+    rest = [rng.choice([1, 64, True, None, 2.5])][:rng.randint(0, 1)]
+    if rest and rng.random() < 0.5:
+        rest.append(rng.choice([None, 0.0005, 1.23456, 2.5e-4, 1e20]))
+    return ("search", rid, "ok", resp, (rng.choice(["seg", "é", 3]), rng.randint(0, 9)), rng.choice(FLOATS[:13] + [0.0125]), *rest)
+
+
+def test_random_batches():
+    rng = random.Random(31)
+    for k in range(300):
+        msgs = []
+        for j in range(rng.randint(0, 16)):
+            r = rng.random()
+            if r < 0.8:
+                msgs.append(_random_reply(rng, k * 100 + j))
+            elif r < 0.9:
+                msgs.append(("search", k * 100 + j, "error", rng.choice([400, 404, 500]), _value(rng)))
+            else:
+                msgs.append(("call", k * 100 + j, 200, rng.choice([b"", b"{}", bytes(range(256))]),
+                             rng.choice(["application/json", "text/plain; charset=é"]), {}))
+        _same(msgs)
+
+
+def test_what_it_does_not_take_raises_and_the_guard_gives_the_python_bytes():
+    from serving.hostpath import _Guarded
+    ids, sc = np.array([b"a"], "S1"), np.array([1.0], np.float32)
+    lone = ("search", 1, "ok", {"took_ms": 1, "x": "\ud800", "hits": {"total": 1, "columns": {"_id": ids, "_score": sc, "sort": []}}},
+            ("s", 1), 0.0, 1)
+    want = binproto.batch4([lone])
+    with pytest.raises(Exception):
+        s3_hostpath.batch4([lone])
+    g = _Guarded(s3_hostpath, "s3_hostpath")
+    assert g.batch4([lone]) == want and g.fallbacks == 1
+    bad = ("search", 2, "ok", {"took_ms": np.int64(1), "hits": {"total": 1, "columns": {"_id": ids, "_score": sc, "sort": []}}},
+           ("s", 1), 0.0, 1)
+    with pytest.raises(TypeError):
+        binproto.batch4([bad])
+    with pytest.raises(TypeError):
+        s3_hostpath.batch4([bad])
+
+
+def test_the_switch_uses_the_python_writer(monkeypatch):
+    monkeypatch.setenv(BATCH4_ENV, "0")
+    msgs = [("call", 1, 200, b"{}", "application/json", {})]
+    assert s3_hostpath.batch4(msgs) == binproto.batch4(msgs)
+
+
+def test_batch4_speed_is_reported():
+    """Not a pass mark: the per-reply time of each writer on a deep-shaped batch (64 replies, 10 hits), printed."""
+    import time
+    rng = np.random.default_rng(1)
+    msgs = []
+    for i in range(64):
+        ids = np.array([b"B0%08d" % rng.integers(10**8) for _ in range(10)], "S10")
+        s = np.sort(rng.random(10).astype(np.float32))[::-1].copy()
+        r = {"took_ms": {"parse": 0.012, "search": 1.234},
+             "hits": {"total": {"value": 1234, "relation": "eq"}, "max_score": float(s[0]),
+                      "columns": {"_id": ids, "_score": s, "sort": []}},
+             "aggregations": {"brand": {"buckets": [{"key": f"b{k}", "doc_count": 10 - k} for k in range(10)]}}}
+        msgs.append(("search", i, "ok", r, ("seg", 3), 0.512, 64, 2.25))
+    assert s3_hostpath.batch4(msgs) == binproto.batch4(msgs)
+    out = {}
+    for name, fn in [("python", binproto.batch4), ("rust", s3_hostpath.batch4)]:
+        for _ in range(20):
+            fn(msgs)
+        t = time.perf_counter()
+        for _ in range(200):
+            fn(msgs)
+        out[name] = (time.perf_counter() - t) / 200 / 64 * 1e6
+    print(f"\nbatch4 per reply (faceted shape, 64 x 10 hits): python {out['python']:.1f} us, rust {out['rust']:.1f} us")

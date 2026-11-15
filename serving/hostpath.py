@@ -124,6 +124,9 @@ class PyStub:
     def reply(self, msgs) -> bytes:
         return b"".join(reply_frame(m) for m in msgs)
 
+    def batch4(self, msgs) -> bytes:
+        return binproto.batch4(msgs)
+
 
 class _Guarded:
     """Wraps a module: its exceptions fall back to Python and are counted."""
@@ -144,6 +147,17 @@ class _Guarded:
         except Exception:  # noqa: BLE001
             self.fallbacks += 1
             return self._py.reply(msgs)
+
+    def batch4(self, msgs) -> bytes:
+        """An S3B3 connection's kind 4 frame (R3c): the module's writer when it has one, else binproto.batch4."""
+        fn = getattr(self.impl, "batch4", None)
+        if fn is None:
+            return binproto.batch4(msgs)
+        try:
+            return fn(msgs)
+        except Exception:  # noqa: BLE001
+            self.fallbacks += 1
+            return binproto.batch4(msgs)
 
 
 def search_prepared_stub(index, prep: Prepared, **kw) -> list:
