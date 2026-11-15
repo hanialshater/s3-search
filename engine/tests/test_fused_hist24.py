@@ -157,9 +157,9 @@ def test_responses_are_the_same_with_it_on_or_off(ds, impacts, monkeypatch):
     monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
     monkeypatch.setenv("S3_TRITON_FUSED_IMPACTS", impacts)
     monkeypatch.setenv("S3_TRITON_FUSED_LEXICAL", "1")
+    monkeypatch.setattr(TT, "MIN_K", 1)       # toy's rows are narrower than MIN_K: put every window on the Triton top-k
     ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
     reqs = _requests(ds)
-    reqs = reqs + [dict(r, size=TT.MIN_K + 50) for r in reqs[:10]]            # windows on the Triton top-k
     monkeypatch.setenv(TF.HIST24_ENV, "0")
     want = [_strip(r) for r in ix.search_batch(reqs)]
     used = []
