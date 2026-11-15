@@ -465,6 +465,9 @@ class GpuServer:
                         refused[id(it)] = (it, classify(exc))
         for it, (st, body) in refused.values():
             self._reply(it, ("search", it.id, "error", st, body))
+        self.hp_batches = getattr(self, "hp_batches", 0) + 1
+        if self.hp_batches % 2000 == 1 and hasattr(hp, "summary"):  # the serving log shows the Rust line's coverage
+            log.warning("hostpath stats after %d batches: %s", self.hp_batches, json.dumps(hp.summary()))
         return [it for it in batch if id(it) not in refused]
 
     def _fail(self, items: list[_Item], exc: BaseException) -> None:

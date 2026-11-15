@@ -221,4 +221,5 @@ def test_batch4_through_the_guard():
     assert _Guarded(NoWriter(), "x").batch4(msgs) == want
     g = _Guarded(Raises(), "x")
     assert g.batch4(msgs) == want and g.fallbacks == 1
+    assert g.summary() == {"module": "x", "fallbacks": 1, "batch4_frames": 1, "batch4_fallbacks": 1, "stats": None}
     assert _Guarded(Own(), "x").batch4(msgs) == b"own"
