@@ -95,6 +95,22 @@ class Timer:
         return (time.perf_counter() - self.t0) * 1000.0
 
 
+class _LeanAgg:
+    """R3b: a prepared request's terms aggregation, all the fused route reads of one."""
+    __slots__ = ("name", "field", "size", "kind", "sub")
+
+    def __init__(self, name, field, size):
+        self.name, self.field, self.size, self.kind, self.sub = name, field, size, "terms", ()
+
+
+class _LeanPlan:
+    """R3b: a prepared request's from, size and aggregations, all the fused route's pages and facets read of a plan."""
+    __slots__ = ("from_", "size", "aggs")
+
+    def __init__(self, from_, size, aggs):
+        self.from_, self.size, self.aggs = from_, size, aggs
+
+
 class Executor:
     def __init__(self, st, rankers=None):
         self.st, self.b = st, st.b
@@ -1034,6 +1050,40 @@ class Executor:
                 cid = object()
                 for g, k in enumerate(ch):
                     out[k] = (scores, g, totals, fac, cid)
+        return out
+
+    def run_prepared(self, prep, parse_ms: float = 0.0) -> list:
+        """R3b: a prepared batch's responses (hits as columns, ids as bytes) without per-request Plan, Timer or state
+        objects. It runs the fused kernel on the Rust host path's blocks (``_fused_from_prepared``), then the same
+        totals, pages, one-pass columns and facet buckets as ``run``'s fused route (``_fused_totals_and_pages``,
+        ``_fused_terms``), into the same response shape: hits first, then aggregations, then took_ms. Each response
+        equals ``run``'s for that request (took_ms aside)."""
+        t0 = time.perf_counter()
+        plans = [_LeanPlan(int(f), int(sz), tuple(_LeanAgg(n, fld, int(k)) for n, fld, k in aggs))
+                 for chunk in prep["chunks"] for f, sz, aggs in zip(chunk["from"], chunk["size"], chunk["aggs"])]
+        if not plans:
+            return []
+        fused_out = self._fused_from_prepared(prep)
+        t1 = time.perf_counter()
+        states = [{"plan": p, "fused": fused_out[k]} for k, p in enumerate(plans)]
+        totals, pages = {}, {}
+        self._fused_totals_and_pages(states, totals, pages)
+        aggs = defaultdict(dict)
+        if any(p.aggs for p in plans):
+            self._fused_terms(states, aggs)
+        t2 = time.perf_counter()
+        n = len(plans)
+        took = {"parse": round(parse_ms, 3), "retrieve": round((t1 - t0) * 1000.0 / n, 3),
+                "page": round((t2 - t1) * 1000.0 / n, 3)}
+        took["total"] = round(parse_ms + (t2 - t0) * 1000.0 / n, 3)
+        out = []
+        for i, (p, sx) in enumerate(zip(plans, states)):
+            resp = {"hits": {"total": totals[i], "columns": sx["fused_cols"]}}
+            if p.aggs:
+                done = aggs[i]
+                resp["aggregations"] = {a.name: done[a.name] for a in p.aggs}
+            resp["took_ms"] = dict(took)
+            out.append(resp)
         return out
 
     def _fused_from_prepared(self, prep) -> dict:

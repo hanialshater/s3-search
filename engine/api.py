@@ -268,6 +268,11 @@ class Index:
         st = self._st
         if len(st.parts) != 1 or not getattr(st.parts[0], "identity", False) or st.b.accumulate != "float64":
             raise ValueError("search_prepared: one segment with float64 accumulation only")
+        if (hits == "columns" and ids == "bytes" and os.environ.get("S3_HOSTPATH_LEAN", "1") != "0"
+                and os.environ.get("S3_FUSED_ONEPASS", "1") != "0"):
+            assert [p for c in prep["chunks"] for p in c["positions"]] == list(prep.get("eligible", [
+                p for c in prep["chunks"] for p in c["positions"]])), "eligible is the chunks' order"
+            return Executor(st, self.rankers).run_prepared(prep, parse_ms=parse_ms)    # R3b: the lean route
         root = Lexical((), (), 1, "global", 1.0, "query")
         plans, where = [], []
         for chunk in prep["chunks"]:
