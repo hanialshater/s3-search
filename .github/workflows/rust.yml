@@ -66,6 +66,10 @@ jobs:
           python -m pytest -v -rs -p no:cacheprovider -p r4_select -o faulthandler_timeout=120 --durations=10 \
             serving/tests/test_gpu_process.py | tee /tmp/r4-serving.txt
           if grep -q SKIPPED /tmp/r4-serving.txt; then echo "a test was skipped"; exit 1; fi
+      - name: "hostpath batch4: the Rust kind 4 writer and R4d's split against binproto.batch4 and golden4 (no skips)"
+        run: |
+          python -m pytest -v -rs -p no:cacheprovider engine/tests/test_hostpath_batch4.py | tee /tmp/b4.txt
+          if grep -q SKIPPED /tmp/b4.txt; then echo "a test was skipped"; exit 1; fi
       - name: "batch4 phase split (R4c/R4d, development only): deep and faceted replies, batches of 10 and 64"
         env:
           PYTHONPATH: ${{ github.workspace }}

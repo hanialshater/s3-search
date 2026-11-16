@@ -204,7 +204,8 @@ _BIN_CASES = [("0", b"S3B1", "0"), ("stub", b"S3B1", "0"), ("stub-prepared", b"S
               ("0", b"S3B3", "stub"), ("stub-prepared", b"S3B3", "stub"),
               ("0", b"S3B1", "1"), ("stub-prepared", b"S3B1", "1"), ("0", b"S3B2", "1"), ("0", b"S3B3", "1"),
               ("stub-prepared", b"S3B3", "1"), ("1", b"S3B3", "1"), ("1", b"S3B3", "0"),
-              ("0", b"S3B3", "stub:inline"), ("1", b"S3B3", "1:inline")]
+              ("0", b"S3B3", "stub:inline"), ("1", b"S3B3", "1:inline"),
+              ("1", b"S3B3", "1:rust"), ("stub-prepared", b"S3B3", "1:rust"), ("1", b"S3B1", "1:rust")]
 
 
 @pytest.mark.parametrize("hostpath,magic,r4", _BIN_CASES)
@@ -303,7 +304,7 @@ def _native_bin():
 
 @pytest.mark.parametrize("binproto,r4,hostpath", [("1", "0", "0"), ("2", "0", "0"), ("3", "0", "0"), (None, "0", "0"),
                                                 ("3", "stub", "0"), ("2", "stub", "0"), ("3", "1", "1"),
-                                                ("2", "1", "0"), ("1", "1", "0")])
+                                                ("2", "1", "0"), ("1", "1", "0"), ("3", "1:rust", "1")])
 def test_native_front_answers_as_one_process(built, single, binproto, r4, hostpath):
     """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process, on S3B1 (opt-out), on S3B2
     (kind 3: the front escaping the ids and writing the floats; each reply sent alone) and with the variable unset (the
@@ -424,7 +425,8 @@ def _replay(built, env, magic, stream):
                                                ("0", b"S3B1", "stub"), ("0", b"S3B2", "stub"),
                                                ("0", b"S3B3", "1"), ("stub-prepared", b"S3B3", "1"),
                                                ("1", b"S3B3", "1"), ("0", b"S3B1", "1"), ("0", b"S3B2", "1"),
-                                               ("0", b"S3B3", "stub:inline"), ("1", b"S3B3", "1:inline")])
+                                               ("0", b"S3B3", "stub:inline"), ("1", b"S3B3", "1:inline"),
+                                               ("1", b"S3B3", "1:rust"), ("stub-prepared", b"S3B3", "1:rust")])
 def test_r4_replies_are_todays(built, hostpath, magic, r4):
     """R4's gate on the toy index: one frame stream (each request alone, then pipelined windows that batch, bodies that
     are not JSON, calls) to a GPU process with S3_SERVING_R4 off and on. Every reply's id, status, body bytes and meta

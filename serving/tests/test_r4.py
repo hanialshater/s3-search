@@ -413,3 +413,51 @@ def test_encode_mode_from_the_environment(monkeypatch):
     monkeypatch.setenv("S3_SERVING_R4_ENCODE", "both")
     with pytest.raises(ValueError):
         gpu._r4_encode_mode()
+
+
+def _replies(n=6):
+    import numpy as np
+    out = []
+    for i in range(n):
+        h = 1 + 37 * i
+        ids = np.array([b"B0%08d" % (i * 1000 + k) for k in range(h)], dtype="S10")
+        s = np.linspace(9, 1, h).astype(np.float32)
+        resp = {"hits": {"total": 5000 + i, "columns": {"_id": ids, "_score": s, "sort": [
+            {"values": s.astype(np.float64), "missing": None},
+            {"values": np.arange(h, dtype=np.int64), "missing": None}]}},
+            "took_ms": {"parse": 0.3, "total": 1.25}}
+        if i % 3 == 1:
+            resp["aggregations"] = {"brand": {"buckets": [{"key": "Acme", "doc_count": 3}]}}
+        out.append(("search", 100 + i, "ok", resp, ("seg-1-abc", 2), 0.5 + i, n, 2.25, 0.0, None))
+    out.append(("search", 200, "error", 400, {"error": {"type": "invalid_request", "reason": "x"}}))
+    out.append(("call", 201, 200, b"{}", "application/json", {}))
+    return out
+
+
+def test_send_batch4_writes_batch4s_bytes(make):
+    """R4d: send_batch4's frame (the Rust Loop: collected under the GIL, laid out by its writer) is binproto.batch4's,
+    byte for byte; a gone connection gets False; what batch4 refuses raises before anything is queued."""
+    from serving import binproto
+    lp = make()
+    ctx = None
+    if not isinstance(lp, r4.PyLoop):
+        import s3_hostpath
+        ctx = s3_hostpath._ctx()
+    front = _conn(lp, 1)
+    batches = [_replies(6), _replies(1), _replies(12)[:3]]
+    want = b"".join(binproto.batch4(m) for m in batches)
+    for m in batches:
+        assert lp.send_batch4(1, m, ctx) is True
+    bad = ("search", 9, "ok", {"took_ms": 1, "x": "\ud800", "hits": {"total": 1, "columns": {
+        "_id": _replies(1)[0][3]["hits"]["columns"]["_id"], "_score": _replies(1)[0][3]["hits"]["columns"]["_score"],
+        "sort": []}}}, ("s", 1), 0.0, 1)
+    if ctx is not None:                                          # the Rust writer refuses a lone surrogate
+        with pytest.raises(Exception):
+            lp.send_batch4(1, [bad], ctx)
+    front.settimeout(5)
+    got = b""
+    while len(got) < len(want):
+        got += front.recv(1 << 16)
+    assert got == want
+    assert lp.send_batch4(77, batches[0], ctx) is False
+    front.close()

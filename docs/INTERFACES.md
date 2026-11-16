@@ -898,6 +898,12 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
       `S3_SERVING_R4_ENCODE=inline` encodes in the batch thread at the batch's end (R4 as first built; plat-m40 found
       that thread then at about 98% of a core and p99 1.3 to 1.7 times worse). `r4-<j>.json` records the mode and the
       encoder's counts (`encoded`, `encode_queue_max`); the 5 s log's thread CPU has an `encoder` share.
+    - **R4d (S6-43, `S3_SERVING_R4_ENCODE=rust`, opt-in):** the encoder thread as R4c, and an S3B3 connection's kind 4
+      frame split in two. `Loop.send_batch4` reads the replies under the GIL (each record's meta, the hit columns copied
+      out of their buffers, the response shell; every limit of the layout checked), and the Loop's writer thread lays
+      the frame out without the GIL. The bytes are `s3_hostpath.batch4`'s (held to golden4 and `binproto.batch4`). It
+      needs `S3_HOSTPATH=1` with the Rust writer (otherwise it behaves as `thread`, logged). A batch the Rust writer
+      refuses gets the Python writer's bytes, counted as the host path's batch4 fallbacks.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:

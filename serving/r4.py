@@ -28,6 +28,9 @@ What a Loop does (the contract both implementations follow; serving/tests/test_r
 - ``send(cid, data) -> bool``: queue bytes for connection ``cid``'s writer; False when it is gone (counted).
   On a ValueError (the Loop closed, ``cid`` in use) ``fd`` is still the caller's to close; on a RuntimeError (its
   threads could not start) the Loop took it and has shut it.
+- ``send_batch4(cid, msgs, ctx) -> bool`` (R4d): one batch's reply messages for ``cid``, sent as
+  ``s3_hostpath.batch4(msgs)``'s bytes. The Rust Loop reads the messages under the GIL (meta, the columns copied out,
+  the shell) and its writer thread lays the frame out without it; it raises what batch4 raises, before queuing.
 - ``close_conn(cid)``: shut the connection down (its threads then end).
 - ``closed_conns() -> list``: the connections both of whose threads have ended since the last call, each once, so
   the caller can forget them.
@@ -278,6 +281,12 @@ class PyLoop:
             self.st["max_out_depth"] = max(self.st["max_out_depth"], len(c.out))
             c.c.notify()
         return True
+
+    def send_batch4(self, cid: int, msgs, ctx=None) -> bool:
+        """R4d's contract: one batch's reply messages for ``cid``, sent as batch4's kind 4 frame. The stub writes it with
+        serving.binproto.batch4 (the Rust Loop collects under the GIL and lays the frame out in its writer)."""
+        from . import binproto
+        return self.send(cid, binproto.batch4(list(msgs)))
 
     def close_conn(self, cid: int) -> None:
         c = self._conns.get(cid)

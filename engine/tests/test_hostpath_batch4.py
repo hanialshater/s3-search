@@ -35,6 +35,10 @@ def _same(msgs):
     want = binproto.batch4(msgs)
     got = s3_hostpath.batch4(msgs)
     assert got == want, _diff(got, want)
+    split = getattr(s3_hostpath._native, "batch4_split", None)   # R4d: collect under the GIL, frame without it
+    if split is not None:
+        b, _, _ = split(list(msgs), s3_hostpath._ctx())
+        assert b == want, "batch4_split: " + _diff(b, want)
     return got
 
 
@@ -71,7 +75,9 @@ sub_in.append(False)
 rows = mv.golden4(random.Random(10))
 sub_in.pop()
 binproto.batch4 = ref
+split = getattr(s3_hostpath._native, "batch4_split", None)
 print(json.dumps({"rows": rows, "rust_equal": [s3_hostpath.batch4(m) == f for m, f in seen],
+                  "split_equal": [split is None or split(list(m), s3_hostpath._ctx())[0] == f for m, f in seen],
                   "rust_hex": [s3_hostpath.batch4(m)[4:].hex() for m, _ in seen], "subnormal_input": sub_in,
                   "fp_clean": mv._fp_mode_clean(), "torch_loaded": "torch" in sys.modules,
                   "numpy": np.__version__, "python": sys.version.split()[0]}))
@@ -98,6 +104,7 @@ def test_every_golden4_frame():
     lines = (ROOT / "serving/native_front/tests/golden4.txt").read_text().splitlines()
     assert len(got["rows"]) == len(lines) == len(got["subnormal_input"]) == 40
     assert all(got["rust_equal"])                              # Rust equals Python on every input
+    assert all(got["split_equal"])                             # R4d: collect plus frame equals them too
     bad = [i for i, (row, line) in enumerate(zip(got["rows"], lines)) if row != line]
     for i in bad:                                              # what differs, for the platform engineer
         a, b = got["rows"][i].split(" "), lines[i].split(" ")
