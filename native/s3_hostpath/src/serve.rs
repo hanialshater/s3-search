@@ -20,7 +20,7 @@
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -33,7 +33,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::reply;
+
 const READ_BUF: usize = 1 << 16;
+
+/// What a connection's writer sends: bytes already made, or (R4d) a batch's replies collected under the GIL, whose
+/// kind 4 frame the writer lays out without it.
+enum OutItem {
+    Bytes(Vec<u8>),
+    Batch4(reply::Collected),
+}
 
 enum Entry {
     Search { conn: u32, id: u64, name: String, payload: Vec<u8>, t: Instant },
@@ -46,7 +55,7 @@ struct Queue {
 }
 
 struct Out {
-    q: VecDeque<Vec<u8>>,
+    q: VecDeque<OutItem>,
     reader_done: bool,
     dead: bool,
 }
@@ -60,9 +69,10 @@ struct Conn {
     ended: AtomicU64,        // threads of this connection that have ended (2: both)
 }
 
-const STATS: [&str; 14] = [
+const STATS: [&str; 17] = [
     "conns_opened", "conns_closed", "frames", "searches", "calls", "bad_heads", "pushed", "batches", "batch_items",
-    "sends", "send_bytes", "send_dropped", "send_errors", "max_out_depth",
+    "sends", "send_bytes", "send_dropped", "send_errors", "max_out_depth", "batch4_sends", "batch4_frame_ns",
+    "batch4_collect_ns",
 ];
 const S_OPENED: usize = 0;
 const S_CLOSED: usize = 1;
@@ -78,6 +88,9 @@ const S_BYTES: usize = 10;
 const S_DROPPED: usize = 11;
 const S_ERRORS: usize = 12;
 const S_MAXDEPTH: usize = 13;
+const S_B4_SENDS: usize = 14;
+const S_B4_FRAME_NS: usize = 15;    // the writers' frame layout (no GIL)
+const S_B4_COLLECT_NS: usize = 16;  // send_batch4's collect (the GIL held)
 
 struct Shared {
     q: Mutex<Queue>,
@@ -86,7 +99,7 @@ struct Shared {
     calls_cv: Condvar,
     conns: Mutex<HashMap<u32, Arc<Conn>>>,
     load: Option<(File, u64)>,
-    st: [AtomicU64; 14],
+    st: [AtomicU64; 17],
     closing: AtomicBool,
     closed: Mutex<Vec<u32>>,         // connections both of whose threads have ended, not yet reported
     cpu_done_ns: [AtomicU64; 2],     // CPU of ended reader and writer threads
@@ -250,7 +263,7 @@ fn writer(sh: Arc<Shared>, cid: u32, c: Arc<Conn>) {
 
 fn writer_loop(sh: &Shared, cid: u32, c: &Conn) {
     loop {
-        let bufs: Vec<Vec<u8>> = {
+        let bufs: Vec<OutItem> = {
             let mut o = c.out.lock().unwrap();
             while o.q.is_empty() && !o.reader_done && !o.dead {
                 o = c.cv.wait(o).unwrap();
@@ -262,7 +275,18 @@ fn writer_loop(sh: &Shared, cid: u32, c: &Conn) {
         };
         let mut w: &UnixStream = &c.stream;
         let mut ok = true;
-        for b in &bufs {
+        for item in &bufs {
+            let made;
+            let b: &[u8] = match item {
+                OutItem::Bytes(b) => b,
+                OutItem::Batch4(c) => {
+                    let t = Instant::now();
+                    made = reply::frame(c);
+                    sh.add(S_B4_FRAME_NS, t.elapsed().as_nanos() as u64);
+                    sh.add(S_BYTES, made.len() as u64);
+                    &made
+                }
+            };
             if w.write_all(b).is_err() {
                 ok = false;
                 break;
@@ -482,7 +506,7 @@ impl Loop {
             self.sh.add(S_DROPPED, 1);
             return false;
         }
-        o.q.push_back(data.to_vec());
+        o.q.push_back(OutItem::Bytes(data.to_vec()));
         let depth = o.q.len() as u64;
         drop(o);
         c.cv.notify_one();
@@ -490,6 +514,39 @@ impl Loop {
         self.sh.add(S_BYTES, data.len() as u64);
         self.sh.st[S_MAXDEPTH].fetch_max(depth, Ordering::Relaxed);
         true
+    }
+
+    /// R4d: one batch's reply messages for connection `cid` (what s3_hostpath.batch4 takes, with its ctx): collected
+    /// here under the GIL (meta, columns copied, shell), the kind 4 frame laid out by the writer without it; the bytes
+    /// are batch4's. False when the connection is gone (nothing collected). Raises what batch4 raises, before queuing
+    /// anything, so the caller can fall back to the Python writer.
+    fn send_batch4<'py>(&self, py: Python<'py>, cid: u32, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, PyTuple>)
+                         -> PyResult<bool> {
+        let c = self.sh.conns.lock().unwrap().get(&cid).cloned();
+        let c = match c {
+            Some(c) => c,
+            None => {
+                self.sh.add(S_DROPPED, 1);
+                return Ok(false);
+            }
+        };
+        let t = Instant::now();
+        let got = reply::collect(py, msgs, ctx)?;
+        self.sh.add(S_B4_COLLECT_NS, t.elapsed().as_nanos() as u64);
+        let mut o = c.out.lock().unwrap();
+        if o.dead {
+            drop(o);
+            self.sh.add(S_DROPPED, 1);
+            return Ok(false);
+        }
+        o.q.push_back(OutItem::Batch4(got));
+        let depth = o.q.len() as u64;
+        drop(o);
+        c.cv.notify_one();
+        self.sh.add(S_SENDS, 1);
+        self.sh.add(S_B4_SENDS, 1);
+        self.sh.st[S_MAXDEPTH].fetch_max(depth, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Shut connection `cid` down; its reader and writer then end.

@@ -39,7 +39,9 @@ const MAX_DEPTH: usize = 512;
 
 // Development timing (batch4_profile): nanoseconds spent per phase, summed over calls.
 // The phases are: meta, columns, shell, frame, and the whole call.
-static PROF: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+// R4d adds three parts of "columns": the ids (buffer, copy, check), the scores, the sort columns.
+static PROF: [AtomicU64; 8] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                               AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn lap(i: usize, t: &mut Instant) {
     let now = Instant::now();
@@ -50,7 +52,7 @@ fn lap(i: usize, t: &mut Instant) {
 /// The phase totals in seconds since the last call, as {meta, columns, shell, frame, total}; resets them.
 #[pyfunction]
 pub fn batch4_profile() -> Vec<(String, f64)> {
-    ["meta", "columns", "shell", "frame", "total"]
+    ["meta", "columns", "shell", "frame", "total", "columns_ids", "columns_score", "columns_sort"]
         .iter()
         .enumerate()
         .map(|(i, n)| (n.to_string(), PROF[i].swap(0, Ordering::Relaxed) as f64 * 1e-9))
@@ -473,6 +475,12 @@ fn tobytes(a: &Bound<PyAny>) -> PyResult<Vec<u8>> {
 }
 
 fn ids_ok(raw: &[u8], w: usize) -> bool {
+    // R4d: the common case at once. Every byte ASCII and none NUL means every id is UTF-8 with no NUL at all (the
+    // per-id loop below gives true for it too); this is one pass the compiler vectorises, where the loop below cost
+    // about 20 ns an id (2,000-hit replies: most of batch4's "columns" phase on the CI runner).
+    if raw.iter().all(|&b| b != 0 && b < 0x80) {
+        return true;
+    }
     for x in raw.chunks(w) {
         let mut e = x.len();
         while e > 0 && x[e - 1] == 0 {
@@ -487,6 +495,7 @@ fn ids_ok(raw: &[u8], w: usize) -> bool {
 }
 
 fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
+    let mut tc = Instant::now();
     // encode._is_columnar
     let Ok(rd) = resp.downcast::<PyDict>() else { return Ok(None) };
     let Some(hits) = rd.get_item(intern!(resp.py(), "hits"))? else { return Ok(None) };
@@ -520,6 +529,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
     if h == 0 || w0 == 0 || raw.len() != h * w0 || !ids_ok(&raw, w0) {
         return Ok(None);
     }
+    lap(5, &mut tc);
     let score = c.get_item(intern!(py, "_score"))?;
     let fast = if score.is_instance(&ctx.ndarray)? {
         Buf::get(&score).and_then(|b| if b.format() == b"f" { Some((b.len(), b.bytes().to_vec())) } else { None })
@@ -540,6 +550,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
         return Err(PyValueError::new_err("scores not 1-D"));
     }
     let s64: Vec<f64> = s32.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect();
+    lap(6, &mut tc);
     let mut cols = Vec::new();
     let sort = c.call_method1(intern!(py, "get"), (intern!(py, "sort").clone(),))?;
     if sort.is_truthy()? {
@@ -632,6 +643,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
             }
         }
     }
+    lap(7, &mut tc);
     Ok(Some(Row { ids: raw, w0, h, s32, cols }))
 }
 
@@ -731,15 +743,21 @@ fn ok_reply(ctx: &Ctx, msg: &Bound<PyAny>, rows: &mut Vec<Row>) -> PyResult<Rec>
     Ok(Rec::Whole { id, meta, status: 200, body })
 }
 
-fn pad8(out: &mut Vec<u8>) {
-    while out.len() % 8 != 0 {
-        out.push(0);
-    }
+
+// ---- R4d: the GIL-held part (collect) apart from the frame layout (frame) -----------------------------------------
+//
+// `batch4` is `collect` then `frame`. `collect` reads the Python objects: each reply's meta, its columns (copied out of
+// the numpy buffers) and its response shell, and checks every limit the layout has, so `frame` cannot fail. `frame`
+// touches no Python object: the Loop's writer thread runs it without the GIL (`Loop.send_batch4`, R4d).
+
+/// One batch's replies, collected under the GIL: what `frame` lays out.
+pub struct Collected {
+    recs: Vec<Rec>,
+    rows: Vec<Row>,
 }
 
-#[pyfunction]
-pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyBytes>> {
-    let ctx = Ctx {
+fn make_ctx<'py>(py: Python<'py>, ctx: &Bound<'py, PyTuple>) -> PyResult<Ctx<'py>> {
+    Ok(Ctx {
         ndarray: ctx.get_item(0)?,
         f32: ctx.get_item(1)?,
         f64: ctx.get_item(2)?,
@@ -749,8 +767,25 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
         round: ctx.get_item(6)?,
         int_repr: py.get_type_bound::<PyLong>().getattr("__repr__")?,
         bool_type: py.get_type_bound::<PyBool>().into_any(),
-    };
-    let t_all = Instant::now();
+    })
+}
+
+fn shared_keys(rows: &[Row]) -> Vec<(usize, u8)> {
+    // shared columns: one per (sort position, kind) any reply uses, in order of first use
+    let mut keys: Vec<(usize, u8)> = Vec::new();
+    for r in rows {
+        for (k, c) in r.cols.iter().enumerate() {
+            if c.kind != 0 && !keys.contains(&(k, c.kind)) {
+                keys.push((k, c.kind));
+            }
+        }
+    }
+    keys
+}
+
+/// The GIL-held part of `batch4`: every reply's meta, columns and shell, and the layout's limits checked.
+pub fn collect<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, PyTuple>) -> PyResult<Collected> {
+    let ctx = make_ctx(py, ctx)?;
     let mut recs: Vec<Rec> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     for msg in msgs.iter()? {
@@ -782,74 +817,100 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
             });
         }
     }
-    let mut t = Instant::now();
     let w = rows.iter().map(|r| r.w0).max().unwrap_or(1).max(1);
     if w > u16::MAX as usize {
         return Err(PyValueError::new_err("ids too wide"));
     }
+    if shared_keys(&rows).len() > 254 {
+        return Err(PyValueError::new_err("too many shared columns"));
+    }
+    if rows.iter().any(|r| r.cols.len() > 255) {
+        return Err(PyValueError::new_err("too many sort columns"));
+    }
+    Ok(Collected { recs, rows })
+}
+
+/// The kind 4 frame (its u32 length, then the payload) for a collected batch: no Python object, no failure. Laid out
+/// in one buffer; every 8-byte alignment is of the payload's offset, as binproto.batch4's pad8.
+pub fn frame(c: &Collected) -> Vec<u8> {
+    let (recs, rows) = (&c.recs, &c.rows);
+    let w = rows.iter().map(|r| r.w0).max().unwrap_or(1).max(1);
     let h_total: usize = rows.iter().map(|r| r.h).sum();
-    let mut out: Vec<u8> = Vec::with_capacity(64 + h_total * (w + 4 + 16) + recs.len() * 256);
+    let keys = shared_keys(rows);
+    let meta_len: usize = recs.iter().map(|r| match r {
+        Rec::Hits { meta, .. } => meta.len() + 32,
+        Rec::Whole { meta, body, .. } => meta.len() + body.len() + 32,
+    }).sum();
+    let mut out: Vec<u8> = Vec::with_capacity(4 + 32 + h_total * (w + 4) + keys.len() * (h_total * 8 + h_total / 8 + 16)
+                                              + meta_len + 16);
+    out.extend_from_slice(&[0u8; 4]); // the frame's length, written at the end
+    let pad = |out: &mut Vec<u8>| {
+        while (out.len() - 4) % 8 != 0 {
+            out.push(0);
+        }
+    };
     out.push(4);
     out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&(recs.len() as u32).to_le_bytes());
     out.extend_from_slice(&(w as u16).to_le_bytes());
     out.extend_from_slice(&(h_total as u32).to_le_bytes());
-    for r in &rows {
-        for x in r.ids.chunks(r.w0) {
-            out.extend_from_slice(x);
-            out.resize(out.len() + (w - r.w0), 0);
-        }
-    }
-    pad8(&mut out);
-    for r in &rows {
-        out.extend_from_slice(&r.s32);
-    }
-    // shared columns: one per (sort position, kind) any reply uses, in order of first use
-    let mut keys: Vec<(usize, u8)> = Vec::new();
-    for r in &rows {
-        for (k, c) in r.cols.iter().enumerate() {
-            if c.kind != 0 && !keys.contains(&(k, c.kind)) {
-                keys.push((k, c.kind));
+    for r in rows {
+        if r.w0 == w {
+            out.extend_from_slice(&r.ids);
+        } else {
+            for x in r.ids.chunks(r.w0) {
+                out.extend_from_slice(x);
+                out.resize(out.len() + (w - r.w0), 0);
             }
         }
     }
-    if keys.len() > 254 {
-        return Err(PyValueError::new_err("too many shared columns"));
+    pad(&mut out);
+    for r in rows {
+        out.extend_from_slice(&r.s32);
     }
     out.push(keys.len() as u8);
     let mut offs = vec![0usize];
-    for r in &rows {
+    for r in rows {
         offs.push(offs.last().unwrap() + r.h);
     }
     for &(k, kind) in &keys {
-        let mut vals = vec![0u8; 8 * h_total];
-        let mut miss = vec![false; h_total];
+        let flags = if rows.iter().any(|r| r.cols.get(k).map_or(false, |c| c.kind == kind && c.miss.is_some())) {
+            1u8
+        } else {
+            0
+        };
+        out.push(kind);
+        out.push(flags);
+        pad(&mut out);
+        let at = out.len();
+        out.resize(at + 8 * h_total, 0);
         for (ri, r) in rows.iter().enumerate() {
             if let Some(c) = r.cols.get(k) {
                 if c.kind == kind {
-                    vals[8 * offs[ri]..8 * offs[ri + 1]].copy_from_slice(&c.vals);
-                    if let Some(m) = &c.miss {
-                        miss[offs[ri]..offs[ri + 1]].copy_from_slice(m);
+                    out[at + 8 * offs[ri]..at + 8 * offs[ri + 1]].copy_from_slice(&c.vals);
+                }
+            }
+        }
+        if flags == 1 {
+            let at = out.len();
+            out.resize(at + (h_total + 7) / 8, 0);
+            for (ri, r) in rows.iter().enumerate() {
+                if let Some(c) = r.cols.get(k) {
+                    if c.kind == kind {
+                        if let Some(m) = &c.miss {
+                            for (j, &x) in m.iter().enumerate() {
+                                if x {
+                                    let i = offs[ri] + j;
+                                    out[at + i / 8] |= 1 << (i % 8);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        let flags = if miss.iter().any(|&x| x) { 1u8 } else { 0 };
-        out.push(kind);
-        out.push(flags);
-        pad8(&mut out);
-        out.extend_from_slice(&vals);
-        if flags == 1 {
-            let mut bits = vec![0u8; (h_total + 7) / 8];
-            for (i, &x) in miss.iter().enumerate() {
-                if x {
-                    bits[i / 8] |= 1 << (i % 8);
-                }
-            }
-            out.extend_from_slice(&bits);
-        }
     }
-    for rec in &recs {
+    for rec in recs {
         match rec {
             Rec::Hits { id, meta, row } => {
                 let r = &rows[*row];
@@ -857,9 +918,6 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
                 out.push(3);
                 out.extend_from_slice(&(offs[*row] as u32).to_le_bytes());
                 out.extend_from_slice(&(r.h as u32).to_le_bytes());
-                if r.cols.len() > 255 {
-                    return Err(PyValueError::new_err("too many sort columns"));
-                }
                 out.push(r.cols.len() as u8);
                 for (k, c) in r.cols.iter().enumerate() {
                     out.push(if c.kind == 0 {
@@ -882,11 +940,35 @@ pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, P
             }
         }
     }
-    let mut framed = Vec::with_capacity(out.len() + 4);
-    framed.extend_from_slice(&(out.len() as u32).to_le_bytes());
-    framed.extend_from_slice(&out);
+    let n = (out.len() - 4) as u32;
+    out[..4].copy_from_slice(&n.to_le_bytes());
+    out
+}
+
+#[pyfunction]
+pub fn batch4<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyBytes>> {
+    let t_all = Instant::now();
+    let c = collect(py, msgs, ctx)?;
+    let mut t = Instant::now();
+    let framed = frame(&c);
     let r = PyBytes::new_bound(py, &framed);
     lap(3, &mut t);
     PROF[4].fetch_add((Instant::now() - t_all).as_nanos() as u64, Ordering::Relaxed);
     Ok(r)
+}
+
+/// R4d's split, for the tests and the phase bench: `(batch4's bytes, ns in collect (GIL held), ns in frame (no GIL
+/// needed))`. The frame is laid out here with the GIL released, as the Loop's writer does.
+#[pyfunction]
+pub fn batch4_split<'py>(py: Python<'py>, msgs: &Bound<'py, PyAny>, ctx: &Bound<'py, PyTuple>)
+                         -> PyResult<(Bound<'py, PyBytes>, u64, u64)> {
+    let t0 = Instant::now();
+    let c = collect(py, msgs, ctx)?;
+    let collect_ns = t0.elapsed().as_nanos() as u64;
+    let (framed, frame_ns) = py.allow_threads(move || {
+        let t1 = Instant::now();
+        let f = frame(&c);
+        (f, t1.elapsed().as_nanos() as u64)
+    });
+    Ok((PyBytes::new_bound(py, &framed), collect_ns, frame_ns))
 }

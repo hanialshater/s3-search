@@ -281,11 +281,23 @@ def _r4_encode_mode() -> str:
     """R4c: where R4 encodes the replies. ``thread`` (the default under R4): one encoder thread per GPU process, so the
     encoding overlaps the next batch's GPU work as the Python writers' did (plat-m40: inline encoding moved the writers'
     ~23% of a core into the batch thread, which then ran at ~98% of a core and lost that overlap). ``inline``: at the
-    batch's end, in the batch thread (R4 as first built)."""
+    batch's end, in the batch thread (R4 as first built). ``rust`` (R4d): the encoder thread, and an S3B3 connection's
+    kind 4 frame split in two: its replies collected under the GIL (meta, the columns copied out, the shell;
+    ``Loop.send_batch4``), the frame laid out by the Loop's writer thread without it; the same bytes as batch4."""
     mode = os.environ.get("S3_SERVING_R4_ENCODE", "thread").strip() or "thread"
-    if mode not in ("thread", "inline"):
-        raise ValueError(f"S3_SERVING_R4_ENCODE={mode!r}: thread or inline")
+    if mode not in ("thread", "inline", "rust"):
+        raise ValueError(f"S3_SERVING_R4_ENCODE={mode!r}: thread, inline or rust")
     return mode
+
+
+def _r4d_ctx():
+    """R4d: s3_hostpath's batch4 context when the Rust kind 4 writer is what S3B3 uses (S3_HOSTPATH=1 and
+    S3_HOSTPATH_BATCH4 not 0), else None (the frame is then written as today)."""
+    hp = _hostpath()
+    impl = getattr(hp, "impl", None)
+    if impl is None or not hasattr(impl, "_ctx") or os.environ.get("S3_HOSTPATH_BATCH4", "1") == "0":
+        return None
+    return impl._ctx()
 
 
 class _R4Encoder:
@@ -345,10 +357,12 @@ class _R4Conn:
     ``encoder`` set) or where ``put`` is called (the batch loop at a batch's end, or the call thread). An encoding error
     closes the connection (a writer thread's exception ended its sends before) and is counted; it never stops the
     batch loop."""
-    __slots__ = ("loop", "cid", "proto", "counts", "encoder")
+    __slots__ = ("loop", "cid", "proto", "counts", "encoder", "rust")
 
-    def __init__(self, loop, cid: int, proto: int, counts: dict | None = None, encoder: "_R4Encoder | None" = None):
+    def __init__(self, loop, cid: int, proto: int, counts: dict | None = None, encoder: "_R4Encoder | None" = None,
+                 rust: bool = False):
         self.loop, self.cid, self.proto, self.encoder = loop, cid, proto, encoder
+        self.rust = rust and proto == 3 and hasattr(loop, "send_batch4")   # R4d: the frame laid out by the Loop
         self.counts = counts if counts is not None else {"encode_errors": 0}   # the server's, in r4-<j>.json
 
     def put(self, msg) -> None:
@@ -358,6 +372,30 @@ class _R4Conn:
             self.send_now(msg)
 
     def send_now(self, msg) -> None:
+        if self.rust:
+            ctx = _r4d_ctx()
+            if ctx is not None:
+                hp = _hostpath()
+                msgs = msg[1] if msg[0] == "multi" else [msg]
+                hp.batch4_frames += 1                             # the host path's counts, as its batch4 keeps them
+                try:
+                    self.loop.send_batch4(self.cid, msgs, ctx)
+                    self.counts["r4d_frames"] = self.counts.get("r4d_frames", 0) + 1
+                    return
+                except Exception:  # noqa: BLE001 - what batch4 does not take: the Python writer's bytes, as its guard
+                    hp.fallbacks += 1
+                    hp.batch4_fallbacks += 1
+                    self.counts["r4d_fallbacks"] = self.counts.get("r4d_fallbacks", 0) + 1
+                    from . import binproto
+                    try:
+                        data = binproto.batch4(msgs)
+                    except Exception:  # noqa: BLE001
+                        self.counts["encode_errors"] += 1
+                        log.exception("R4: encoding a reply for connection %d failed; closing it", self.cid)
+                        self.loop.close_conn(self.cid)
+                        return
+                    self.loop.send(self.cid, data)
+                    return
         try:
             data = _bin_bytes(msg, self.proto)
         except Exception:  # noqa: BLE001 - never lose the batch loop to one front's reply
@@ -462,7 +500,10 @@ class GpuServer:
             # of connections already gone (their fronts left), connections the Loop refused
             self._r4_counts = {"encode_errors": 0, "gone_items": 0, "gone_calls": 0, "refused_conns": 0}
             self.r4_encode = _r4_encode_mode()                  # R4c: S3_SERVING_R4_ENCODE (thread, the default)
-            self._r4_encoder = _R4Encoder(self._r4_counts) if self.r4_encode == "thread" else None
+            self._r4_encoder = _R4Encoder(self._r4_counts) if self.r4_encode in ("thread", "rust") else None
+            if self.r4_encode == "rust" and (not hasattr(self.r4, "send_batch4") or _r4d_ctx() is None):
+                log.warning("gpu process %d: S3_SERVING_R4_ENCODE=rust needs the Rust Loop and S3_HOSTPATH=1 with its "
+                            "batch4; replies are encoded on the encoder thread as for 'thread'", index)
             log.warning("gpu process %d: R4 serving loop on (%s), replies encoded %s", index,
                         getattr(self.r4, "name", type(self.r4).__name__),
                         "on one encoder thread" if self._r4_encoder is not None else "inline in the batch thread")
@@ -633,7 +674,7 @@ class GpuServer:
     def _r4_add(self, sock: socket.socket, proto: int) -> None:
         cid = next(self._r4_ids)
         self._r4_conns[cid] = _R4Conn(self.r4, cid, proto, self._r4_counts,   # before the Loop can queue a frame
-                                      getattr(self, "_r4_encoder", None))
+                                      getattr(self, "_r4_encoder", None), getattr(self, "r4_encode", "") == "rust")
         fd = sock.detach()
         try:
             self.r4.add_conn(cid, fd, proto)

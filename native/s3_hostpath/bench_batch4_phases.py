@@ -15,7 +15,11 @@ The replies are shaped like the engine's (hits="columns", ids="bytes"; serving/g
 - deep: 2,000 hits, ESCI-like 10-byte ids, float32 scores, sort [the score widened, an int64 doc index], total;
 - faceted: 10 hits and two terms aggregations of 10 buckets each (brand and colour).
 Batches of 10 and 64 replies (plat-m40's R4 batches were 10 to 12). The Python reference writer
-(serving.binproto.batch4) and flush_response are timed beside it. Prints and writes JSON.
+(serving.binproto.batch4) and flush_response are timed beside it.
+
+R4d (``_native.batch4_split``, what ``Loop.send_batch4`` does): the GIL-held part ("collect": meta, columns, shell and
+the layout's limits) timed apart from the frame laid out with the GIL released; its bytes are checked equal to
+batch4's. Prints and writes JSON.
 """
 from __future__ import annotations
 
@@ -99,9 +103,18 @@ def main():
                     flush_response(m[3])
             fl_us = (time.perf_counter() - t0) / n * 1e6
             frame_bytes = len(s3_hostpath.batch4(batches[0]))
+            ctx = s3_hostpath._ctx()
+            for m in batches[:2]:
+                assert _native.batch4_split(m, ctx)[0] == s3_hostpath.batch4(m)
+            col_ns = fr_ns = 0
+            for r in range(REPS):
+                _, c_ns, f_ns = _native.batch4_split(batches[r % 8], ctx)
+                col_ns, fr_ns = col_ns + c_ns, fr_ns + f_ns
+            r4d = {"gil_us_per_reply": round(col_ns / n / 1e3, 3), "off_gil_us_per_reply": round(fr_ns / n / 1e3, 3),
+                   "gil_vs_batch4": round(col_ns / n / 1e3 / us["total"], 3)}
             case = {"us_per_reply": us, "unattributed_us": rest, "wall_us_per_reply": round(wall / n * 1e6, 3),
                     "python_batch4_us_per_reply": round(py_us, 3), "flush_response_us_per_reply": round(fl_us, 3),
-                    "frame_bytes_per_reply": frame_bytes // bs,
+                    "frame_bytes_per_reply": frame_bytes // bs, "r4d": r4d,
                     "share": {k: round(us[k] / us["total"], 3) for k in ("meta", "columns", "shell", "frame")}}
             out["cases"][f"{kind}_batch{bs}"] = case
             print(f"[batch4-phases] {kind} batch {bs}: {json.dumps(case)}", flush=True)
