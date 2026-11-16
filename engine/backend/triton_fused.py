@@ -141,7 +141,10 @@ if triton is not None:
         acc = tl.load(acc_ptr + base + dd, mask=inb_t, other=0.0)
         cnt = tl.load(cnt_ptr + base + dd, mask=inb_t, other=0)
         live = tl.load(live_ptr + dd, mask=inb_t, other=0)
-        msm = tl.load(msm_ptr + g)
+        # int32 whatever the pointer's type. The packed path and the Rust host route pass msm in their int64 block, and
+        # an int64 msm widens the whole tile's count compare to 64 bits (plat-m38: the packed path 15% slower). msm is
+        # at most the number of query terms, so the cast is exact.
+        msm = tl.load(msm_ptr + g).to(tl.int32)
         boost = tl.load(boost_ptr + g)
         match = inb_t & (cnt >= msm) & (live != 0)
         s32 = acc.to(tl.float32)
