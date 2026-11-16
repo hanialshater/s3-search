@@ -48,8 +48,8 @@ def test_results_record_the_engine_switches(monkeypatch):
     """S3_TRITON_BM25, S3_PLAN_CACHE and S3_CUDA_BLOCKING_SYNC are recorded as set, null when unset."""
     import os
     from referee import bench as b
-    for k in [k for k in os.environ if k.startswith("S3_TRITON_")]:   # the run's own switches must not leak in
-        monkeypatch.delenv(k)
+    for k in [k for k in os.environ if k.startswith(("S3_TRITON_", "S3_FUSED_")) or k == "S3_HOSTPATH"]:
+        monkeypatch.delenv(k)                                   # the run's own switches must not leak in
     monkeypatch.setenv("S3_TRITON_BM25", "1")
     monkeypatch.delenv("S3_PLAN_CACHE", raising=False)
     monkeypatch.setenv("S3_CUDA_BLOCKING_SYNC", "0")
@@ -57,3 +57,15 @@ def test_results_record_the_engine_switches(monkeypatch):
     monkeypatch.setenv("S3_TRITON_FACETS", "0")
     assert b.engine_env() == {"S3_TRITON_BM25": "1", "S3_TRITON_TOPK": None, "S3_PLAN_CACHE": None,
                               "S3_CUDA_BLOCKING_SYNC": "0", "S3_TRITON_FACETS": "0"}
+
+
+def test_route_switches_are_recorded(monkeypatch):
+    """S3_FUSED_* and S3_HOSTPATH are recorded when set, as S3_TRITON_* are."""
+    import os
+    from referee import bench as b
+    for k in [k for k in os.environ if k.startswith(("S3_TRITON_", "S3_FUSED_")) or k == "S3_HOSTPATH"]:
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("S3_FUSED_PACK", "0")
+    monkeypatch.setenv("S3_HOSTPATH", "1")
+    got = b.engine_env()
+    assert got["S3_FUSED_PACK"] == "0" and got["S3_HOSTPATH"] == "1"
