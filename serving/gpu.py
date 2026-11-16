@@ -473,11 +473,13 @@ class GpuServer:
 
     # -- connections
     def serve_forever(self) -> None:
-        threading.Thread(target=self._batch_loop, name="gpu-batches", daemon=True).start()
+        waiters = [threading.Thread(target=self._batch_loop, name="gpu-batches", daemon=True)]
         threading.Thread(target=self._publish_versions, name="gpu-versions", daemon=True).start()
         threading.Thread(target=self._stats, name="gpu-stats", daemon=True).start()
         if getattr(self, "r4", None) is not None:
-            threading.Thread(target=self._r4_calls, name="gpu-r4-calls", daemon=True).start()
+            waiters.append(threading.Thread(target=self._r4_calls, name="gpu-r4-calls", daemon=True))
+        for t in waiters:
+            t.start()
         self.listener.settimeout(0.5)
         while not self._stop.is_set():
             try:
@@ -488,6 +490,15 @@ class GpuServer:
                 break
             conn.settimeout(None)
             threading.Thread(target=self._reader, args=(conn,), daemon=True).start()
+        if getattr(self, "r4", None) is not None:
+            # R4: the batch and call threads wait inside the Loop without the GIL (next_batch, next_call). A daemon
+            # thread that takes the GIL back after the interpreter has begun to finalize is ended with pthread_exit,
+            # which aborts the process when it unwinds through the Rust frames (a GPU process died of SIGABRT at exit
+            # in the rust job). They see _stop within 0.2 s, so wait for them before returning.
+            for t in waiters:
+                t.join(10.0)
+                if t.is_alive():
+                    log.warning("gpu process %d: %s still running at exit", self.index, t.name)
 
     def shutdown(self) -> None:
         self._stop.set()
