@@ -32,7 +32,8 @@ What a Loop does (the contract both implementations follow; serving/tests/test_r
 - ``closed_conns() -> list``: the connections both of whose threads have ended since the last call, each once, so
   the caller can forget them.
 - ``close(timeout_s=2.0) -> int``: shutdown. No new connection or frame is taken; each connection's reader ends and
-  its writer sends what is already queued, then closes the socket. Waits up to ``timeout_s`` for that (a front that
+  its writer sends what is already queued, then closes the socket. Waits up to ``timeout_s`` for every thread to end
+  (so ``closed_conns`` then lists every connection; a front that
   reads nothing can hold its writer) and returns how many connections are still open.
 - ``qsize()``, ``stats() -> dict``: the queue length; the Loop's counters, with ``cpu_s`` (``{"reader", "writer"}``:
   the CPU seconds of the Loop's reader and writer threads, so the 5 s log shows where the host time went once it has
@@ -94,6 +95,7 @@ class PyLoop:
         self._closed: list = []
         self._cpu = {"reader": 0.0, "writer": 0.0}            # ended threads' CPU seconds
         self._live: dict = {}                                    # thread ident -> (kind, its thread_time so far)
+        self._threads = 0                                        # reader and writer threads running
         self.st = {k: 0 for k in ("conns_opened", "conns_closed", "frames", "searches", "calls", "bad_heads",
                                   "pushed", "batches", "batch_items", "sends", "send_bytes", "send_dropped",
                                   "send_errors", "max_out_depth")}
@@ -122,6 +124,7 @@ class PyLoop:
             sock.setblocking(True)
             c = _PyConn(self, cid, sock, proto)
             self._conns[cid] = c
+            self._threads += 2
             self.st["conns_opened"] += 1
         threading.Thread(target=self._reader, args=(c,), name=f"r4-read-{cid}", daemon=True).start()
         threading.Thread(target=self._writer, args=(c,), name=f"r4-write-{cid}", daemon=True).start()
@@ -146,6 +149,7 @@ class PyLoop:
             c.ended += 1
             if c.ended == 2:
                 self._closed.append(c.cid)
+            self._threads -= 1
 
     def _reader(self, c: _PyConn) -> None:
         try:
@@ -301,7 +305,7 @@ class PyLoop:
                 c.reader_done = True
                 c.c.notify()
         end = time.perf_counter() + timeout
-        while self._conns and time.perf_counter() < end:
+        while (self._conns or self._threads) and time.perf_counter() < end:
             time.sleep(0.005)
         return len(self._conns)
 

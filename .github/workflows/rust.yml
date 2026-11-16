@@ -26,6 +26,9 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash          # bash -eo pipefail: a failing pytest fails its step through the tee
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

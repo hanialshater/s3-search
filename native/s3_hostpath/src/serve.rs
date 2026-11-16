@@ -90,6 +90,7 @@ struct Shared {
     closing: AtomicBool,
     closed: Mutex<Vec<u32>>,         // connections both of whose threads have ended, not yet reported
     cpu_done_ns: [AtomicU64; 2],     // CPU of ended reader and writer threads
+    live: AtomicU64,                 // reader and writer threads running (close waits for 0)
 }
 
 impl Shared {
@@ -195,6 +196,7 @@ fn reader(sh: Arc<Shared>, cid: u32, c: Arc<Conn>) {
     sh.cpu_done_ns[0].fetch_add(thread_cpu_ns(tid), Ordering::Relaxed);
     c.reader_tid.store(0, Ordering::Relaxed);
     sh.ended(cid, &c);
+    sh.live.fetch_sub(1, Ordering::AcqRel);
 }
 
 fn reader_loop(sh: &Shared, cid: u32, c: &Conn) {
@@ -243,6 +245,7 @@ fn writer(sh: Arc<Shared>, cid: u32, c: Arc<Conn>) {
     sh.cpu_done_ns[1].fetch_add(thread_cpu_ns(tid), Ordering::Relaxed);
     c.writer_tid.store(0, Ordering::Relaxed);
     sh.ended(cid, &c);
+    sh.live.fetch_sub(1, Ordering::AcqRel);
 }
 
 fn writer_loop(sh: &Shared, cid: u32, c: &Conn) {
@@ -322,6 +325,7 @@ impl Loop {
             closing: AtomicBool::new(false),
             closed: Mutex::new(Vec::new()),
             cpu_done_ns: Default::default(),
+            live: AtomicU64::new(0),
         };
         Ok(Loop { sh: Arc::new(sh), base, base_pc: perf_now })
     }
@@ -358,6 +362,7 @@ impl Loop {
             c
         };
         self.sh.add(S_OPENED, 1);
+        self.sh.live.fetch_add(2, Ordering::AcqRel); // each thread takes one off as it ends
         let (sh, c2) = (self.sh.clone(), c.clone());
         let r = thread::Builder::new().name(format!("r4-read-{cid}")).spawn(move || reader(sh, cid, c2));
         let (sh, c3) = (self.sh.clone(), c.clone());
@@ -368,10 +373,12 @@ impl Loop {
                 c.out.lock().unwrap().reader_done = true; // the writer, if it started, ends after its queue
                 c.cv.notify_one();
                 self.sh.ended(cid, &c);
+                self.sh.live.fetch_sub(1, Ordering::AcqRel);
             }
             if w.is_err() {
                 self.sh.conns.lock().unwrap().remove(&cid);
                 self.sh.ended(cid, &c);
+                self.sh.live.fetch_sub(1, Ordering::AcqRel);
             }
             return Err(PyRuntimeError::new_err("Loop: could not start the connection's threads (it is shut)"));
         }
@@ -395,8 +402,8 @@ impl Loop {
             let end = Instant::now() + t;
             loop {
                 let n = sh.conns.lock().unwrap().len();
-                if n == 0 || Instant::now() >= end {
-                    return n;
+                if (n == 0 && sh.live.load(Ordering::Acquire) == 0) || Instant::now() >= end {
+                    return n; // every thread ended, so closed_conns now lists every connection
                 }
                 thread::sleep(Duration::from_millis(5));
             }
