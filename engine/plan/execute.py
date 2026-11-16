@@ -95,6 +95,71 @@ class Timer:
         return (time.perf_counter() - self.t0) * 1000.0
 
 
+class FlushedColumns(dict):
+    """Columnar hits whose float32 scores and float64 sort values have no subnormals left: the engine flushed them
+    once per batch (``flush_subnormals``), so ``serving.encode.flush_response`` returns such a response as it is.
+    plat-m35: the per-reply flush was the default path's one new host cost per reply, 8 to 24 us after #46. Any
+    mutation drops the marker (``s3_flushed`` becomes False), so changed columns are flushed per reply again. A plain
+    dict otherwise."""
+    s3_flushed = True
+
+    def _changed(self):
+        self.s3_flushed = False
+
+    def __setitem__(self, k, v):
+        self._changed()
+        super().__setitem__(k, v)
+
+    def __delitem__(self, k):
+        self._changed()
+        super().__delitem__(k)
+
+    def update(self, *a, **kw):
+        self._changed()
+        super().update(*a, **kw)
+
+    def setdefault(self, k, default=None):
+        self._changed()
+        return super().setdefault(k, default)
+
+    def pop(self, k, *default):
+        self._changed()
+        return super().pop(k, *default)
+
+    def popitem(self):
+        self._changed()
+        return super().popitem()
+
+    def clear(self):
+        self._changed()
+        super().clear()
+
+    def __ior__(self, other):
+        self._changed()
+        return super().__ior__(other)
+
+
+_F32 = (np.uint32, np.uint32(0x7FFFFFFF), np.uint32(1), np.uint32(0x007FFFFF), np.uint32(0x80000000))
+_F64 = (np.uint64, np.uint64(0x7FFFFFFFFFFFFFFF), np.uint64(1), np.uint64(0x000FFFFFFFFFFFFF),
+        np.uint64(0x8000000000000000))
+
+
+def flush_subnormals(a):
+    """``serving.encode.flush_subnormals``'s rule, for an engine array: float32 or float64 subnormals as signed zero, by
+    bit masks (independent of the FP mode); the array itself when it has none, or is of another dtype."""
+    t = _F32 if a.dtype == np.float32 else _F64 if a.dtype == np.float64 else None
+    if t is None:
+        return a
+    ut, mag, one, lim, sign = t
+    u = np.ascontiguousarray(a).view(ut)
+    sub = ((u & mag) - one) < lim
+    if not sub.any():
+        return a
+    u = u.copy()
+    u[sub] &= sign
+    return u.view(a.dtype)
+
+
 class _LeanAgg:
     """R3b: a prepared request's terms aggregation, all the fused route reads of one."""
     __slots__ = ("name", "field", "size", "kind", "sub")
@@ -1182,8 +1247,10 @@ class Executor:
         idx_all = pg[:, :, 0].astype(np.int64)
         valid_n = (idx_all >= 0).sum(axis=1)
         ids_all = st.ids_bytes()[np.maximum(idx_all, 0)]
-        score32_all = pg[:, :, 1].astype(np.float32)
-        score64_all = np.ascontiguousarray(pg[:, :, 1])
+        # Subnormals flushed once for the whole batch, not once per reply: the serving flush (lab f134183) then skips
+        # these columns (FlushedColumns). The values are exactly what serving.encode.flush_response gives per reply.
+        score32_all = flush_subnormals(pg[:, :, 1].astype(np.float32))
+        score64_all = flush_subnormals(np.ascontiguousarray(pg[:, :, 1]))
         fo_all = pg[:, :, 2].astype(np.int64)
         ms = (time.perf_counter() - t0) * 1000.0 / n
         for r, i in enumerate(order):
@@ -1195,9 +1262,10 @@ class Executor:
             states[i]["page_ms"] = ms
             if os.environ.get("S3_FUSED_ONEPASS", "1") == "0":   # the per-plan assembly, for comparison
                 continue
-            states[i]["fused_cols"] = {"_id": ids_all[r, f0:f1], "_score": score32_all[r, f0:f1],
-                                       "sort": [{"values": score64_all[r, f0:f1], "missing": None},
-                                                {"values": fo_all[r, f0:f1], "missing": None}]}
+            states[i]["fused_cols"] = FlushedColumns(
+                {"_id": ids_all[r, f0:f1], "_score": score32_all[r, f0:f1],
+                 "sort": [{"values": score64_all[r, f0:f1], "missing": None},
+                          {"values": fo_all[r, f0:f1], "missing": None}]})
 
     def _fused_terms(self, states, out):
         """The fused plans' terms aggregations from the pass's counts: per field and size one ``top_buckets`` over
