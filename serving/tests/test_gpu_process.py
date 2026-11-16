@@ -93,7 +93,7 @@ def test_fronts_and_one_gpu_process_answer_as_one_process(built, single, tmp_pat
     import tempfile                                          # a short path: a Unix socket path is limited to ~104 bytes
     state = tempfile.mkdtemp(prefix="s3t-")                  # the supervisor's state directory, named so we can look in it
     p = _start(data, port, ["--fronts", "2", "--gpu-processes", "1"], {"S3_SERVING_STATE_DIR": str(state),
-                                                                     "S3_SERVING_R4": r4})
+                                                                     **_r4_env(r4)})
     try:
         rz = json.loads(_http("GET", f"http://127.0.0.1:{port}/readyz")[1])
         assert rz["ready"] and rz["fronts"] == 2 and rz["gpu_processes"] == 1 and rz["gpu_ready"] == 1
@@ -174,19 +174,27 @@ def _r4_built():
     return hasattr(s3_hostpath, "Loop")
 
 
+def _r4_env(r4):
+    """An r4 case ("0", "stub", "1", or with ":inline", R4c's inline encoding) as the GPU process's environment."""
+    mode, _, enc = r4.partition(":")
+    return {"S3_SERVING_R4": mode, **({"S3_SERVING_R4_ENCODE": enc} if enc else {})}
+
+
 def _r4_skip(r4, hostpath="0"):
-    if (r4 == "1" or hostpath == "1") and not _r4_built():
+    if (r4.partition(":")[0] == "1" or hostpath == "1") and not _r4_built():
         pytest.skip("s3_hostpath (with R4's Loop) is not built")
 
 
 def _r4_ran(state, r4):
     """R4 on: the GPU process wrote r4-0.json naming its Loop (serving/gpu.py ``_r4_note``)."""
     path = os.path.join(state, "r4-0.json")
-    if r4 == "0":
+    mode, _, enc = r4.partition(":")
+    if mode == "0":
         assert not os.path.exists(path)
         return
-    want = "python-stub" if r4 == "stub" else "s3_hostpath.Loop"
-    assert json.loads(open(path).read())["loop"] == want
+    note = json.loads(open(path).read())
+    assert note["loop"] == ("python-stub" if mode == "stub" else "s3_hostpath.Loop")
+    assert note["encode"] == (enc or "thread")                 # R4c: the encoder thread unless inline
 
 
 # R4 (S3_SERVING_R4): the same cases with the Loop owning the connection, on its Python stub and on the Rust Loop
@@ -195,7 +203,8 @@ _BIN_CASES = [("0", b"S3B1", "0"), ("stub", b"S3B1", "0"), ("stub-prepared", b"S
               ("0", b"S3B1", "stub"), ("stub-prepared", b"S3B1", "stub"), ("0", b"S3B2", "stub"),
               ("0", b"S3B3", "stub"), ("stub-prepared", b"S3B3", "stub"),
               ("0", b"S3B1", "1"), ("stub-prepared", b"S3B1", "1"), ("0", b"S3B2", "1"), ("0", b"S3B3", "1"),
-              ("stub-prepared", b"S3B3", "1"), ("1", b"S3B3", "1"), ("1", b"S3B3", "0")]
+              ("stub-prepared", b"S3B3", "1"), ("1", b"S3B3", "1"), ("1", b"S3B3", "0"),
+              ("0", b"S3B3", "stub:inline"), ("1", b"S3B3", "1:inline")]
 
 
 @pytest.mark.parametrize("hostpath,magic,r4", _BIN_CASES)
@@ -212,7 +221,7 @@ def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic, r
     state = tempfile.mkdtemp(prefix="s3b-")
     port = _free_port()
     p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"],
-               {"S3_SERVING_STATE_DIR": state, "S3_HOSTPATH": hostpath, "S3_SERVING_R4": r4})
+               {"S3_SERVING_STATE_DIR": state, "S3_HOSTPATH": hostpath, **_r4_env(r4)})
     sp = _free_port()
     ps = _start(built, sp, [])                              # one process: what the Python front says to a bad body
     try:
@@ -304,7 +313,7 @@ def test_native_front_answers_as_one_process(built, single, binproto, r4, hostpa
     _r4_skip(r4, hostpath)
     port = _free_port()
     p = _start(built, port, ["--fronts", "2", "--gpu-processes", "1"],
-               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin(), "S3_SERVING_R4": r4,
+               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin(), **_r4_env(r4),
                 "S3_HOSTPATH": hostpath, **({"S3_SERVING_BINPROTO": binproto} if binproto else {})})
     try:
         _same(single, _answers(port))
@@ -324,7 +333,7 @@ def test_timing_headers_include_the_batch_time(built, front, r4):
     process's search_batch wall time), the per-request tail breakdown's inputs (native skipped unless built); the
     same under R4 (the Python front's pickle connection then shares the Loop's queue)."""
     _r4_skip(r4)
-    env = {"S3_SERVING_R4": r4}
+    env = _r4_env(r4)
     if front == "native":
         if not _native_bin():
             pytest.skip("serving/native_front is not built")
@@ -404,7 +413,8 @@ def _replay(built, env, magic, stream):
             s.sendall(binproto.frame(item))
             sent += 1
         s.close()
-        _r4_ran(state, env.get("S3_SERVING_R4", "0"))
+        _r4_ran(state, env.get("S3_SERVING_R4", "0") + (":" + env["S3_SERVING_R4_ENCODE"]
+                                                         if "S3_SERVING_R4_ENCODE" in env else ""))
         return out, kinds
     finally:
         assert _stop(p) == 0
@@ -413,7 +423,8 @@ def _replay(built, env, magic, stream):
 @pytest.mark.parametrize("hostpath,magic,r4", [("0", b"S3B3", "stub"), ("stub-prepared", b"S3B3", "stub"),
                                                ("0", b"S3B1", "stub"), ("0", b"S3B2", "stub"),
                                                ("0", b"S3B3", "1"), ("stub-prepared", b"S3B3", "1"),
-                                               ("1", b"S3B3", "1"), ("0", b"S3B1", "1"), ("0", b"S3B2", "1")])
+                                               ("1", b"S3B3", "1"), ("0", b"S3B1", "1"), ("0", b"S3B2", "1"),
+                                               ("0", b"S3B3", "stub:inline"), ("1", b"S3B3", "1:inline")])
 def test_r4_replies_are_todays(built, hostpath, magic, r4):
     """R4's gate on the toy index: one frame stream (each request alone, then pipelined windows that batch, bodies that
     are not JSON, calls) to a GPU process with S3_SERVING_R4 off and on. Every reply's id, status, body bytes and meta
@@ -441,7 +452,7 @@ def test_r4_replies_are_todays(built, hostpath, magic, r4):
         piped += win + [None]
     env = {"S3_HOSTPATH": hostpath}
     a0, k0 = _replay(built, {**env, "S3_SERVING_R4": "0"}, magic, alone)
-    a1, k1 = _replay(built, {**env, "S3_SERVING_R4": r4}, magic, alone)
+    a1, k1 = _replay(built, {**env, **_r4_env(r4)}, magic, alone)
     assert k0 == k1
 
     def norm(rows):
@@ -459,7 +470,7 @@ def test_r4_replies_are_todays(built, hostpath, magic, r4):
     n0, n1 = norm(a0), norm(a1)
     assert len(n0) == len(a0) == len(alone) // 2 and n0 == n1
     p0, _ = _replay(built, {**env, "S3_SERVING_R4": "0"}, magic, piped)
-    p1, _ = _replay(built, {**env, "S3_SERVING_R4": r4}, magic, piped)
+    p1, _ = _replay(built, {**env, **_r4_env(r4)}, magic, piped)
     m0, m1 = norm(p0), norm(p1)
     assert len(m0) == len(p0) == len(piped) - 4
     for k in m0:                                                # the batch size in the meta depends on timing

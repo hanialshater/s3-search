@@ -1,7 +1,8 @@
 # R4 (S6-41) and the Rust crates on CPU: build native/s3_hostpath (the pyo3 extension, with R4's Loop) and
 # serving/native_front, run the native front's cargo tests, then hold the real Rust Loop to its contract
 # (serving/tests/test_r4.py) and run every test_gpu_process case that uses the Rust Loop or the Rust host path, with
-# no skip allowed in those steps. Development checks only; no GPU, nothing deployed.
+# no skip allowed in those steps; then the batch4 phase split (native/s3_hostpath/bench_batch4_phases.py, a timing
+# printed and kept as an artifact, never a score). Development checks only; no GPU, nothing deployed.
 name: rust
 
 on:
@@ -65,3 +66,11 @@ jobs:
           python -m pytest -v -rs -p no:cacheprovider -p r4_select -o faulthandler_timeout=120 --durations=10 \
             serving/tests/test_gpu_process.py | tee /tmp/r4-serving.txt
           if grep -q SKIPPED /tmp/r4-serving.txt; then echo "a test was skipped"; exit 1; fi
+      - name: "batch4 phase split (R4c/R4d, development only): deep and faceted replies, batches of 10 and 64"
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python native/s3_hostpath/bench_batch4_phases.py --reps=300 --out=/tmp/batch4-phases.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: batch4-phases
+          path: /tmp/batch4-phases.json

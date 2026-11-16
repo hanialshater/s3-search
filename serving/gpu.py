@@ -277,18 +277,87 @@ def _bin_bytes(msg, proto: int) -> bytes:
     return hostpath.reply_frame(msg, 1)
 
 
-class _R4Conn:
-    """R4: a native front's connection owned by the Loop. ``put`` encodes the message where it is called (the batch
-    loop at a batch's end, or the call thread) as ``_BinConn``'s writer did, and queues the bytes on the Loop's writer
-    thread, which sends them without the GIL. An encoding error closes the connection (a writer thread's exception
-    ended its sends before) and is counted; it never stops the batch loop."""
-    __slots__ = ("loop", "cid", "proto", "counts")
+def _r4_encode_mode() -> str:
+    """R4c: where R4 encodes the replies. ``thread`` (the default under R4): one encoder thread per GPU process, so the
+    encoding overlaps the next batch's GPU work as the Python writers' did (plat-m40: inline encoding moved the writers'
+    ~23% of a core into the batch thread, which then ran at ~98% of a core and lost that overlap). ``inline``: at the
+    batch's end, in the batch thread (R4 as first built)."""
+    mode = os.environ.get("S3_SERVING_R4_ENCODE", "thread").strip() or "thread"
+    if mode not in ("thread", "inline"):
+        raise ValueError(f"S3_SERVING_R4_ENCODE={mode!r}: thread or inline")
+    return mode
 
-    def __init__(self, loop, cid: int, proto: int, counts: dict | None = None):
-        self.loop, self.cid, self.proto = loop, cid, proto
+
+class _R4Encoder:
+    """R4c: one thread that encodes every front's replies and hands the bytes to the Loop. One FIFO for all the
+    connections keeps each connection's order (the batch loop's and the call thread's puts in the order they were
+    made). The batch loop's handoff is one append per front per batch."""
+
+    def __init__(self, counts: dict):
+        self._d: deque = deque()
+        self._c = threading.Condition(threading.Lock())
+        self._stopping = False
+        self.counts = counts
+        counts.setdefault("encoded", 0)
+        counts.setdefault("encode_queue_max", 0)
+        self._t = threading.Thread(target=self._run, name="gpu-r4-encode", daemon=True)
+        self._t.start()
+
+    def put(self, conn, msg) -> None:
+        with self._c:
+            self._d.append((conn, msg))
+            if len(self._d) > self.counts["encode_queue_max"]:
+                self.counts["encode_queue_max"] = len(self._d)
+            self._c.notify()
+
+    def qsize(self) -> int:
+        return len(self._d)
+
+    def _run(self) -> None:
+        n = 0
+        while True:
+            with self._c:
+                while not self._d and not self._stopping:
+                    self._c.wait()
+                if not self._d:
+                    return
+                work = list(self._d)
+                self._d.clear()
+            for conn, msg in work:
+                conn.send_now(msg)
+            self.counts["encoded"] += len(work)
+            n += 1
+            if n % ACCOUNT_EVERY == 1:
+                _account("encoder")
+
+    def stop(self, timeout: float) -> bool:
+        """Encode and hand over what is queued, then end; True when it finished within ``timeout``."""
+        with self._c:
+            self._stopping = True
+            self._c.notify()
+        self._t.join(timeout)
+        return not self._t.is_alive()
+
+
+class _R4Conn:
+    """R4: a native front's connection owned by the Loop. ``put`` encodes the message as ``_BinConn``'s writer did and
+    queues the bytes on the Loop's writer thread, which sends them without the GIL: on the encoder thread (R4c,
+    ``encoder`` set) or where ``put`` is called (the batch loop at a batch's end, or the call thread). An encoding error
+    closes the connection (a writer thread's exception ended its sends before) and is counted; it never stops the
+    batch loop."""
+    __slots__ = ("loop", "cid", "proto", "counts", "encoder")
+
+    def __init__(self, loop, cid: int, proto: int, counts: dict | None = None, encoder: "_R4Encoder | None" = None):
+        self.loop, self.cid, self.proto, self.encoder = loop, cid, proto, encoder
         self.counts = counts if counts is not None else {"encode_errors": 0}   # the server's, in r4-<j>.json
 
     def put(self, msg) -> None:
+        if self.encoder is not None:
+            self.encoder.put(self, msg)
+        else:
+            self.send_now(msg)
+
+    def send_now(self, msg) -> None:
         try:
             data = _bin_bytes(msg, self.proto)
         except Exception:  # noqa: BLE001 - never lose the batch loop to one front's reply
@@ -392,7 +461,11 @@ class GpuServer:
             # the server's own R4 counts: replies it could not encode (that connection closed), batch items and calls
             # of connections already gone (their fronts left), connections the Loop refused
             self._r4_counts = {"encode_errors": 0, "gone_items": 0, "gone_calls": 0, "refused_conns": 0}
-            log.warning("gpu process %d: R4 serving loop on (%s)", index, getattr(self.r4, "name", type(self.r4).__name__))
+            self.r4_encode = _r4_encode_mode()                  # R4c: S3_SERVING_R4_ENCODE (thread, the default)
+            self._r4_encoder = _R4Encoder(self._r4_counts) if self.r4_encode == "thread" else None
+            log.warning("gpu process %d: R4 serving loop on (%s), replies encoded %s", index,
+                        getattr(self.r4, "name", type(self.r4).__name__),
+                        "on one encoder thread" if self._r4_encoder is not None else "inline in the batch thread")
             if _hostpath() is None:
                 log.warning("gpu process %d: R4 without S3_HOSTPATH: each native frame's JSON is parsed in the batch "
                             "loop's thread, serially with the GPU work (set S3_HOSTPATH=1)", index)
@@ -400,11 +473,13 @@ class GpuServer:
 
     # -- connections
     def serve_forever(self) -> None:
-        threading.Thread(target=self._batch_loop, name="gpu-batches", daemon=True).start()
+        waiters = [threading.Thread(target=self._batch_loop, name="gpu-batches", daemon=True)]
         threading.Thread(target=self._publish_versions, name="gpu-versions", daemon=True).start()
         threading.Thread(target=self._stats, name="gpu-stats", daemon=True).start()
         if getattr(self, "r4", None) is not None:
-            threading.Thread(target=self._r4_calls, name="gpu-r4-calls", daemon=True).start()
+            waiters.append(threading.Thread(target=self._r4_calls, name="gpu-r4-calls", daemon=True))
+        for t in waiters:
+            t.start()
         self.listener.settimeout(0.5)
         while not self._stop.is_set():
             try:
@@ -415,10 +490,22 @@ class GpuServer:
                 break
             conn.settimeout(None)
             threading.Thread(target=self._reader, args=(conn,), daemon=True).start()
+        if getattr(self, "r4", None) is not None:
+            # R4: the batch and call threads wait inside the Loop without the GIL (next_batch, next_call). A daemon
+            # thread that takes the GIL back after the interpreter has begun to finalize is ended with pthread_exit,
+            # which aborts the process when it unwinds through the Rust frames (a GPU process died of SIGABRT at exit
+            # in the rust job). They see _stop within 0.2 s, so wait for them before returning.
+            for t in waiters:
+                t.join(10.0)
+                if t.is_alive():
+                    log.warning("gpu process %d: %s still running at exit", self.index, t.name)
 
     def shutdown(self) -> None:
         self._stop.set()
         if getattr(self, "r4", None) is not None:              # R4: the Loop's threads end, its sockets close
+            enc = getattr(self, "_r4_encoder", None)
+            if enc is not None and not enc.stop(2.0):           # R4c: what is queued is encoded and handed over first
+                log.warning("gpu process %d: R4 encoder still busy at shutdown", self.index)
             left = self.r4.close(2.0)                           # (each writer sends what it has queued first)
             if left:
                 log.warning("gpu process %d: R4 closed with %d connection(s) still sending", self.index, left)
@@ -545,7 +632,8 @@ class GpuServer:
     # -- R4: the Loop's side (serving/r4.py)
     def _r4_add(self, sock: socket.socket, proto: int) -> None:
         cid = next(self._r4_ids)
-        self._r4_conns[cid] = _R4Conn(self.r4, cid, proto, self._r4_counts)   # before the Loop can queue a frame
+        self._r4_conns[cid] = _R4Conn(self.r4, cid, proto, self._r4_counts,   # before the Loop can queue a frame
+                                      getattr(self, "_r4_encoder", None))
         fd = sock.detach()
         try:
             self.r4.add_conn(cid, fd, proto)
@@ -631,6 +719,7 @@ class GpuServer:
         try:
             with open(path + ".tmp", "w") as f:
                 json.dump({"loop": getattr(self.r4, "name", type(self.r4).__name__), "stats": stats,
+                           "encode": getattr(self, "r4_encode", None),
                            "server": {**self._r4_counts, "conns": len(self._r4_conns)},
                            "hostpath": hp.summary() if hasattr(hp, "summary") else None}, f, default=str)
             os.replace(path + ".tmp", path)
