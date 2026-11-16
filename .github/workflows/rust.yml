@@ -67,6 +67,8 @@ jobs:
             serving/tests/test_gpu_process.py | tee /tmp/r4-serving.txt
           if grep -q SKIPPED /tmp/r4-serving.txt; then echo "a test was skipped"; exit 1; fi
       - name: "batch4 phase split (R4c/R4d, development only): deep and faceted replies, batches of 10 and 64"
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: python native/s3_hostpath/bench_batch4_phases.py --reps=300 --out=/tmp/batch4-phases.json
       - uses: actions/upload-artifact@v4
         with:
