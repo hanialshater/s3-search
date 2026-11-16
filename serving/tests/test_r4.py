@@ -240,3 +240,128 @@ def test_load_names_the_switch(monkeypatch):
     monkeypatch.setenv("S3_SERVING_R4", "yes")
     with pytest.raises(ValueError):
         r4.load()
+
+
+def test_close_sends_what_is_queued_then_closes(make):
+    """Shutdown: the writers send what is queued, every connection closes, nothing new is taken."""
+    lp = make()
+    a, b = _conn(lp, 1), _conn(lp, 2)
+    assert lp.send(1, b"bye-1") and lp.send(2, b"bye-2")
+    assert lp.close(5.0) == 0
+    for s, want in ((a, b"bye-1"), (b, b"bye-2")):
+        s.settimeout(5)
+        got = b""
+        while True:
+            k = s.recv(64)
+            if not k:
+                break
+            got += k
+        assert got == want                                       # its queued reply, then EOF
+    assert sorted(lp.closed_conns()) == [1, 2] and lp.closed_conns() == []
+    x, y = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with pytest.raises(ValueError):                              # closed: refused, and the fd is still ours
+        lp.add_conn(3, x.fileno(), 3)
+    os.fstat(x.fileno())
+    x.close()
+    y.close()
+
+
+def test_closed_conns_reports_each_once_and_a_refused_fd_stays_the_callers(make):
+    lp = make()
+    front = _conn(lp, 9)
+    x, y = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with pytest.raises(ValueError):                              # cid in use
+        lp.add_conn(9, x.fileno(), 3)
+    os.fstat(x.fileno())                                         # not closed by the refusal
+    x.sendall(b"ok")
+    assert y.recv(2) == b"ok"
+    x.close()
+    y.close()
+    assert lp.closed_conns() == []
+    front.close()
+    assert _wait(lambda: lp.stats()["conns"] == 0)
+    assert _wait(lambda: lp.closed_conns() == [9])
+    assert lp.closed_conns() == []
+
+
+def test_stats_carry_the_loops_cpu(make):
+    lp = make()
+    front = _conn(lp, 1)
+    front.sendall(b"".join(_frame(_search(i)) for i in range(200)))
+    assert _wait(lambda: lp.qsize() == 200)
+    cpu = lp.stats()["cpu_s"]
+    assert set(cpu) == {"reader", "writer"} and all(v >= 0 for v in cpu.values())
+    front.close()
+
+
+class _RefusingLoop:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def add_conn(self, cid, fd, proto):
+        raise self.exc
+
+
+def _r4_server(loop):
+    from serving import gpu
+    srv = object.__new__(gpu.GpuServer)
+    srv.r4, srv._r4_conns, srv._r4_ids, srv.index = loop, {}, iter(range(1, 100)), 0
+    srv._r4_counts = {"encode_errors": 0, "gone_items": 0, "gone_calls": 0, "refused_conns": 0}
+    return srv
+
+
+def test_a_refused_connection_is_closed_and_forgotten():
+    srv = _r4_server(_RefusingLoop(ValueError("Loop: closed")))
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv._r4_add(a, 3)
+    b.settimeout(5)
+    assert b.recv(4) == b""                                      # the GPU process closed its end
+    assert srv._r4_conns == {} and srv._r4_counts["refused_conns"] == 1
+    b.close()
+
+
+def test_closed_connections_are_forgotten_and_their_items_and_calls_counted(make, caplog, monkeypatch):
+    from serving import gpu
+    lp = make()
+    srv = _r4_server(lp)
+    srv.q = gpu._R4Queue(lp)
+    srv._stop = threading.Event()
+    monkeypatch.setattr(gpu, "_hostpath", lambda: object())     # frames stay raw: no parse needed here
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv._r4_add(a, 3)
+    b.sendall(_frame(_search(1)) + _frame(_call(2)))
+    assert _wait(lambda: lp.qsize() == 1)
+    b.close()
+    assert _wait(lambda: lp.stats()["conns"] == 0)
+    srv._r4_forget()
+    assert srv._r4_conns == {}
+    assert srv._r4_items(lp.next_batch(64, 0.0, 0.2)) == [] and srv._r4_counts["gone_items"] == 1
+    t = threading.Thread(target=srv._r4_calls, daemon=True)
+    with caplog.at_level("WARNING", logger="serving.gpu"):
+        t.start()
+        assert _wait(lambda: srv._r4_counts["gone_calls"] == 1)
+        srv._stop.set()
+        t.join(5)
+    assert any("has closed; not run" in r.getMessage() for r in caplog.records)
+
+
+def test_shutdown_closes_the_loop(make):
+    lp = make()
+    srv = _r4_server(lp)
+    srv._stop = threading.Event()
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv._r4_add(a, 3)
+    assert lp.send(1, b"last")
+    srv.shutdown()
+    b.settimeout(5)
+    assert _recv_all(b) == b"last" and lp.stats()["conns"] == 0
+    b.close()
+
+
+def _recv_all(s):
+    got = b""
+    while True:
+        k = s.recv(64)
+        if not k:
+            return got
+        got += k

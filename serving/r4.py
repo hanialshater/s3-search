@@ -26,8 +26,17 @@ What a Loop does (the contract both implementations follow; serving/tests/test_r
 - ``set_in_batch(n)``: the batch in hand's size, for the load slot (written with the queue length, under its lock).
 - ``next_call(timeout_s)``: ``(cid, payload)`` of the next call frame, or None.
 - ``send(cid, data) -> bool``: queue bytes for connection ``cid``'s writer; False when it is gone (counted).
+  On a ValueError (the Loop closed, ``cid`` in use) ``fd`` is still the caller's to close; on a RuntimeError (its
+  threads could not start) the Loop took it and has shut it.
 - ``close_conn(cid)``: shut the connection down (its threads then end).
-- ``qsize()``, ``stats() -> dict``: the queue length; the Loop's counters.
+- ``closed_conns() -> list``: the connections both of whose threads have ended since the last call, each once, so
+  the caller can forget them.
+- ``close(timeout_s=2.0) -> int``: shutdown. No new connection or frame is taken; each connection's reader ends and
+  its writer sends what is already queued, then closes the socket. Waits up to ``timeout_s`` for that (a front that
+  reads nothing can hold its writer) and returns how many connections are still open.
+- ``qsize()``, ``stats() -> dict``: the queue length; the Loop's counters, with ``cpu_s`` (``{"reader", "writer"}``:
+  the CPU seconds of the Loop's reader and writer threads, so the 5 s log shows where the host time went once it has
+  left Python's threads).
 
 The Loop holds no Python object while it waits (the proposal's GIL rule): frames are bytes it owns until
 ``next_batch`` hands them over. Development only; the default is off.
@@ -64,6 +73,7 @@ class _PyConn:
         self.out: deque = deque()
         self.c = threading.Condition(threading.Lock())
         self.reader_done = self.dead = False
+        self.ended = 0
 
 
 class PyLoop:
@@ -80,6 +90,10 @@ class PyLoop:
         self._lock = threading.Lock()
         self._load = os.open(load_path, os.O_RDWR) if load_path else None
         self._slot = int(load_slot)
+        self._closing = False
+        self._closed: list = []
+        self._cpu = {"reader": 0.0, "writer": 0.0}            # ended threads' CPU seconds
+        self._live: dict = {}                                    # thread ident -> (kind, its thread_time so far)
         self.st = {k: 0 for k in ("conns_opened", "conns_closed", "frames", "searches", "calls", "bad_heads",
                                   "pushed", "batches", "batch_items", "sends", "send_bytes", "send_dropped",
                                   "send_errors", "max_out_depth")}
@@ -99,12 +113,14 @@ class PyLoop:
 
     # -- connections
     def add_conn(self, cid: int, fd: int, proto: int) -> None:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=fd)
-        sock.setblocking(True)
-        c = _PyConn(self, cid, sock, proto)
-        with self._lock:
+        with self._lock:                                        # checked before the fd is wrapped: on a refusal it
+            if self._closing:                                   # stays the caller's
+                raise ValueError("Loop: closed")
             if cid in self._conns:
                 raise ValueError(f"connection {cid} exists")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=fd)
+            sock.setblocking(True)
+            c = _PyConn(self, cid, sock, proto)
             self._conns[cid] = c
             self.st["conns_opened"] += 1
         threading.Thread(target=self._reader, args=(c,), name=f"r4-read-{cid}", daemon=True).start()
@@ -120,16 +136,34 @@ class PyLoop:
             got += k
         return bytes(buf)
 
+    def _tick(self, kind: str) -> None:
+        self._live[threading.get_ident()] = (kind, time.thread_time())
+
+    def _end(self, c: _PyConn, kind: str) -> None:
+        self._live.pop(threading.get_ident(), None)
+        with self._lock:
+            self._cpu[kind] += time.thread_time()
+            c.ended += 1
+            if c.ended == 2:
+                self._closed.append(c.cid)
+
     def _reader(self, c: _PyConn) -> None:
+        try:
+            self._reader_loop(c)
+        finally:
+            self._end(c, "reader")
+
+    def _reader_loop(self, c: _PyConn) -> None:
         try:
             while True:
                 head = self._read(c.sock, 4)
                 if head is None:
                     return
                 p = self._read(c.sock, _U32.unpack(head)[0])
-                if not p:                                       # EOF, or an empty frame (a Python reader's IndexError)
-                    return
+                if not p or self._closing:                      # EOF, an empty frame (a Python reader's IndexError)
+                    return                                      # or closing
                 self.st["frames"] += 1
+                self._tick("reader")
                 if p[0] == 1:
                     h = search_head(p)
                     if h is None:
@@ -154,6 +188,12 @@ class PyLoop:
 
     def _writer(self, c: _PyConn) -> None:
         try:
+            self._writer_loop(c)
+        finally:
+            self._end(c, "writer")
+
+    def _writer_loop(self, c: _PyConn) -> None:
+        try:
             while True:
                 with c.c:
                     while not c.out and not c.reader_done and not c.dead:
@@ -165,6 +205,7 @@ class PyLoop:
                 try:
                     for b in bufs:
                         c.sock.sendall(b)
+                    self._tick("writer")
                 except OSError:
                     with c.c:
                         c.dead = True
@@ -242,8 +283,33 @@ class PyLoop:
             except OSError:
                 pass
 
+    def closed_conns(self) -> list:
+        with self._lock:
+            out, self._closed = self._closed, []
+        return out
+
+    def close(self, timeout: float = 2.0) -> int:
+        with self._lock:
+            self._closing = True
+            conns = list(self._conns.values())
+        for c in conns:
+            try:
+                c.sock.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+            with c.c:
+                c.reader_done = True
+                c.c.notify()
+        end = time.perf_counter() + timeout
+        while self._conns and time.perf_counter() < end:
+            time.sleep(0.005)
+        return len(self._conns)
+
     def stats(self) -> dict:
-        return {**self.st, "queued": len(self._d), "conns": len(self._conns)}
+        cpu = dict(self._cpu)
+        for kind, v in list(self._live.values()):
+            cpu[kind] += v
+        return {**self.st, "queued": len(self._d), "conns": len(self._conns), "cpu_s": cpu}
 
 
 def load():

@@ -8,8 +8,17 @@
 //! The GIL rule: nothing here holds a Python object. The queues hold Rust bytes and the batch is turned into Python
 //! objects only after the wait, under the GIL. The load slot (serving/gpu.py `LoadTable`, `load.bin`) is written with
 //! `pwrite` under the queue's lock, so its value is never stale against a later one.
+//!
+//! Shutdown (`close`): no new connection or frame is taken; every connection's read side is shut, so its reader ends
+//! and its writer sends what is already queued, then closes the socket. `close` waits (without the GIL) up to its
+//! timeout for that and returns how many connections are still open. A connection whose threads have both ended is
+//! reported once by `closed_conns`, so the caller can forget it.
+//!
+//! CPU (`stats()["cpu_s"]`): each Loop thread's time on a CPU, from Linux's /proc/<pid>/task/<tid>/schedstat (its first
+//! field, nanoseconds), the live threads read when asked and the ended ones summed as they end; 0 where /proc has no
+//! schedstat (not Linux).
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::{HashMap, VecDeque};
@@ -17,9 +26,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +55,9 @@ struct Conn {
     stream: UnixStream,
     out: Mutex<Out>,
     cv: Condvar,
+    reader_tid: AtomicU64,   // the reader's Linux thread id while it runs (0 otherwise), for its CPU
+    writer_tid: AtomicU64,
+    ended: AtomicU64,        // threads of this connection that have ended (2: both)
 }
 
 const STATS: [&str; 14] = [
@@ -75,6 +87,9 @@ struct Shared {
     conns: Mutex<HashMap<u32, Arc<Conn>>>,
     load: Option<(File, u64)>,
     st: [AtomicU64; 14],
+    closing: AtomicBool,
+    closed: Mutex<Vec<u32>>,         // connections both of whose threads have ended, not yet reported
+    cpu_done_ns: [AtomicU64; 2],     // CPU of ended reader and writer threads
 }
 
 impl Shared {
@@ -87,6 +102,13 @@ impl Shared {
         if let Some((f, off)) = &self.load {
             let v = (q.d.len() + q.in_batch) as i64;
             let _ = f.write_at(&v.to_le_bytes(), *off);
+        }
+    }
+
+    fn ended(&self, cid: u32, c: &Conn) {
+        // a connection's reader or writer has ended; the second to end reports the connection closed
+        if c.ended.fetch_add(1, Ordering::AcqRel) == 1 {
+            self.closed.lock().unwrap().push(cid);
         }
     }
 
@@ -149,7 +171,33 @@ fn search_head(p: &[u8]) -> Option<(u64, String)> {
     String::from_utf8(p[11..end].to_vec()).ok().map(|name| (id, name))
 }
 
+/// This thread's Linux thread id (from /proc/thread-self), or 0.
+fn own_tid() -> u64 {
+    std::fs::read_link("/proc/thread-self").ok()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// Nanoseconds on a CPU of thread `tid` of this process (schedstat's first field), or 0.
+fn thread_cpu_ns(tid: u64) -> u64 {
+    if tid == 0 {
+        return 0;
+    }
+    std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat")).ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|x| x.parse().ok()))
+        .unwrap_or(0)
+}
+
 fn reader(sh: Arc<Shared>, cid: u32, c: Arc<Conn>) {
+    let tid = own_tid();
+    c.reader_tid.store(tid, Ordering::Relaxed);
+    reader_loop(&sh, cid, &c);
+    sh.cpu_done_ns[0].fetch_add(thread_cpu_ns(tid), Ordering::Relaxed);
+    c.reader_tid.store(0, Ordering::Relaxed);
+    sh.ended(cid, &c);
+}
+
+fn reader_loop(sh: &Shared, cid: u32, c: &Conn) {
     let mut r = BufReader::with_capacity(READ_BUF, &c.stream);
     let mut head = [0u8; 4];
     loop {
@@ -160,6 +208,9 @@ fn reader(sh: Arc<Shared>, cid: u32, c: Arc<Conn>) {
         let mut p = vec![0u8; n];
         if r.read_exact(&mut p).is_err() || p.is_empty() {
             break; // EOF, or an empty frame (a Python reader's IndexError closed it too)
+        }
+        if sh.closing.load(Ordering::Relaxed) {
+            break; // closing: no new frame is taken
         }
         sh.add(S_FRAMES, 1);
         if p[0] == 1 {
@@ -186,6 +237,15 @@ fn reader(sh: Arc<Shared>, cid: u32, c: Arc<Conn>) {
 }
 
 fn writer(sh: Arc<Shared>, cid: u32, c: Arc<Conn>) {
+    let tid = own_tid();
+    c.writer_tid.store(tid, Ordering::Relaxed);
+    writer_loop(&sh, cid, &c);
+    sh.cpu_done_ns[1].fetch_add(thread_cpu_ns(tid), Ordering::Relaxed);
+    c.writer_tid.store(0, Ordering::Relaxed);
+    sh.ended(cid, &c);
+}
+
+fn writer_loop(sh: &Shared, cid: u32, c: &Conn) {
     loop {
         let bufs: Vec<Vec<u8>> = {
             let mut o = c.out.lock().unwrap();
@@ -259,6 +319,9 @@ impl Loop {
             conns: Mutex::new(HashMap::new()),
             load,
             st: Default::default(),
+            closing: AtomicBool::new(false),
+            closed: Mutex::new(Vec::new()),
+            cpu_done_ns: Default::default(),
         };
         Ok(Loop { sh: Arc::new(sh), base, base_pc: perf_now })
     }
@@ -269,19 +332,31 @@ impl Loop {
     }
 
     /// Take the connected socket `fd` (after its magic) as connection `cid`; start its reader and writer threads.
+    /// A ValueError (the Loop closing, a cid in use, a socket it cannot set blocking) leaves `fd` the caller's to
+    /// close; a RuntimeError (its threads could not start) means the Loop took `fd` and has shut it.
     fn add_conn(&self, cid: u32, fd: RawFd, proto: u8) -> PyResult<()> {
         let _ = proto; // the wire format of the replies is the caller's (it encodes them); kept for the stats' sake
+        if self.sh.closing.load(Ordering::Relaxed) {
+            return Err(PyValueError::new_err("Loop: closed"));
+        }
         let stream = unsafe { UnixStream::from_raw_fd(fd) };
-        stream.set_nonblocking(false).map_err(|e| PyValueError::new_err(format!("Loop: fd {fd}: {e}")))?;
-        let c = Arc::new(Conn { stream, out: Mutex::new(Out { q: VecDeque::new(), reader_done: false, dead: false }),
-                                cv: Condvar::new() });
-        {
+        if let Err(e) = stream.set_nonblocking(false) {
+            let _ = stream.into_raw_fd(); // back to the caller, not closed here
+            return Err(PyValueError::new_err(format!("Loop: fd {fd}: {e}")));
+        }
+        let c = {
             let mut m = self.sh.conns.lock().unwrap();
             if m.contains_key(&cid) {
+                drop(m);
+                let _ = stream.into_raw_fd(); // back to the caller, not closed here
                 return Err(PyValueError::new_err(format!("Loop: connection {cid} exists")));
             }
+            let c = Arc::new(Conn { stream, out: Mutex::new(Out { q: VecDeque::new(), reader_done: false, dead: false }),
+                                    cv: Condvar::new(), reader_tid: AtomicU64::new(0), writer_tid: AtomicU64::new(0),
+                                    ended: AtomicU64::new(0) });
             m.insert(cid, c.clone());
-        }
+            c
+        };
         self.sh.add(S_OPENED, 1);
         let (sh, c2) = (self.sh.clone(), c.clone());
         let r = thread::Builder::new().name(format!("r4-read-{cid}")).spawn(move || reader(sh, cid, c2));
@@ -289,9 +364,48 @@ impl Loop {
         let w = thread::Builder::new().name(format!("r4-write-{cid}")).spawn(move || writer(sh, cid, c3));
         if r.is_err() || w.is_err() {
             let _ = c.stream.shutdown(Shutdown::Both);
-            return Err(PyValueError::new_err("Loop: could not start the connection's threads"));
+            if r.is_err() {
+                c.out.lock().unwrap().reader_done = true; // the writer, if it started, ends after its queue
+                c.cv.notify_one();
+                self.sh.ended(cid, &c);
+            }
+            if w.is_err() {
+                self.sh.conns.lock().unwrap().remove(&cid);
+                self.sh.ended(cid, &c);
+            }
+            return Err(PyRuntimeError::new_err("Loop: could not start the connection's threads (it is shut)"));
         }
         Ok(())
+    }
+
+    /// Shut down: no new connection or frame; every connection's reader ends and its writer sends what is queued,
+    /// then closes. Waits up to `timeout` seconds (without the GIL); returns the connections still open.
+    #[pyo3(signature = (timeout=2.0))]
+    fn close(&self, py: Python<'_>, timeout: f64) -> usize {
+        self.sh.closing.store(true, Ordering::Relaxed);
+        let conns: Vec<Arc<Conn>> = self.sh.conns.lock().unwrap().values().cloned().collect();
+        for c in &conns {
+            let _ = c.stream.shutdown(Shutdown::Read);
+            c.out.lock().unwrap().reader_done = true;
+            c.cv.notify_one();
+        }
+        let sh = self.sh.clone();
+        let t = secs(timeout);
+        py.allow_threads(move || {
+            let end = Instant::now() + t;
+            loop {
+                let n = sh.conns.lock().unwrap().len();
+                if n == 0 || Instant::now() >= end {
+                    return n;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    /// Connections both of whose threads have ended since the last call, each reported once.
+    fn closed_conns(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.sh.closed.lock().unwrap())
     }
 
     /// A pickle connection's request, by its token, into the same queue.
@@ -384,6 +498,15 @@ impl Loop {
             d.set_item(*k, self.sh.st[i].load(Ordering::Relaxed))?;
         }
         d.set_item("queued", self.sh.q.lock().unwrap().d.len())?;
+        let (mut rd, mut wr) = (self.sh.cpu_done_ns[0].load(Ordering::Relaxed), self.sh.cpu_done_ns[1].load(Ordering::Relaxed));
+        for c in self.sh.conns.lock().unwrap().values() {
+            rd += thread_cpu_ns(c.reader_tid.load(Ordering::Relaxed));
+            wr += thread_cpu_ns(c.writer_tid.load(Ordering::Relaxed));
+        }
+        let cpu = PyDict::new_bound(py);
+        cpu.set_item("reader", rd as f64 * 1e-9)?;
+        cpu.set_item("writer", wr as f64 * 1e-9)?;
+        d.set_item("cpu_s", cpu)?;
         d.set_item("conns", self.sh.conns.lock().unwrap().len())?;
         Ok(d)
     }

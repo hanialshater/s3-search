@@ -282,16 +282,17 @@ class _R4Conn:
     loop at a batch's end, or the call thread) as ``_BinConn``'s writer did, and queues the bytes on the Loop's writer
     thread, which sends them without the GIL. An encoding error closes the connection (a writer thread's exception
     ended its sends before) and is counted; it never stops the batch loop."""
-    __slots__ = ("loop", "cid", "proto", "errors")
+    __slots__ = ("loop", "cid", "proto", "counts")
 
-    def __init__(self, loop, cid: int, proto: int):
-        self.loop, self.cid, self.proto, self.errors = loop, cid, proto, 0
+    def __init__(self, loop, cid: int, proto: int, counts: dict | None = None):
+        self.loop, self.cid, self.proto = loop, cid, proto
+        self.counts = counts if counts is not None else {"encode_errors": 0}   # the server's, in r4-<j>.json
 
     def put(self, msg) -> None:
         try:
             data = _bin_bytes(msg, self.proto)
         except Exception:  # noqa: BLE001 - never lose the batch loop to one front's reply
-            self.errors += 1
+            self.counts["encode_errors"] += 1
             log.exception("R4: encoding a reply for connection %d failed; closing it", self.cid)
             self.loop.close_conn(self.cid)
             return
@@ -388,7 +389,13 @@ class GpuServer:
             self.q = _R4Queue(self.r4)
             self._r4_conns: dict[int, _R4Conn] = {}
             self._r4_ids = iter(range(1, 1 << 31))
+            # the server's own R4 counts: replies it could not encode (that connection closed), batch items and calls
+            # of connections already gone (their fronts left), connections the Loop refused
+            self._r4_counts = {"encode_errors": 0, "gone_items": 0, "gone_calls": 0, "refused_conns": 0}
             log.warning("gpu process %d: R4 serving loop on (%s)", index, getattr(self.r4, "name", type(self.r4).__name__))
+            if _hostpath() is None:
+                log.warning("gpu process %d: R4 without S3_HOSTPATH: each native frame's JSON is parsed in the batch "
+                            "loop's thread, serially with the GPU work (set S3_HOSTPATH=1)", index)
             self._r4_note()
 
     # -- connections
@@ -411,6 +418,10 @@ class GpuServer:
 
     def shutdown(self) -> None:
         self._stop.set()
+        if getattr(self, "r4", None) is not None:              # R4: the Loop's threads end, its sockets close
+            left = self.r4.close(2.0)                           # (each writer sends what it has queued first)
+            if left:
+                log.warning("gpu process %d: R4 closed with %d connection(s) still sending", self.index, left)
 
     def _reader(self, sock: socket.socket) -> None:
         first = _read_into(sock, 4)
@@ -534,12 +545,24 @@ class GpuServer:
     # -- R4: the Loop's side (serving/r4.py)
     def _r4_add(self, sock: socket.socket, proto: int) -> None:
         cid = next(self._r4_ids)
-        self._r4_conns[cid] = _R4Conn(self.r4, cid, proto)     # before the Loop can queue a frame of it
+        self._r4_conns[cid] = _R4Conn(self.r4, cid, proto, self._r4_counts)   # before the Loop can queue a frame
+        fd = sock.detach()
         try:
-            self.r4.add_conn(cid, sock.detach(), proto)
-        except Exception:  # noqa: BLE001
+            self.r4.add_conn(cid, fd, proto)
+        except ValueError:                                      # refused: the fd is still ours (serving/r4.py)
             self._r4_conns.pop(cid, None)
-            log.exception("R4: the Loop refused a connection")
+            self._r4_counts["refused_conns"] += 1
+            os.close(fd)
+            log.warning("R4: the Loop refused connection %d", cid, exc_info=True)
+        except Exception:  # noqa: BLE001 - its threads did not start: the Loop has shut the fd
+            self._r4_conns.pop(cid, None)
+            self._r4_counts["refused_conns"] += 1
+            log.exception("R4: the Loop could not start connection %d", cid)
+
+    def _r4_forget(self) -> None:
+        """Drop the connections the Loop reports closed (both its threads ended), so ``_r4_conns`` does not grow."""
+        for cid in self.r4.closed_conns():
+            self._r4_conns.pop(cid, None)
 
     def _r4_items(self, entries: list) -> list[_Item]:
         """The Loop's batch as the batch loop's items. A frame becomes what ``_bin_reader`` made of it: the raw
@@ -552,7 +575,10 @@ class GpuServer:
                 if it is not None:
                     out.append(it)
                 continue
-            conn = conns[cid]
+            conn = conns.get(cid)
+            if conn is None:                                    # its front has gone and the Loop closed it
+                self._r4_counts["gone_items"] += 1
+                continue
             if hp is not None:
                 it = _Item(conn, id_, name, None, raw=raw)
             else:
@@ -579,6 +605,7 @@ class GpuServer:
         from . import binproto
         while not self._stop.is_set():
             got = self.r4.next_call(0.2)
+            self._r4_forget()
             if got is None:
                 continue
             cid, payload = got
@@ -588,8 +615,12 @@ class GpuServer:
             except Exception:  # noqa: BLE001 - its reader would have died on it: the connection closes
                 self.r4.close_conn(cid)
                 continue
-            if conn is not None:
-                self.calls.submit(self._call, conn, ("call", id_, method, path, body, {}))
+            if conn is None:                                    # its connection closed before the call ran
+                self._r4_counts["gone_calls"] += 1
+                log.warning("R4: a call (%s %s, id %d) for connection %d, which has closed; not run", method, path,
+                            id_, cid)
+                continue
+            self.calls.submit(self._call, conn, ("call", id_, method, path, body, {}))
 
     def _r4_note(self, stats: dict | None = None) -> None:
         """``r4-<index>.json`` in the state directory: the Loop's name and, every 5 s, its counters (tests read it)."""
@@ -600,6 +631,7 @@ class GpuServer:
         try:
             with open(path + ".tmp", "w") as f:
                 json.dump({"loop": getattr(self.r4, "name", type(self.r4).__name__), "stats": stats,
+                           "server": {**self._r4_counts, "conns": len(self._r4_conns)},
                            "hostpath": hp.summary() if hasattr(hp, "summary") else None}, f, default=str)
             os.replace(path + ".tmp", path)
         except OSError:
@@ -815,6 +847,7 @@ class GpuServer:
     def _stats(self, every: float = 5.0) -> None:
         last = (0, 0, 0.0, time.perf_counter())
         last_cpu: dict = {}
+        last_loop: dict = {}                                    # R4: the Loop's thread CPU at the last log
         while not self._stop.wait(every):
             cpu = {}
             for (kind, _), v in list(THREAD_CPU.items()):
@@ -834,8 +867,12 @@ class GpuServer:
                          self.q.qsize(), share, {k: round(v / 2**20) for k, v in mem.items()})
             if getattr(self, "r4", None) is not None:
                 st = dict(self.r4.stats())
+                lcpu = st.get("cpu_s") or {}                    # the Loop's threads: the host time that left Python's
                 if nb != last[0] or self.q.qsize():
-                    log.info("gpu process %d: R4 loop %s", self.index, json.dumps(st))
+                    share = {k: round(100 * (v - last_loop.get(k, 0.0)) / dt) for k, v in sorted(lcpu.items())}
+                    log.info("gpu process %d: R4 loop CPU %% of a core %s; %s; server %s", self.index, share,
+                             json.dumps(st), json.dumps(self._r4_counts))
+                last_loop = dict(lcpu)
                 self._r4_note(st)
             last = (nb, nr, busy, t)
             last_cpu = cpu

@@ -886,7 +886,12 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
       batch's end as that protocol's writer encoded them, then sent by the Loop. A pickle connection keeps its Python
       reader and shares the Loop's queue.
     - A frame whose head cannot be read closes its connection, as before. The GPU process writes `r4-<j>.json` in the
-      state directory: the Loop's name and, every 5 s, its counters and the host path's summary.
+      state directory: the Loop's name and, every 5 s, its counters (with its reader and writer threads' CPU), the
+      host path's summary and the server's own R4 counts (replies it could not encode, items and calls of connections
+      already closed, refused connections). The 5 s log shows the Loop's CPU as a share of a core.
+    - Shutdown closes the Loop: no new connection or frame, each writer sends what it has queued, then every socket
+      closes (up to 2 s). Closed connections are forgotten; a call that arrives for one is logged and not run.
+    - R4 without `S3_HOSTPATH=1` is allowed but warned: each frame's JSON is then parsed in the batch loop's thread.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:
