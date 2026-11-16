@@ -43,6 +43,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -70,6 +71,49 @@ THREAD_CPU: dict = {}                                           # thread name ->
 def _account(kind: str) -> None:
     """Record this thread's CPU time under its kind (reader, writer, batches, ...); the 5 s log sums them."""
     THREAD_CPU[(kind, threading.get_ident())] = time.thread_time()
+
+
+ACCOUNT_EVERY = 32          # R4a: a reader records its CPU time every 32 frames (the 5 s log lags by at most that)
+
+
+class _BatchQueue:
+    """R4a: the requests waiting for the batch loop, a deque under one condition variable. The batch loop takes a
+    whole batch in one lock hold; a queue.Queue took one lock and one condition round per item. ``put`` and ``qsize``
+    are queue.Queue's; ``take`` is ``_collect``'s rule: the first item (waiting up to ``first_timeout``), then whatever
+    is queued up to ``mb``, then, with a ``wait``, arrivals until ``wait`` after the first item or the batch is full."""
+
+    def __init__(self):
+        self._d: deque = deque()
+        self._c = threading.Condition(threading.Lock())
+
+    def put(self, item) -> None:
+        with self._c:
+            self._d.append(item)
+            self._c.notify()
+
+    def qsize(self) -> int:
+        return len(self._d)
+
+    def take(self, mb: int, wait: float, first_timeout: float = 0.2) -> list:
+        d, c = self._d, self._c
+        with c:
+            if not d:
+                end = time.perf_counter() + first_timeout
+                while not d:
+                    left = end - time.perf_counter()
+                    if left <= 0 or not c.wait(left) and not d:
+                        return []
+            deadline = time.perf_counter() + wait
+            batch = [d.popleft() for _ in range(min(mb, len(d)))]
+            while len(batch) < mb and wait > 0:
+                left = deadline - time.perf_counter()
+                if left <= 0:
+                    break
+                if not d:
+                    c.wait(left)
+                while d and len(batch) < mb:
+                    batch.append(d.popleft())
+            return batch
 
 
 # ---- frames ------------------------------------------------------------------------------------------------------------
@@ -253,7 +297,8 @@ def _search_batch(index, requests: list) -> tuple[list, bool]:
 class GpuServer:
     def __init__(self, app, sock_path: str, index: int = 0, state_dir: str | None = None):
         self.app, self.sock_path, self.index, self.state_dir = app, sock_path, index, state_dir
-        self.q: queue.Queue[_Item] = queue.Queue()
+        self.q = _BatchQueue()                                  # R4a: a deque and one condition variable
+        self._ok: dict = {}                                     # R4a: index name -> [mi, ok answers this batch]
         self.calls = ThreadPoolExecutor(1, thread_name_prefix="gpu-call")
         self.listener = unix_listen(sock_path)
         self._stop = threading.Event()
@@ -291,6 +336,7 @@ class GpuServer:
             return self._bin_reader(sock, {b"S3B1": 1, b"S3B2": 2, b"S3B3": 3}[bytes(first)])
         conn = _Conn(sock)
         pending = bytes(first)
+        nread = 0
         try:
             while True:
                 if pending:                                     # the first frame's header began with those 4 bytes
@@ -305,7 +351,9 @@ class GpuServer:
                     return
                 if msg[0] == "search":
                     self.q.put(_Item(conn, msg[1], msg[2], msg[3]))
-                    _account("reader")
+                    nread += 1
+                    if nread % ACCOUNT_EVERY == 1:
+                        _account("reader")
                     self._publish_load()
                 elif msg[0] == "call":
                     self.calls.submit(self._call, conn, msg)
@@ -321,6 +369,7 @@ class GpuServer:
     def _bin_reader(self, sock: socket.socket, proto: int = 1) -> None:
         from . import binproto
         conn = _BinConn(sock, proto)
+        nread = 0
         try:
             while True:
                 head = _read_into(sock, 4)
@@ -333,7 +382,9 @@ class GpuServer:
                 if hp is not None and payload[0] == 1:          # S3_HOSTPATH: the batch loop prepares the raw frame
                     id_, name = binproto.search_head(payload)
                     self.q.put(_Item(conn, id_, name, None, raw=bytes(payload)))
-                    _account("reader")
+                    nread += 1
+                    if nread % ACCOUNT_EVERY == 1:
+                        _account("reader")
                     self._publish_load()
                     continue
                 tp = time.perf_counter()
@@ -346,7 +397,9 @@ class GpuServer:
                     item = _Item(conn, msg[1], msg[2], msg[3])
                     item.parse_ms = parse_ms
                     self.q.put(item)
-                    _account("reader")
+                    nread += 1
+                    if nread % ACCOUNT_EVERY == 1:
+                        _account("reader")
                     self._publish_load()
                 else:
                     _, id_, method, path, body = msg
@@ -383,28 +436,9 @@ class GpuServer:
     # -- the batch loop
     def _collect(self) -> list[_Item]:
         """The next batch: the first request, then whatever is queued, up to the max batch; with a batch wait, keep
-        taking arrivals until the wait after the first request has passed or the batch is full."""
+        taking arrivals until the wait after the first request has passed or the batch is full (_BatchQueue.take)."""
         mb, wait = getattr(self, "batch_settings", None) or _batch_settings()
-        try:
-            first = self.q.get(timeout=0.2)
-        except queue.Empty:
-            return []
-        batch = [first]
-        deadline = time.perf_counter() + wait
-        while len(batch) < mb:
-            try:
-                batch.append(self.q.get_nowait())
-                continue
-            except queue.Empty:
-                pass
-            left = deadline - time.perf_counter()
-            if left <= 0:
-                break
-            try:
-                batch.append(self.q.get(timeout=left))
-            except queue.Empty:
-                break
-        return batch
+        return self.q.take(mb, wait)
 
     def _batch_loop(self) -> None:
         while not self._stop.is_set():
@@ -427,6 +461,7 @@ class GpuServer:
                     status, body = classify(exc)
                     for it in items:
                         self._reply(it, ("search", it.id, "error", status, body))
+            self._count_ok()
             self._flush()
             self.in_batch = 0
             _account("batches")
@@ -589,11 +624,27 @@ class GpuServer:
                 mi.attach_source(resp, src)
             except Exception as exc:  # noqa: BLE001
                 return self._fail([it], exc)
-        mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
+        if getattr(self, "_out", None) is None:                 # outside a batch: counted now, as before
+            mi.metrics.inc("s3_search_requests_total", index=mi.name, outcome="ok")
+        else:                                                   # R4a: inside a batch, once per batch (_count_ok)
+            okd = self.__dict__.setdefault("_ok", {})
+            ok = okd.get(mi.name)
+            if ok is None or ok[0] is not mi:
+                self._count_ok()                                # a different index object: count what we have first
+                okd = self.__dict__.setdefault("_ok", {})
+                okd[mi.name] = ok = [mi, 0]
+            ok[1] += 1
         msg = ("search", it.id, "ok", resp, version, wait_ms, size)
         # [7] batch_ms (X-S3-Batch-Ms), [8] the answer's perf_counter (the writer's wait from it: post_ms), [9] the
         # reader's parse_ms: the front's share of a request split into its parts (S6-22s timers)
         self._reply(it, msg + (batch_ms, time.perf_counter(), it.parse_ms))
+
+    def _count_ok(self) -> None:
+        """The batch's ok answers into s3_search_requests_total, one inc per index (R4a; it was one per answer)."""
+        ok, self._ok = getattr(self, "_ok", {}), {}
+        for name, (mi, n) in ok.items():
+            if n:
+                mi.metrics.inc("s3_search_requests_total", n, index=name, outcome="ok")
 
     # -- what the process is doing, every 5 s in its log (and gauges): batches, queue, device memory
     def _stats(self, every: float = 5.0) -> None:
