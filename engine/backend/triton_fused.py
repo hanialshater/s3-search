@@ -141,7 +141,10 @@ if triton is not None:
         acc = tl.load(acc_ptr + base + dd, mask=inb_t, other=0.0)
         cnt = tl.load(cnt_ptr + base + dd, mask=inb_t, other=0)
         live = tl.load(live_ptr + dd, mask=inb_t, other=0)
-        msm = tl.load(msm_ptr + g)
+        # int32 whatever the pointer's type. The packed path and the Rust host route pass msm in their int64 block, and
+        # an int64 msm widens the whole tile's count compare to 64 bits (plat-m38: the packed path 15% slower). msm is
+        # at most the number of query terms, so the cast is exact.
+        msm = tl.load(msm_ptr + g).to(tl.int32)
         boost = tl.load(boost_ptr + g)
         match = inb_t & (cnt >= msm) & (live != 0)
         s32 = acc.to(tl.float32)
@@ -288,6 +291,17 @@ def _run_kernel(b, part, terms, w, bb, k1, idf, msm, boost, live, facet_codes, f
     sizes = [int(s) for s in facet_sizes]
     offs = [int(x) for x in np.cumsum([0] + [Q * s for s in sizes])[:-1]] if nf else []
     R = len(row_start)
+    if os.environ.get("S3_FUSED_PACK", "0") != "1":
+        # plat-m36: the per-array inputs as a7e65c5 built them (one small copy each, msm as int32), the faster
+        # default there. S3_FUSED_PACK=1 is #34's two packed copies, kept for the A/B that decides between them.
+        t64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=dev)  # noqa: E731
+        vi = [t64(row_start or [0]), t64(row_len or [0]), t64(q_lo), t64(q_hi),
+              torch.tensor([int(m) for m in msm], dtype=torch.int32, device=dev), t64(offs or [0]), t64(sizes or [1]),
+              t64(row_term) if row_term else None]
+        w_d = b.asarray(np.asarray(w, np.float32), "float32")
+        vf = [w_d, None, None, torch.tensor([float(x) for x in boost], dtype=torch.float32, device=dev)]
+        return _launch(b, part, k1, idf, Q, R, vi, vf, live, facet_codes, sizes, offs, np.asarray(bb, np.float32),
+                       np.asarray(w, np.float32))
     # S6-24: every small per-call array in two host-to-device copies (one int64, one float32), not one per array
     ints = [row_start or [0], row_len or [0], q_lo, q_hi, [int(m) for m in msm], offs or [0], sizes or [1],
             row_term or [0]]

@@ -797,7 +797,9 @@ def engine_target(ds, server_cpus):
            **dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # e.g. S3_TRITON_BM25=1
     COMPETITOR.setdefault("engine", {})["server_env"] = {      # provenance: what the server ran with (the steward's ask)
         k: v for k, v in env.items() if k.startswith(("S3_SERVING_", "S3_SEARCH_", "S3_TRITON", "S3_PLAN_CACHE",
-                                                      "S3_CUDA_", "S3_HOSTPATH"))}
+                                                      "S3_CUDA_", "S3_HOSTPATH", "S3_FUSED_"))
+        or k in dict(kv.split("=", 1) for kv in opt("server-env", "").split(",") if "=" in kv)}   # every --server-env key too
+    # (plat-m38: S3_FUSED_PACK was passed but not recorded here; the steward, lab e6fbc25)
     COMPETITOR["engine"]["server_env_arg"] = opt("server-env", "")
     if native:
         COMPETITOR["engine"]["native_front"] = native
@@ -848,7 +850,9 @@ def _role(p) -> str:
     for flag, name in (("--gpu-process", "gpu process"), ("--gpu-sockets", "front"), ("--worker-index", "worker")):
         if flag in a:
             i = a.index(flag)
-            j = a[i + 1] if flag != "--gpu-sockets" else a[a.index("--worker-index") + 1] if "--worker-index" in a else "?"
+            # the native front is one process (its threads are the fronts) with no --worker-index: it is front 0, so
+            # --profile finds it (plat-m35 had "front ?" and no front profile)
+            j = a[i + 1] if flag != "--gpu-sockets" else a[a.index("--worker-index") + 1] if "--worker-index" in a else "0"
             return f"{name} {j}"
     return "server" if "serving" in " ".join(a) else a[0] if a else "?"     # the supervisor, or a single process
 

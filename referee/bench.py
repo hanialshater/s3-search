@@ -79,7 +79,10 @@ def engine_env() -> dict:
     process's environment, or null when unset (the engine's default then applies). Recorded in every results file, so
     two runs that differ only in a switch say so (the founder's approval, 2026-11-14)."""
     out = {k: os.environ.get(k) for k in ENGINE_ENV}
-    out.update({k: v for k, v in sorted(os.environ.items()) if k.startswith("S3_TRITON_")})   # any later kernel switch too
+    # any later kernel or route switch too: S3_TRITON_* and S3_FUSED_* (S3_FUSED_PACK, S3_FUSED_HIST24, ...), and
+    # S3_HOSTPATH (the Rust host path; plat-m38: S3_FUSED_PACK was recorded only in fair_bench's server_env_arg)
+    out.update({k: v for k, v in sorted(os.environ.items())
+                if k.startswith(("S3_TRITON_", "S3_FUSED_")) or k == "S3_HOSTPATH"})
     return out
 
 

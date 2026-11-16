@@ -24,26 +24,41 @@ def _is_columnar(resp: Any) -> bool:
     return isinstance(resp, dict) and isinstance(resp.get("hits"), dict) and "columns" in resp["hits"]
 
 
+_FLUSH: dict = {}                  # dtype -> (uint view, magnitude mask, 1, subnormal limit, sign): built on first use
+
+
+def _flush_consts() -> dict:
+    import numpy as np
+    _FLUSH[np.dtype(np.float32)] = (np.uint32, np.uint32(0x7FFFFFFF), np.uint32(1), np.uint32(0x007FFFFF), np.uint32(0x80000000))
+    _FLUSH[np.dtype(np.float64)] = (np.uint64, np.uint64(0x7FFFFFFFFFFFFFFF), np.uint64(1), np.uint64(0x000FFFFFFFFFFFFF),
+                                    np.uint64(0x8000000000000000))
+    _FLUSH["ndarray"] = np.ndarray
+    _FLUSH["asarray"] = np.asarray
+    _FLUSH["contiguous"] = np.ascontiguousarray
+    return _FLUSH
+
+
 def flush_subnormals(a):
     """A float32 or float64 array with its subnormals as signed zero, by bit masks, so the result does not depend on
     the process's floating-point mode. torch can set flush-to-zero; then numpy's float32 to float64 conversion and
     comparisons treat subnormals as zero, and reply bytes would differ by process (the steward's ruling, lab 5f5454f).
     Normal values, zeros, infinities and NaNs keep their bits. The array is returned unchanged (not copied) when it
-    has no subnormal. (The architect's helper, #44 0ec23be.)"""
-    import numpy as np
-    a = np.asarray(a)
-    if a.dtype == np.float32:
-        ut, exp, sign = np.uint32, 0x7F800000, 0x80000000
-    elif a.dtype == np.float64:
-        ut, exp, sign = np.uint64, 0x7FF0000000000000, 0x8000000000000000
-    else:
+    has no subnormal. One unsigned compare finds them: ``(bits & magnitude) - 1 < limit`` holds exactly for a nonzero
+    magnitude below the smallest normal (zero wraps to the top), with the constants built once (the architect's
+    cheaper check: about 9 to 12 µs a reply against 20 to 27 µs)."""
+    f = _FLUSH or _flush_consts()
+    if not isinstance(a, f["ndarray"]):
+        a = f["asarray"](a)
+    t = f.get(a.dtype)
+    if t is None:
         return a
-    u = np.ascontiguousarray(a).view(ut)
-    sub = ((u & ut(exp)) == 0) & ((u & ~ut(exp | sign)) != 0)
+    ut, mag, one, lim, sign = t
+    u = (a if a.flags.c_contiguous else f["contiguous"](a)).view(ut)
+    sub = ((u & mag) - one) < lim
     if not sub.any():
         return a
     u = u.copy()
-    u[sub] &= ut(sign)
+    u[sub] &= sign
     return u.view(a.dtype)
 
 
@@ -52,9 +67,9 @@ def flush_response(obj):
     ``_score`` and float sort columns with their subnormals as signed zero, before any writer sees them, so every reply
     kind (S3B1, S3B2, S3B3, the Python front) writes the same bytes whatever the process's FP mode. Called on each
     answer in the GPU process (serving/gpu.py ``_answer``) and on the single-process path (serving/app.py
-    ``_search_json``). A list (``_msearch``) is flushed item by item; anything not columnar is returned as it is.
-    Engine scores are sums of positive BM25F weights and are never subnormal in practice; a float64 sort value can be."""
-    import numpy as np
+    ``_search_json``). A list (``_msearch``) is flushed item by item; anything not columnar is returned as it is (the
+    same object when nothing is subnormal). Engine scores are sums of positive BM25F weights and are never subnormal in
+    practice; a float64 sort value can be."""
     if isinstance(obj, list):
         return [flush_response(x) for x in obj]
     if not _is_columnar(obj):
@@ -62,15 +77,25 @@ def flush_response(obj):
             return {**obj, "responses": [flush_response(x) for x in obj["responses"]]}
         return obj
     c = obj["hits"]["columns"]
-    sc = c.get("_score")
-    new_sc = flush_subnormals(sc) if isinstance(sc, np.ndarray) else sc
-    sort = c.get("sort") or []
-    new_sort = [({**col, "values": flush_subnormals(col["values"])}
-                 if isinstance(col, dict) and isinstance(col.get("values"), np.ndarray) and col["values"].dtype.kind == "f"
-                 else col) for col in sort]
-    if new_sc is sc and all(a is b or (isinstance(a, dict) and a.get("values") is b.get("values")) for a, b in zip(sort, new_sort)):
+    if getattr(c, "s3_flushed", False):                 # the engine flushed these once per batch (FlushedColumns)
         return obj
-    return {**obj, "hits": {**obj["hits"], "columns": {**c, "_score": new_sc, "sort": new_sort}}}
+    nd = (_FLUSH or _flush_consts())["ndarray"]
+    sc = c.get("_score")
+    new_sc = flush_subnormals(sc) if isinstance(sc, nd) else sc
+    sort = c.get("sort")
+    new_sort = sort
+    if sort:
+        for i, col in enumerate(sort):
+            v = col.get("values") if isinstance(col, dict) else None
+            if isinstance(v, nd) and v.dtype.kind == "f":
+                nv = flush_subnormals(v)
+                if nv is not v:
+                    if new_sort is sort:
+                        new_sort = list(sort)
+                    new_sort[i] = {**col, "values": nv}
+    if new_sc is sc and new_sort is sort:
+        return obj
+    return {**obj, "hits": {**obj["hits"], "columns": {**c, "_score": new_sc, "sort": new_sort if new_sort is not None else []}}}
 
 
 def _floats(values) -> list[str]:

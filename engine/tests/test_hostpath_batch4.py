@@ -83,8 +83,10 @@ def test_every_golden4_frame():
     fresh process without torch, in a clean FP mode, as make_vectors requires:
     - Rust equals Python on every input;
     - Rust equals the file on every line Python reproduces;
-    - a line Python does not reproduce must have had a subnormal input before flush_response (the generator's own
-      float64-to-float32 casts). arch-hp17 and hp18 on the Colab CPU: line 33 only, even here. The lines are printed.
+    - Python reproduces all 40 lines and Rust equals the file on all 40. (arch-hp17 and hp18 on the Colab CPU had line
+      33 differ, and still did with exact casts in plat-r9: golden4's float pool used pow, log and exp, whose last bit
+      differs between macOS and glibc; make_vectors now draws golden4 from floats_exact, exact operations only, with
+      the float32 scores by exact scalar casts: the steward's ruling, lab 706a7b9.) A differing line is printed.
     """
     import subprocess
     import sys
@@ -97,16 +99,15 @@ def test_every_golden4_frame():
     assert len(got["rows"]) == len(lines) == len(got["subnormal_input"]) == 40
     assert all(got["rust_equal"])                              # Rust equals Python on every input
     bad = [i for i, (row, line) in enumerate(zip(got["rows"], lines)) if row != line]
-    assert all(got["subnormal_input"][i] for i in bad), [i for i in bad if not got["subnormal_input"][i]]
-    for i in range(40):
-        if i not in bad:
-            assert got["rust_hex"][i] == lines[i].split(" ")[0], i
     for i in bad:                                              # what differs, for the platform engineer
         a, b = got["rows"][i].split(" "), lines[i].split(" ")
         part = "payload" if a[0] != b[0] else "bodies"
-        print(f"\ngolden4 line {i} differs here ({part}; python {got['python']}, numpy {got['numpy']})")
-    print(f"\ngolden4: {40 - len(bad)} of 40 lines reproduced (fresh process, no torch, clean FP mode); "
-          f"not reproduced {bad}, each with a subnormal input before the flush; rust equals python on all 40")
+        print(f"\ngolden4 line {i} differs here ({part}; python {got['python']}, numpy {got['numpy']}; "
+              f"subnormal input {got['subnormal_input'][i]})")
+    assert bad == [], bad                                      # all 40 lines, on every platform
+    for i in range(40):
+        assert got["rust_hex"][i] == lines[i].split(" ")[0], i
+    print("\ngolden4: 40 of 40 lines reproduced (fresh process, no torch, clean FP mode); rust equals python and the file")
 
 
 def test_subnormals_pass_through_both_writers_alike():

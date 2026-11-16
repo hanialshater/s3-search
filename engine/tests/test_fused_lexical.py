@@ -118,3 +118,31 @@ def test_kernel_responses_equal_todays(ds, impacts, monkeypatch):
     monkeypatch.setattr(TF, "_run_kernel", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
     assert [_strip(r) for r in ix.search_batch(reqs, hits="columns", ids="bytes")] == want
     assert calls, "the fused kernel never ran"
+
+
+@pytest.mark.skipif(TF.triton is None or "cuda" not in available_devices(), reason="needs Triton and cuda")
+def test_packed_and_per_array_inputs_give_the_same_bits(ds, monkeypatch):
+    """plat-m36: S3_FUSED_PACK=0 (the default, per-array inputs as a7e65c5) and =1 (#34's two packed copies)."""
+    import torch
+    monkeypatch.setenv("S3_TRITON_CAPABILITIES", "any")
+    ix = api.build_index(ds.catalogue, ds.mapping, device="cuda")
+    st = ix._st
+    part, b = st.parts[0], st.b
+    F = len(st.text_fields)
+    rng = np.random.default_rng(2)
+    common = np.argsort(-np.diff(part.host_term_ptr))[:12]
+    terms = [sorted(rng.choice(common, int(rng.integers(1, 6)), replace=False).tolist()) for _ in range(20)] + [[]]
+    w = np.linspace(0.7, 2.3, F).astype(np.float32)
+    bb = np.linspace(0.3, 0.9, F).astype(np.float32)
+    msm = [int(rng.integers(1, 3)) for _ in terms]
+    boost = [1.0 if i % 3 else 1.5 for i in range(len(terms))]
+    codes = [st.keywords[f].codes for f in sorted(st.keywords)[:2]]
+    sizes = [len(st.keywords[f].values) for f in sorted(st.keywords)[:2]]
+    got = {}
+    for pack in ("0", "1"):
+        monkeypatch.setenv("S3_FUSED_PACK", pack)
+        got[pack] = TF._run_kernel(b, part, terms, w, bb, 1.2, part.idf, msm, boost, st.live, codes, sizes)
+    assert torch.equal(got["0"][0].view(torch.int32), got["1"][0].view(torch.int32))
+    assert torch.equal(got["0"][1], got["1"][1])
+    for a, c in zip(got["0"][2], got["1"][2]):
+        assert torch.equal(a, c)
