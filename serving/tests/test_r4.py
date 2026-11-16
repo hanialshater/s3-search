@@ -365,3 +365,51 @@ def _recv_all(s):
         if not k:
             return got
         got += k
+
+
+class _RecLoop:
+    """A Loop stand-in that records what is sent and closed."""
+    def __init__(self):
+        self.sent, self.closed = [], []
+
+    def send(self, cid, data):
+        self.sent.append((cid, data))
+        return True
+
+    def close_conn(self, cid):
+        self.closed.append(cid)
+
+
+def test_the_encoder_keeps_order_and_drains_on_stop(monkeypatch):
+    """R4c: one encoder thread for every connection: each connection's replies in put order, all of them handed over
+    by stop(), and an encoding error closes only that connection (counted)."""
+    from serving import gpu
+    def fake_bytes(msg, proto):
+        if msg == "boom":
+            raise ValueError("boom")
+        return f"{proto}:{msg}".encode()
+    monkeypatch.setattr(gpu, "_bin_bytes", fake_bytes)
+    lp, counts = _RecLoop(), {"encode_errors": 0}
+    enc = gpu._R4Encoder(counts)
+    conns = [gpu._R4Conn(lp, c, 3, counts, enc) for c in (1, 2, 3)]
+    for i in range(300):
+        conns[i % 3].put(f"m{i}")
+    conns[1].put("boom")
+    conns[0].put("last")
+    assert enc.stop(5.0)
+    for c in (1, 2, 3):
+        want = [f"3:m{i}".encode() for i in range(300) if i % 3 == c - 1] + ([b"3:last"] if c == 1 else [])
+        assert [d for cc, d in lp.sent if cc == c] == want
+    assert lp.closed == [2] and counts["encode_errors"] == 1 and counts["encoded"] == 302
+    assert counts["encode_queue_max"] >= 1
+
+
+def test_encode_mode_from_the_environment(monkeypatch):
+    from serving import gpu
+    monkeypatch.delenv("S3_SERVING_R4_ENCODE", raising=False)
+    assert gpu._r4_encode_mode() == "thread"
+    monkeypatch.setenv("S3_SERVING_R4_ENCODE", "inline")
+    assert gpu._r4_encode_mode() == "inline"
+    monkeypatch.setenv("S3_SERVING_R4_ENCODE", "both")
+    with pytest.raises(ValueError):
+        gpu._r4_encode_mode()

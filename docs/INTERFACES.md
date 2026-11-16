@@ -892,6 +892,12 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
     - Shutdown closes the Loop: no new connection or frame, each writer sends what it has queued, then every socket
       closes (up to 2 s). Closed connections are forgotten; a call that arrives for one is logged and not run.
     - R4 without `S3_HOSTPATH=1` is allowed but warned: each frame's JSON is then parsed in the batch loop's thread.
+    - **R4c (S6-42):** the replies are encoded on one encoder thread per GPU process (`S3_SERVING_R4_ENCODE=thread`,
+      the default under R4), so encoding overlaps the next batch's GPU work as the Python writers' did; the batch
+      loop hands each front's replies over once per batch, and one FIFO keeps each connection's order.
+      `S3_SERVING_R4_ENCODE=inline` encodes in the batch thread at the batch's end (R4 as first built; plat-m40 found
+      that thread then at about 98% of a core and p99 1.3 to 1.7 times worse). `r4-<j>.json` records the mode and the
+      encoder's counts (`encoded`, `encode_queue_max`); the 5 s log's thread CPU has an `encoder` share.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:
