@@ -39,7 +39,9 @@ const MAX_DEPTH: usize = 512;
 
 // Development timing (batch4_profile): nanoseconds spent per phase, summed over calls.
 // The phases are: meta, columns, shell, frame, and the whole call.
-static PROF: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+// R4d adds three parts of "columns": the ids (buffer, copy, check), the scores, the sort columns.
+static PROF: [AtomicU64; 8] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                               AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn lap(i: usize, t: &mut Instant) {
     let now = Instant::now();
@@ -50,7 +52,7 @@ fn lap(i: usize, t: &mut Instant) {
 /// The phase totals in seconds since the last call, as {meta, columns, shell, frame, total}; resets them.
 #[pyfunction]
 pub fn batch4_profile() -> Vec<(String, f64)> {
-    ["meta", "columns", "shell", "frame", "total"]
+    ["meta", "columns", "shell", "frame", "total", "columns_ids", "columns_score", "columns_sort"]
         .iter()
         .enumerate()
         .map(|(i, n)| (n.to_string(), PROF[i].swap(0, Ordering::Relaxed) as f64 * 1e-9))
@@ -493,6 +495,7 @@ fn ids_ok(raw: &[u8], w: usize) -> bool {
 }
 
 fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
+    let mut tc = Instant::now();
     // encode._is_columnar
     let Ok(rd) = resp.downcast::<PyDict>() else { return Ok(None) };
     let Some(hits) = rd.get_item(intern!(resp.py(), "hits"))? else { return Ok(None) };
@@ -526,6 +529,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
     if h == 0 || w0 == 0 || raw.len() != h * w0 || !ids_ok(&raw, w0) {
         return Ok(None);
     }
+    lap(5, &mut tc);
     let score = c.get_item(intern!(py, "_score"))?;
     let fast = if score.is_instance(&ctx.ndarray)? {
         Buf::get(&score).and_then(|b| if b.format() == b"f" { Some((b.len(), b.bytes().to_vec())) } else { None })
@@ -546,6 +550,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
         return Err(PyValueError::new_err("scores not 1-D"));
     }
     let s64: Vec<f64> = s32.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect();
+    lap(6, &mut tc);
     let mut cols = Vec::new();
     let sort = c.call_method1(intern!(py, "get"), (intern!(py, "sort").clone(),))?;
     if sort.is_truthy()? {
@@ -638,6 +643,7 @@ fn columns(ctx: &Ctx, resp: &Bound<PyAny>) -> PyResult<Option<Row>> {
             }
         }
     }
+    lap(7, &mut tc);
     Ok(Some(Row { ids: raw, w0, h, s32, cols }))
 }
 
