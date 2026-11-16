@@ -1,0 +1,64 @@
+# R4 (S6-41) and the Rust crates on CPU: build native/s3_hostpath (the pyo3 extension, with R4's Loop) and
+# serving/native_front, run the native front's cargo tests, then hold the real Rust Loop to its contract
+# (serving/tests/test_r4.py) and run every test_gpu_process case that uses the Rust Loop or the Rust host path, with
+# no skip allowed in those steps. Development checks only; no GPU, nothing deployed.
+name: rust
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "native/**"
+      - "serving/**"
+      - "engine/**"
+      - "requirements*.txt"
+      - ".github/workflows/rust.yml"
+      - ".github/ci/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            native/s3_hostpath
+            serving/native_front
+      - name: Python requirements and maturin
+        run: pip install -r requirements.txt "maturin>=1.5,<2"
+      - name: Build and install s3_hostpath (with R4's Loop)
+        run: |
+          python -m maturin build --release -m native/s3_hostpath/Cargo.toml -o /tmp/hostpath-wheels
+          pip install --force-reinstall --no-deps /tmp/hostpath-wheels/*.whl
+          python -c "import s3_hostpath; print(s3_hostpath.Loop)"
+          sha256sum /tmp/hostpath-wheels/*.whl native/s3_hostpath/Cargo.lock
+      - name: Build and test the native front
+        working-directory: serving/native_front
+        run: |
+          cargo build --release --locked
+          cargo test --release --locked
+      - name: "r4 loop: the Loop's contract on PyLoop and the Rust Loop (no skips)"
+        run: |
+          python -m pytest -v -rs -p no:cacheprovider -o faulthandler_timeout=120 serving/tests/test_r4.py | tee /tmp/r4-loop.txt
+          if grep -q SKIPPED /tmp/r4-loop.txt; then echo "a test was skipped"; exit 1; fi
+      - name: "r4 serving: test_gpu_process on the Rust Loop and host path (no skips)"
+        env:
+          PYTHONPATH: .github/ci
+          S3_NATIVE_FRONT_BIN: ${{ github.workspace }}/serving/native_front/target/release/s3-native-front
+        run: |
+          python -m pytest -v -rs -p no:cacheprovider -p r4_select -o faulthandler_timeout=120 --durations=10 \
+            serving/tests/test_gpu_process.py | tee /tmp/r4-serving.txt
+          if grep -q SKIPPED /tmp/r4-serving.txt; then echo "a test was skipped"; exit 1; fi
