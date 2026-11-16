@@ -13,16 +13,18 @@
   - ``reply`` writes the kind 2 and 3 frames with the Python encoder.
 - ``batch4(msgs)`` (R3c) writes an S3B3 connection's kind 4 frame for one batch's replies in Rust: the same bytes as
   ``serving.binproto.batch4``, held to the platform's golden4 frames. ``S3_HOSTPATH_BATCH4=0`` uses the Python writer.
+- ``Loop`` (R4, ``S3_SERVING_R4=1``): the GPU process's native-front connections on Rust threads (readers, framing,
+  the batch queue, writers), waiting without the GIL; serving/r4.py holds its contract.
 """
 from __future__ import annotations
 
 import os
 import threading
 
-from ._native import HostIndex, analyze, stem, token, words_of
+from ._native import HostIndex, Loop, analyze, stem, token, words_of
 from ._native import batch4 as _batch4
 
-__all__ = ["HostIndex", "analyze", "batch4", "prepare", "reply", "stats", "stem", "token", "words_of"]
+__all__ = ["HostIndex", "Loop", "analyze", "batch4", "prepare", "reply", "stats", "stem", "token", "words_of"]
 
 _lock = threading.Lock()
 _built: dict = {}            # id(IndexState) -> (state, HostIndex), the state kept so its id is not reused

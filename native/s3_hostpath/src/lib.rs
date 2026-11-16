@@ -26,6 +26,7 @@
 
 mod analysis;
 mod reply;
+mod serve;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -577,6 +578,7 @@ fn token(word: &str) -> Option<String> {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HostIndex>()?;
+    m.add_class::<serve::Loop>()?;
     m.add_function(wrap_pyfunction!(analyze, m)?)?;
     m.add_function(wrap_pyfunction!(words_of, m)?)?;
     m.add_function(wrap_pyfunction!(stem, m)?)?;

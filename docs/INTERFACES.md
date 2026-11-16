@@ -878,6 +878,15 @@ ingest, validate and enrich changes, build a segment from the store, load an `In
       so independent of the process's FP mode). Such a value is returned as `0.0` or `-0.0` on every reply kind and
       protocol. Normal values are unchanged bit for bit, and ranking is unaffected: the flush runs on the returned
       hits after the top-k. The writers, `binproto.batch4` and `s3_hostpath.batch4`, do no flushing of their own.
+  - **R4: the connections in Rust (opt-in, S6-41; `S3_SERVING_R4=1`, `stub` for the Python stand-in; default 0).**
+    - After a native front's 4-byte magic, the GPU process hands its socket to `s3_hostpath.Loop` (`serving/r4.py`
+      holds the contract). Rust threads read the frames, queue the searches with their enqueue times, hold the calls,
+      write the load slot and send the replies, waiting without the GIL. The wire format is unchanged.
+    - The batch loop takes its batches from the Loop and runs them as before. Each front's replies are encoded at the
+      batch's end as that protocol's writer encoded them, then sent by the Loop. A pickle connection keeps its Python
+      reader and shares the Loop's queue.
+    - A frame whose head cannot be read closes its connection, as before. The GPU process writes `r4-<j>.json` in the
+      state directory: the Loop's name and, every 5 s, its counters and the host path's summary.
   - **Readiness:** a front's `/readyz` asks every GPU process. It is ready when all are, and reports `fronts`,
     `gpu_processes`, `gpu_ready` and `worker`.
   - **Checked:** `serving/tests/test_gpu_process.py`, against a single process, real engine, toy dataset:
