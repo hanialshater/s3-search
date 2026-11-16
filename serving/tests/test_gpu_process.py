@@ -81,14 +81,19 @@ def single(built):
         assert _stop(p) == 0
 
 
-def test_fronts_and_one_gpu_process_answer_as_one_process(built, single, tmp_path):
+@pytest.mark.parametrize("r4", ["0", "stub", "1"])
+def test_fronts_and_one_gpu_process_answer_as_one_process(built, single, tmp_path, r4):
+    """Two Python fronts and one GPU process; under R4 (S3_SERVING_R4) the fronts' pickle connections keep their
+    Python readers and share the Loop's queue."""
+    _r4_skip(r4)
     import shutil
     data = tmp_path / "data"                                # this test writes: its own copy of the index and store
     shutil.copytree(built, data)
     port = _free_port()
     import tempfile                                          # a short path: a Unix socket path is limited to ~104 bytes
     state = tempfile.mkdtemp(prefix="s3t-")                  # the supervisor's state directory, named so we can look in it
-    p = _start(data, port, ["--fronts", "2", "--gpu-processes", "1"], {"S3_SERVING_STATE_DIR": str(state)})
+    p = _start(data, port, ["--fronts", "2", "--gpu-processes", "1"], {"S3_SERVING_STATE_DIR": str(state),
+                                                                     "S3_SERVING_R4": r4})
     try:
         rz = json.loads(_http("GET", f"http://127.0.0.1:{port}/readyz")[1])
         assert rz["ready"] and rz["fronts"] == 2 and rz["gpu_processes"] == 1 and rz["gpu_ready"] == 1
@@ -119,6 +124,7 @@ def test_fronts_and_one_gpu_process_answer_as_one_process(built, single, tmp_pat
         sock = os.path.join(state, "gpu-0.sock")
         assert stat.S_IMODE(os.stat(sock).st_mode) == 0o600
         assert stat.S_IMODE(os.stat(state).st_mode) == 0o700
+        _r4_ran(state, r4)
     finally:
         assert _stop(p) == 0
 
@@ -160,21 +166,53 @@ def _raw_post(url, body):
         return e.code, e.read()
 
 
-@pytest.mark.parametrize("hostpath,magic", [("0", b"S3B1"), ("stub", b"S3B1"), ("stub-prepared", b"S3B1"), ("0", b"S3B2"),
-                                           ("0", b"S3B3")])
-def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic):
+def _r4_built():
+    try:
+        import s3_hostpath
+    except ImportError:
+        return False
+    return hasattr(s3_hostpath, "Loop")
+
+
+def _r4_skip(r4, hostpath="0"):
+    if (r4 == "1" or hostpath == "1") and not _r4_built():
+        pytest.skip("s3_hostpath (with R4's Loop) is not built")
+
+
+def _r4_ran(state, r4):
+    """R4 on: the GPU process wrote r4-0.json naming its Loop (serving/gpu.py ``_r4_note``)."""
+    path = os.path.join(state, "r4-0.json")
+    if r4 == "0":
+        assert not os.path.exists(path)
+        return
+    want = "python-stub" if r4 == "stub" else "s3_hostpath.Loop"
+    assert json.loads(open(path).read())["loop"] == want
+
+
+# R4 (S3_SERVING_R4): the same cases with the Loop owning the connection, on its Python stub and on the Rust Loop
+_BIN_CASES = [("0", b"S3B1", "0"), ("stub", b"S3B1", "0"), ("stub-prepared", b"S3B1", "0"), ("0", b"S3B2", "0"),
+              ("0", b"S3B3", "0"),
+              ("0", b"S3B1", "stub"), ("stub-prepared", b"S3B1", "stub"), ("0", b"S3B2", "stub"),
+              ("0", b"S3B3", "stub"), ("stub-prepared", b"S3B3", "stub"),
+              ("0", b"S3B1", "1"), ("stub-prepared", b"S3B1", "1"), ("0", b"S3B2", "1"), ("0", b"S3B3", "1"),
+              ("stub-prepared", b"S3B3", "1"), ("1", b"S3B3", "1"), ("1", b"S3B3", "0")]
+
+
+@pytest.mark.parametrize("hostpath,magic,r4", _BIN_CASES)
+def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic, r4):
     """S6-22s: on a connection opened with S3B1, a GPU process answers in serving/binproto.py's frames, and the
     bodies decoded the way a native front must encode them equal one process's (but for took_ms); the same with the
-    S3_HOSTPATH seam on its Python stub (serving/hostpath.py). A body that is not JSON gets the Python front's 400 on
-    the same connection, which stays open."""
+    S3_HOSTPATH seam on its Python stub (serving/hostpath.py), and under R4 (S3_SERVING_R4, serving/r4.py). A body
+    that is not JSON gets the Python front's 400 on the same connection, which stays open."""
     import socket as _socket
     import struct
     import tempfile
     from serving import binproto
+    _r4_skip(r4, hostpath)
     state = tempfile.mkdtemp(prefix="s3b-")
     port = _free_port()
     p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"],
-               {"S3_SERVING_STATE_DIR": state, "S3_HOSTPATH": hostpath})
+               {"S3_SERVING_STATE_DIR": state, "S3_HOSTPATH": hostpath, "S3_SERVING_R4": r4})
     sp = _free_port()
     ps = _start(built, sp, [])                              # one process: what the Python front says to a bad body
     try:
@@ -234,6 +272,7 @@ def test_binary_protocol_gives_the_same_bodies(built, single, hostpath, magic):
             j0.pop("took_ms", None); got[k][1].pop("took_ms", None)
             assert got[k] == (want_st, j0), (k, req)
         s.close()
+        _r4_ran(state, r4)
     finally:
         assert _stop(p) == 0
         assert _stop(ps) == 0
@@ -253,17 +292,20 @@ def _native_bin():
     return os.environ.get("S3_NATIVE_FRONT_BIN") or (str(here) if here.exists() else None)
 
 
-@pytest.mark.parametrize("binproto", ["1", "2", "3", None])
-def test_native_front_answers_as_one_process(built, single, binproto):
+@pytest.mark.parametrize("binproto,r4,hostpath", [("1", "0", "0"), ("2", "0", "0"), ("3", "0", "0"), (None, "0", "0"),
+                                                ("3", "stub", "0"), ("2", "stub", "0"), ("3", "1", "1"),
+                                                ("2", "1", "0"), ("1", "1", "0")])
+def test_native_front_answers_as_one_process(built, single, binproto, r4, hostpath):
     """S6-22s: the Rust front (serving/native_front) sends the same bodies as one process, on S3B1 (opt-out), on S3B2
     (kind 3: the front escaping the ids and writing the floats; each reply sent alone) and with the variable unset (the
-    default, S3B2) (skipped unless built)."""
+    default, S3B2), and under R4 (S3_SERVING_R4) (skipped unless built)."""
     if not _native_bin():
         pytest.skip("serving/native_front is not built")
+    _r4_skip(r4, hostpath)
     port = _free_port()
     p = _start(built, port, ["--fronts", "2", "--gpu-processes", "1"],
-               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin(),
-                **({"S3_SERVING_BINPROTO": binproto} if binproto else {})})
+               {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin(), "S3_SERVING_R4": r4,
+                "S3_HOSTPATH": hostpath, **({"S3_SERVING_BINPROTO": binproto} if binproto else {})})
     try:
         _same(single, _answers(port))
         url = f"http://127.0.0.1:{port}/indexes/toy/_search"
@@ -275,15 +317,18 @@ def test_native_front_answers_as_one_process(built, single, binproto):
         assert _stop(p) == 0
 
 
-@pytest.mark.parametrize("front", ["stdlib", "native"])
-def test_timing_headers_include_the_batch_time(built, front):
+@pytest.mark.parametrize("front,r4", [("stdlib", "0"), ("native", "0"), ("stdlib", "stub"), ("native", "stub"),
+                                     ("native", "1")])
+def test_timing_headers_include_the_batch_time(built, front, r4):
     """S6-22s: a search through either front carries X-S3-Queue-Ms, X-S3-Serve-Ms and X-S3-Batch-Ms (the GPU
-    process's search_batch wall time), the per-request tail breakdown's inputs (native skipped unless built)."""
-    env = {}
+    process's search_batch wall time), the per-request tail breakdown's inputs (native skipped unless built); the
+    same under R4 (the Python front's pickle connection then shares the Loop's queue)."""
+    _r4_skip(r4)
+    env = {"S3_SERVING_R4": r4}
     if front == "native":
         if not _native_bin():
             pytest.skip("serving/native_front is not built")
-        env = {"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin()}
+        env.update({"S3_SERVING_FRONT_SERVER": "native", "S3_NATIVE_FRONT_BIN": _native_bin()})
     port = _free_port()
     p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"], env)
     try:
@@ -322,3 +367,101 @@ def test_native_front_readyz_asks_every_gpu_process_and_honours_the_route(built,
                 assert r.status == 200 and r.headers["X-S3-Gpu-Process"] == str(j)
     finally:
         assert _stop(p) == 0
+
+
+_TIMERS = ("queue_ms", "batch_ms", "post_ms", "parse_ms")
+
+
+def _replay(built, env, magic, stream):
+    """Start one GPU process with ``env``, send ``stream`` (a list of payloads, or None for "wait for every reply so
+    far") on one connection opened with ``magic``, and return each reply as (id, status, body, meta without its
+    timers), in arrival order, and the frame kinds seen."""
+    import socket as _socket
+    import struct
+    import tempfile
+    from serving import binproto
+    state = tempfile.mkdtemp(prefix="s3r4-")
+    port = _free_port()
+    p = _start(built, port, ["--fronts", "1", "--gpu-processes", "1"], {"S3_SERVING_STATE_DIR": state, **env})
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.connect(os.path.join(state, "gpu-0.sock"))
+        s.sendall(magic)
+        out, kinds, sent = [], [], 0
+
+        def read_one():
+            n = struct.unpack("<I", _recv(s, 4))[0]
+            payload = _recv(s, n)
+            kinds.append(payload[0])
+            for id_, st, body, meta in (binproto.split_batch4(payload) if payload[0] == 4
+                                        else [binproto.decode_reply(payload)]):
+                out.append((id_, st, body, {k: v for k, v in meta.items() if k not in _TIMERS}))
+        for item in stream + [None]:
+            if item is None:
+                while len(out) < sent:
+                    read_one()
+                continue
+            s.sendall(binproto.frame(item))
+            sent += 1
+        s.close()
+        _r4_ran(state, env.get("S3_SERVING_R4", "0"))
+        return out, kinds
+    finally:
+        assert _stop(p) == 0
+
+
+@pytest.mark.parametrize("hostpath,magic,r4", [("0", b"S3B3", "stub"), ("stub-prepared", b"S3B3", "stub"),
+                                               ("0", b"S3B1", "stub"), ("0", b"S3B2", "stub"),
+                                               ("0", b"S3B3", "1"), ("stub-prepared", b"S3B3", "1"),
+                                               ("1", b"S3B3", "1"), ("0", b"S3B1", "1"), ("0", b"S3B2", "1")])
+def test_r4_replies_are_todays(built, hostpath, magic, r4):
+    """R4's gate on the toy index: one frame stream (each request alone, then pipelined windows that batch, bodies that
+    are not JSON, calls) to a GPU process with S3_SERVING_R4 off and on. Every reply's id, status, body bytes and meta
+    (its timers aside) are the same, and so are the frame kinds of the requests sent alone."""
+    import struct
+    _r4_skip(r4, hostpath)
+
+    def search(i, body):
+        body = body if isinstance(body, bytes) else json.dumps(body).encode()
+        return struct.pack("<BQ", 1, i) + struct.pack("<H", 3) + b"toy" + struct.pack("<I", len(body)) + body
+
+    def call(i, method, path, body=b""):
+        m, pth = method.encode(), path.encode()
+        return (struct.pack("<BQ", 2, i) + struct.pack("<H", len(m)) + m + struct.pack("<H", len(pth)) + pth
+                + struct.pack("<I", len(body)) + body)
+    alone = []
+    for i, req in enumerate(REQS + BAD_BODIES):
+        alone += [search(i, req), None]
+    alone += [call(500, "GET", "/indexes/toy/_mapping"), None]
+    piped = []
+    for w in range(4):                                          # windows of 24 that batch: searches, bad bodies, a call
+        win = [search(1000 + 100 * w + k, (REQS + BAD_BODIES)[(k + w) % (len(REQS) + len(BAD_BODIES))])
+               for k in range(24)]
+        win.insert(7, call(1000 + 100 * w + 50, "GET", "/indexes/toy/_mapping"))
+        piped += win + [None]
+    env = {"S3_HOSTPATH": hostpath}
+    a0, k0 = _replay(built, {**env, "S3_SERVING_R4": "0"}, magic, alone)
+    a1, k1 = _replay(built, {**env, "S3_SERVING_R4": r4}, magic, alone)
+    assert k0 == k1
+
+    def norm(rows):
+        out = {}
+        for id_, st, body, meta in rows:
+            j = json.loads(body)
+            took = j.pop("took_ms", None) if isinstance(j, dict) else None
+            if took is not None:                                # took_ms masked in the bytes, the rest exact
+                body = body.replace(json.dumps(took, separators=(",", ":")).encode(), b"")
+            if took is not None:                                # and in the meta's pre and post
+                t = json.dumps(took, separators=(",", ":"))
+                meta = {k: v.replace(t, "") if isinstance(v, str) else v for k, v in meta.items()}
+            out[id_] = (st, body, meta)
+        return out
+    n0, n1 = norm(a0), norm(a1)
+    assert len(n0) == len(a0) == len(alone) // 2 and n0 == n1
+    p0, _ = _replay(built, {**env, "S3_SERVING_R4": "0"}, magic, piped)
+    p1, _ = _replay(built, {**env, "S3_SERVING_R4": r4}, magic, piped)
+    m0, m1 = norm(p0), norm(p1)
+    assert len(m0) == len(p0) == len(piped) - 4
+    for k in m0:                                                # the batch size in the meta depends on timing
+        assert {**m0[k][2], "batch": None} == {**m1[k][2], "batch": None}, k
+        assert m0[k][:2] == m1[k][:2], k

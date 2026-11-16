@@ -25,7 +25,7 @@ ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 REF = ARGS[0] if ARGS else "main"
 HOSTPATH = "--hostpath=1" in sys.argv[1:]
 HOSTPATH_TESTS = ["engine/tests/test_hostpath.py", "engine/tests/test_hostpath_analysis.py",
-                  "engine/tests/test_hostpath_batch4.py"]
+                  "engine/tests/test_hostpath_batch4.py", "serving/tests/test_r4.py"]   # R4: the Loop's contract
 SUITES = [  # (name, pytest targets, hard limit in seconds)
     ("referee fast", None, 900),
     ("engine tests", ["engine/tests"], 1200),

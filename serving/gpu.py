@@ -30,6 +30,13 @@ of the batch fails with that error instead of retrying each.
 **Writes.** Calls (writes, admin, GET routes) run on one call thread, one at a time, next to the batch loop: an
 ``Index`` write is copy-on-write and ``search_batch`` reads its state once (§5), so a batch that starts after a call
 returns sees it. The front answers the write only after this process has applied it.
+
+**R4** (``S3_SERVING_R4=1``, opt-in; ``stub`` for its Python stand-in; serving/r4.py): a native front's connection is
+handed, after its 4-byte magic, to a ``Loop`` (``s3_hostpath.Loop``, Rust) whose threads read its frames, queue the
+searches, hold the calls and write the replies, waiting without the GIL. The batch loop takes its batches from the
+Loop (``_collect``) and runs them exactly as below; each front's replies are encoded at the batch's end as that
+protocol's writer encoded them (``_R4Conn``) and handed to the Loop's writer. A pickle connection keeps its Python
+reader and enters the same queue as a token. The default (0) leaves this loop untouched.
 """
 from __future__ import annotations
 
@@ -254,6 +261,73 @@ class _BinConn(_Conn):
             _account("writer")
 
 
+def _bin_bytes(msg, proto: int) -> bytes:
+    """The bytes a native front's writer (``_BinConn._writer``) sends for one queued message, all of them at once."""
+    from . import hostpath
+    hp = _hostpath()
+    if proto == 3:                                              # S3B3: the batch's replies as one kind 4 frame
+        from . import binproto
+        msgs = msg[1] if msg[0] == "multi" else [msg]
+        return hp.batch4(msgs) if hp is not None else binproto.batch4(msgs)
+    if proto == 2:                                              # S3B2: one frame per reply (sent back to back)
+        parts = msg[1] if msg[0] == "multi" else [msg]
+        return b"".join(hostpath.reply_frame(m, 2) for m in parts)
+    if hp is not None:                                          # S3B1 under S3_HOSTPATH: the module writes the frames
+        return hp.reply(msg[1] if msg[0] == "multi" else [msg])
+    return hostpath.reply_frame(msg, 1)
+
+
+class _R4Conn:
+    """R4: a native front's connection owned by the Loop. ``put`` encodes the message where it is called (the batch
+    loop at a batch's end, or the call thread) as ``_BinConn``'s writer did, and queues the bytes on the Loop's writer
+    thread, which sends them without the GIL. An encoding error closes the connection (a writer thread's exception
+    ended its sends before) and is counted; it never stops the batch loop."""
+    __slots__ = ("loop", "cid", "proto", "counts")
+
+    def __init__(self, loop, cid: int, proto: int, counts: dict | None = None):
+        self.loop, self.cid, self.proto = loop, cid, proto
+        self.counts = counts if counts is not None else {"encode_errors": 0}   # the server's, in r4-<j>.json
+
+    def put(self, msg) -> None:
+        try:
+            data = _bin_bytes(msg, self.proto)
+        except Exception:  # noqa: BLE001 - never lose the batch loop to one front's reply
+            self.counts["encode_errors"] += 1
+            log.exception("R4: encoding a reply for connection %d failed; closing it", self.cid)
+            self.loop.close_conn(self.cid)
+            return
+        self.loop.send(self.cid, data)
+
+    def close(self) -> None:
+        self.loop.close_conn(self.cid)
+
+
+class _R4Queue:
+    """R4: ``GpuServer.q`` over the Loop. A pickle connection's reader puts its ``_Item`` here: it waits in a dict
+    under a token, and the token joins the Loop's queue, so the frames and the Python front's requests share one
+    queue in arrival order."""
+
+    def __init__(self, loop):
+        self.loop = loop
+        self.items: dict = {}
+        self._tokens = iter(range(1, 1 << 62))
+        self._lock = threading.Lock()
+
+    def put(self, item) -> None:
+        with self._lock:
+            tok = next(self._tokens)
+        self.items[tok] = item
+        self.loop.push_py(tok)
+
+    def qsize(self) -> int:
+        return self.loop.qsize()
+
+
+def _r4_loop_class():
+    from .r4 import load
+    return load()
+
+
 _HOSTPATH: list = []
 
 
@@ -308,12 +382,29 @@ class GpuServer:
         self.in_batch = 0
         self.load = LoadTable(state_dir, create=False) if state_dir else None
         self.batch_settings = _batch_settings()                # S3_SERVING_GPU_MAX_BATCH, S3_SERVING_GPU_BATCH_WAIT_MS
+        self.r4 = None                                          # R4 (S3_SERVING_R4): the Loop that owns the fronts
+        cls = _r4_loop_class()
+        if cls is not None:
+            self.r4 = cls(time.perf_counter(), os.path.join(state_dir, "load.bin") if state_dir else None, index)
+            self.q = _R4Queue(self.r4)
+            self._r4_conns: dict[int, _R4Conn] = {}
+            self._r4_ids = iter(range(1, 1 << 31))
+            # the server's own R4 counts: replies it could not encode (that connection closed), batch items and calls
+            # of connections already gone (their fronts left), connections the Loop refused
+            self._r4_counts = {"encode_errors": 0, "gone_items": 0, "gone_calls": 0, "refused_conns": 0}
+            log.warning("gpu process %d: R4 serving loop on (%s)", index, getattr(self.r4, "name", type(self.r4).__name__))
+            if _hostpath() is None:
+                log.warning("gpu process %d: R4 without S3_HOSTPATH: each native frame's JSON is parsed in the batch "
+                            "loop's thread, serially with the GPU work (set S3_HOSTPATH=1)", index)
+            self._r4_note()
 
     # -- connections
     def serve_forever(self) -> None:
         threading.Thread(target=self._batch_loop, name="gpu-batches", daemon=True).start()
         threading.Thread(target=self._publish_versions, name="gpu-versions", daemon=True).start()
         threading.Thread(target=self._stats, name="gpu-stats", daemon=True).start()
+        if getattr(self, "r4", None) is not None:
+            threading.Thread(target=self._r4_calls, name="gpu-r4-calls", daemon=True).start()
         self.listener.settimeout(0.5)
         while not self._stop.is_set():
             try:
@@ -327,13 +418,20 @@ class GpuServer:
 
     def shutdown(self) -> None:
         self._stop.set()
+        if getattr(self, "r4", None) is not None:              # R4: the Loop's threads end, its sockets close
+            left = self.r4.close(2.0)                           # (each writer sends what it has queued first)
+            if left:
+                log.warning("gpu process %d: R4 closed with %d connection(s) still sending", self.index, left)
 
     def _reader(self, sock: socket.socket) -> None:
         first = _read_into(sock, 4)
         if first is None:
             return sock.close()
         if bytes(first) in (b"S3B1", b"S3B2", b"S3B3"):         # a native front (serving/binproto.py)
-            return self._bin_reader(sock, {b"S3B1": 1, b"S3B2": 2, b"S3B3": 3}[bytes(first)])
+            proto = {b"S3B1": 1, b"S3B2": 2, b"S3B3": 3}[bytes(first)]
+            if getattr(self, "r4", None) is not None:            # R4: the Loop reads and writes it from here on
+                return self._r4_add(sock, proto)
+            return self._bin_reader(sock, proto)
         conn = _Conn(sock)
         pending = bytes(first)
         nread = 0
@@ -414,6 +512,8 @@ class GpuServer:
                 pass
 
     def _publish_load(self) -> None:
+        if getattr(self, "r4", None) is not None:              # R4: the Loop writes the slot with its queue length
+            return self.r4.set_in_batch(self.in_batch)
         if self.load is not None:
             self.load.set(self.index, self.q.qsize() + self.in_batch)
 
@@ -438,7 +538,104 @@ class GpuServer:
         """The next batch: the first request, then whatever is queued, up to the max batch; with a batch wait, keep
         taking arrivals until the wait after the first request has passed or the batch is full (_BatchQueue.take)."""
         mb, wait = getattr(self, "batch_settings", None) or _batch_settings()
+        if getattr(self, "r4", None) is not None:
+            return self._r4_items(self.r4.next_batch(mb, wait, 0.2))
         return self.q.take(mb, wait)
+
+    # -- R4: the Loop's side (serving/r4.py)
+    def _r4_add(self, sock: socket.socket, proto: int) -> None:
+        cid = next(self._r4_ids)
+        self._r4_conns[cid] = _R4Conn(self.r4, cid, proto, self._r4_counts)   # before the Loop can queue a frame
+        fd = sock.detach()
+        try:
+            self.r4.add_conn(cid, fd, proto)
+        except ValueError:                                      # refused: the fd is still ours (serving/r4.py)
+            self._r4_conns.pop(cid, None)
+            self._r4_counts["refused_conns"] += 1
+            os.close(fd)
+            log.warning("R4: the Loop refused connection %d", cid, exc_info=True)
+        except Exception:  # noqa: BLE001 - its threads did not start: the Loop has shut the fd
+            self._r4_conns.pop(cid, None)
+            self._r4_counts["refused_conns"] += 1
+            log.exception("R4: the Loop could not start connection %d", cid)
+
+    def _r4_forget(self) -> None:
+        """Drop the connections the Loop reports closed (both its threads ended), so ``_r4_conns`` does not grow."""
+        for cid in self.r4.closed_conns():
+            self._r4_conns.pop(cid, None)
+
+    def _r4_items(self, entries: list) -> list[_Item]:
+        """The Loop's batch as the batch loop's items. A frame becomes what ``_bin_reader`` made of it: the raw
+        payload under S3_HOSTPATH (prepared in ``_prepare_raw``), else the request parsed here, a body that is not
+        JSON answered at once with the Python front's 400 (its own frame, as the reader sent it)."""
+        hp, conns, py, out = _hostpath(), self._r4_conns, self.q.items, []
+        for cid, id_, name, raw, t in entries:
+            if cid < 0:                                         # a pickle connection's request, by its token
+                it = py.pop(id_, None)
+                if it is not None:
+                    out.append(it)
+                continue
+            conn = conns.get(cid)
+            if conn is None:                                    # its front has gone and the Loop closed it
+                self._r4_counts["gone_items"] += 1
+                continue
+            if hp is not None:
+                it = _Item(conn, id_, name, None, raw=raw)
+            else:
+                from . import binproto
+                tp = time.perf_counter()
+                try:
+                    msg = binproto.parse_request(raw)
+                except Exception:  # noqa: BLE001 - a frame its reader would have died on: the connection closes
+                    self.r4.close_conn(cid)
+                    continue
+                parse_ms = (time.perf_counter() - tp) * 1000.0
+                if isinstance(msg[3], Exception):               # not JSON: 400, as the Python front
+                    status, body = classify(msg[3])
+                    conn.put(("search", msg[1], "error", status, body))
+                    continue
+                it = _Item(conn, msg[1], msg[2], msg[3])
+                it.parse_ms = parse_ms
+            it.t = t                                            # queued when the Loop read it
+            out.append(it)
+        return out
+
+    def _r4_calls(self) -> None:
+        """The Loop's call frames onto the call thread, as ``_bin_reader`` submitted them."""
+        from . import binproto
+        while not self._stop.is_set():
+            got = self.r4.next_call(0.2)
+            self._r4_forget()
+            if got is None:
+                continue
+            cid, payload = got
+            conn = self._r4_conns.get(cid)
+            try:
+                _, id_, method, path, body = binproto.parse_request(payload)
+            except Exception:  # noqa: BLE001 - its reader would have died on it: the connection closes
+                self.r4.close_conn(cid)
+                continue
+            if conn is None:                                    # its connection closed before the call ran
+                self._r4_counts["gone_calls"] += 1
+                log.warning("R4: a call (%s %s, id %d) for connection %d, which has closed; not run", method, path,
+                            id_, cid)
+                continue
+            self.calls.submit(self._call, conn, ("call", id_, method, path, body, {}))
+
+    def _r4_note(self, stats: dict | None = None) -> None:
+        """``r4-<index>.json`` in the state directory: the Loop's name and, every 5 s, its counters (tests read it)."""
+        if not self.state_dir:
+            return
+        path = os.path.join(self.state_dir, f"r4-{self.index}.json")
+        hp = _hostpath() if stats is not None else None         # the host path's coverage too (S3_HOSTPATH)
+        try:
+            with open(path + ".tmp", "w") as f:
+                json.dump({"loop": getattr(self.r4, "name", type(self.r4).__name__), "stats": stats,
+                           "server": {**self._r4_counts, "conns": len(self._r4_conns)},
+                           "hostpath": hp.summary() if hasattr(hp, "summary") else None}, f, default=str)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
 
     def _batch_loop(self) -> None:
         while not self._stop.is_set():
@@ -650,6 +847,7 @@ class GpuServer:
     def _stats(self, every: float = 5.0) -> None:
         last = (0, 0, 0.0, time.perf_counter())
         last_cpu: dict = {}
+        last_loop: dict = {}                                    # R4: the Loop's thread CPU at the last log
         while not self._stop.wait(every):
             cpu = {}
             for (kind, _), v in list(THREAD_CPU.items()):
@@ -667,6 +865,15 @@ class GpuServer:
                          "queue %d, thread CPU %% of a core %s, device MiB %s", self.index, (nr - last[1]) / dt,
                          (nb - last[0]) / dt, (nr - last[1]) / max(1, nb - last[0]), 100 * (busy - last[2]) / dt,
                          self.q.qsize(), share, {k: round(v / 2**20) for k, v in mem.items()})
+            if getattr(self, "r4", None) is not None:
+                st = dict(self.r4.stats())
+                lcpu = st.get("cpu_s") or {}                    # the Loop's threads: the host time that left Python's
+                if nb != last[0] or self.q.qsize():
+                    share = {k: round(100 * (v - last_loop.get(k, 0.0)) / dt) for k, v in sorted(lcpu.items())}
+                    log.info("gpu process %d: R4 loop CPU %% of a core %s; %s; server %s", self.index, share,
+                             json.dumps(st), json.dumps(self._r4_counts))
+                last_loop = dict(lcpu)
+                self._r4_note(st)
             last = (nb, nr, busy, t)
             last_cpu = cpu
 
