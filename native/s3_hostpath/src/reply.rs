@@ -473,6 +473,12 @@ fn tobytes(a: &Bound<PyAny>) -> PyResult<Vec<u8>> {
 }
 
 fn ids_ok(raw: &[u8], w: usize) -> bool {
+    // R4d: the common case at once. Every byte ASCII and none NUL means every id is UTF-8 with no NUL at all (the
+    // per-id loop below gives true for it too); this is one pass the compiler vectorises, where the loop below cost
+    // about 20 ns an id (2,000-hit replies: most of batch4's "columns" phase on the CI runner).
+    if raw.iter().all(|&b| b != 0 && b < 0x80) {
+        return true;
+    }
     for x in raw.chunks(w) {
         let mut e = x.len();
         while e > 0 && x[e - 1] == 0 {
