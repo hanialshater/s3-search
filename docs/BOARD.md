@@ -66,7 +66,7 @@ Status values: open · claimed · in review · done.
 | S5-2 | Debug (explain): every score and feature contribution for one product | in review | tools-engineer, 2026-11-09 |
 | S5-3 | The test-drive report from a referee run | in review | tools-engineer, 2026-11-09 |
 | S5-4 | The demo page over ESCI-sample: search, facets, pagination | in review | tools-engineer, 2026-11-09 |
-| S5-5 | The Colab demo notebook (founder's ask, 2026-11-19): the engine end to end through the HTTP API (create, bulk, search, facets, live updates, explain, rollback), then a matched benchmark against OpenSearch 2.19 (indexing time, fit-split nDCG@10, latency, QPS). Development only, never the score of record | claimed | tools-engineer, 2026-11-19 |
+| S5-5 | The Colab demo notebook (founder's ask, 2026-11-19): the engine end to end through the HTTP API (create, bulk, search, facets, live updates, explain, rollback), then a matched benchmark against OpenSearch 2.19 (indexing time, fit-split nDCG@10, latency, QPS). Development only, never the score of record | in review | tools-engineer, 2026-11-19 (`demo/colab_demo.ipynb`; run end to end on CPU over esci-sample, OpenSearch path exercised only against a stand-in; the first Colab run is the founder's) |
 
 ## S6 · Serving speed (architect)
 

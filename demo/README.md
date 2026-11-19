@@ -26,3 +26,18 @@ sortable, and the page renders only those.
 Run it locally: `python -m tools.demo --api http://127.0.0.1:8080` then open `http://127.0.0.1:8000/?index=esci-sample`,
 or `python -m tools.demo --real [--fields]` to start a real replica over ESCI-sample first. **Local only.** It deploys
 only with the founder's approval of that deploy, and no commit here carries `[deploy]`.
+
+## The Colab notebook (S5-5): `demo/colab_demo.ipynb`
+
+owner: tools-engineer · the founder's ask of 2026-11-19. One notebook, opened in Colab (GPU runtime, A100 or T4; it also runs on CPU), run top to bottom. **Development only, never the score of record** (that is `referee/colab_referee.ipynb`; the rigorous load test is `colab/fair_bench.py`).
+
+1. **Setup.** Clones `REF` (default `main`; the repository is private, so a Colab secret `GITHUB_TOKEN` is needed, as in the referee notebook), installs `requirements.txt` (not `requirements-gpu.txt`: its cu12 wheels would overwrite Colab's torch and RAPIDS, as the referee notebook notes), picks `cuda` or `cpu`, loads `DATASET` (`esci-sample`, the default, or `esci-us`) only through `referee/loader.py`.
+2. **Serving.** `python -m serving` in the background, query cache off, waits on `/healthz`.
+3. **Indexing through the API.** `PUT /indexes/esci` (mapping + Parquet source; timed), `GET` the index and its `_mapping`, `_bulk` NDJSON into a small `esci-live` index.
+4. **Querying.** The tuned BM25F request, facets (`terms`, `range`, `stats`), a `bool` filter, multi-select `post_filter`, `from` and `search_after`, `_msearch`, `explain` (through `tools/explain.py`), and a small `tfidf-svd-64` dense and hybrid (RRF) example.
+5. **Live updates** on `esci-live`: patch, delete, upsert, `_refresh`, `versions`, `_reindex`, `_rollback`.
+6. **Benchmark against OpenSearch 2.19.1** (started as in `colab/fair_bench.py`, indexed by `referee/opensearch.py`): indexing time, nDCG@10 and exact recall@100 on **fit-split judgments only**, batch-1 latency p50/p95/p99 on test query **texts**, and a short closed-loop concurrency run. A table, a chart, and `/content/demo-bench.json`. The predictions, with sources and a wrong-if each, are in a cell **before** the benchmark; the cell also says what is and is not matched (a closed loop of Python threads hides queueing; `fair_bench` is the rigorous version).
+
+If OpenSearch cannot be downloaded or started, that section prints why and the benchmark runs for the engine alone. Both servers are stopped by the last cell (and by `atexit`).
+
+Run it unattended (a test, not Colab): `S3_DEMO_OVERRIDES='{"N_QUALITY":150,"N_LATENCY":60,"SECONDS_PER_LEVEL":3}'` with `nbclient`; the `IN_COLAB` guard then uses the local checkout and skips the clone and `pip`. `tools/tests/test_demo_notebook.py` checks the file is valid, has no outputs, and compiles.

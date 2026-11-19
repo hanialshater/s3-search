@@ -9,6 +9,7 @@ Every number shown is the referee's: metrics are `referee.metrics`, imported, an
 | Explain (S5-2) | `python -m tools.explain --api URL --index NAME --query "red shoes" --product ID` | Finds the product's hit, prints its trace, checks every sum and the root against `_score` (1e-4). Unknown combiners are reported unchecked, not passed. `sample_check` does it for N sampled products. |
 | Report (S5-3) | `python -m tools.report results.json --out report.html --milestones PATH --milestone S5` | Static HTML: recall, quality, slices, latency, cost, worst queries with explanations, predictions beside the results. CPU runs say "development only". `check_report` fails on any difference from `results.json`. |
 | Demo (S5-4, S7-8) | `python -m tools.demo --api URL` (or `--real [--fields]`) | Serves `demo/` on 127.0.0.1 and forwards `/indexes/*` to the API. Local only. |
+| Colab notebook (S5-5) | open `demo/colab_demo.ipynb` in Colab | The engine end to end through the HTTP API (index, search, facets, live updates, explain, rollback), then a quick matched benchmark against OpenSearch 2.19.1 with predictions first. Development only. See `demo/README.md`. |
 
 `results.json`'s shape is not yet defined by the referee; `tools/report.py`'s docstring states the shape it reads (a
 proposal to the evaluation steward). Any other numeric field is still shown, under "Other".
